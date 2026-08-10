@@ -1,0 +1,94 @@
+name: Driver validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  WINTAP_WDK_VERSION: 10.0.28000.2526
+  BUILD_CONFIGURATION: Release
+
+jobs:
+  repository-validation:
+    name: Repository validation
+    runs-on: windows-2025
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate specification and implementation artifacts
+        shell: pwsh
+        run: .\tests\validate-spec-artifacts.ps1
+
+      - name: Validate PowerShell syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD\tests\run-wintap-harness.ps1",
+            [ref]$tokens,
+            [ref]$errors) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
+
+  build:
+    name: Build ${{ matrix.architecture }}
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x64, ARM64]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore WDK and SDK packages
+        shell: pwsh
+        run: |
+          msbuild .\driver\WinTapNetAdapterCx.vcxproj `
+            /t:Restore `
+            /m `
+            /p:Configuration=${{ env.BUILD_CONFIGURATION }} `
+            /p:Platform=${{ matrix.architecture }} `
+            /p:WintapWdkVersion=${{ env.WINTAP_WDK_VERSION }} `
+            /p:WindowsTargetPlatformVersion=10.0.28000.0 `
+            /v:minimal
+
+      - name: Build driver
+        shell: pwsh
+        run: |
+          msbuild .\driver\WinTapNetAdapterCx.vcxproj `
+            /t:Build `
+            /m `
+            /p:Configuration=${{ env.BUILD_CONFIGURATION }} `
+            /p:Platform=${{ matrix.architecture }} `
+            /p:WintapWdkVersion=${{ env.WINTAP_WDK_VERSION }} `
+            /p:WindowsTargetPlatformVersion=10.0.28000.0 `
+            /p:OutDir="$PWD\out\driver\${{ matrix.architecture }}\${{ env.BUILD_CONFIGURATION }}\"
+
+      - name: Validate driver artifact
+        shell: pwsh
+        run: |
+          $driver = ".\out\driver\${{ matrix.architecture }}\${{ env.BUILD_CONFIGURATION }}\WinTapNetAdapterCx.sys"
+          if (-not (Test-Path -LiteralPath $driver -PathType Leaf)) {
+            throw "Driver artifact was not produced: $driver"
+          }
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinTapNetAdapterCx-${{ matrix.architecture }}
+          path: |
+            out/driver/${{ matrix.architecture }}/${{ env.BUILD_CONFIGURATION }}/WinTapNetAdapterCx.sys
+            driver/WinTapNetAdapterCx.inf

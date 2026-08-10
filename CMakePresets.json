@@ -1,0 +1,41 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "vs18-x64-debug",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/vs2022-x64-debug",
+      "cacheVariables": {
+        "WINTAP_CONFIGURATION": "Debug",
+        "CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION": "10.0.26100.0"
+      }
+    },
+    {
+      "name": "vs18-arm64-debug",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "ARM64",
+      "binaryDir": "${sourceDir}/out/build/vs2022-arm64-debug",
+      "cacheVariables": {
+        "WINTAP_CONFIGURATION": "Debug",
+        "CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION": "10.0.26100.0"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs18-x64-debug",
+      "configurePreset": "vs18-x64-debug",
+      "targets": [
+        "wintap_driver"
+      ]
+    },
+    {
+      "name": "vs18-arm64-debug",
+      "configurePreset": "vs18-arm64-debug",
+      "targets": [
+        "wintap_driver"
+      ]
+    }
+  ]
+}
