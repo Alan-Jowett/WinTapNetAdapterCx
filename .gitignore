@@ -1,0 +1,9 @@
+# Build and restore outputs
+out/
+driver/obj/
+driver/WinTapNe.9A6E4C04/
+*.user
+*.suo
+
+# NuGet packages
+packages/
