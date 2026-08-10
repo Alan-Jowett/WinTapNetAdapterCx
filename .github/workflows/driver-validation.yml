@@ -150,7 +150,7 @@ jobs:
             "microsoft.windows.wdk.x64"
           }
           cmake -S . -B ".\out\cmake\${{ matrix.architecture }}" `
-            -G "Visual Studio 17 2022" `
+            -G "Visual Studio 18 2026" `
             -A "${{ matrix.architecture }}" `
             -DWINTAP_CONFIGURATION="${{ env.BUILD_CONFIGURATION }}" `
             -DWINTAP_WDK_VERSION="${{ env.WINTAP_WDK_VERSION }}" `
