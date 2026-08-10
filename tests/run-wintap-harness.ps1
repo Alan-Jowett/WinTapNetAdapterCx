@@ -1,5 +1,6 @@
 param(
-    [string]$DevicePath = "\\.\WinTapNetAdapterCx"
+    [string]$DevicePath = "\\.\WinTapNetAdapterCx",
+    [switch]$Extended
 )
 
 $ErrorActionPreference = "Stop"
@@ -105,6 +106,17 @@ $handle = [WinTapNative]::CreateFile(
 
 Assert-True ($handle -ne [IntPtr]::new(-1)) "Open failed: $(Get-Win32Error)"
 try {
+    $secondHandle = [WinTapNative]::CreateFile(
+        $DevicePath,
+        ([WinTapNative]::GenericRead -bor [WinTapNative]::GenericWrite),
+        0,
+        [IntPtr]::Zero,
+        [WinTapNative]::OpenExisting,
+        [WinTapNative]::FileFlagOverlapped,
+        [IntPtr]::Zero)
+    Assert-True ($secondHandle -eq [IntPtr]::new(-1)) `
+        "Exclusive device open unexpectedly succeeded twice."
+
     $invalid = [byte[]]::new(13)
     $invalidOverlapped = [WinTapNative+OVERLAPPED]::new()
     $invalidEvent = [WinTapNative]::CreateEvent(
@@ -154,6 +166,8 @@ try {
         $cancelError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         Assert-True ($cancelError -eq [WinTapNative]::ErrorOperationAborted) `
             "Unexpected cancellation status: $cancelError"
+    } else {
+        throw "Read completed synchronously; cancellation coverage was not exercised."
     }
     [WinTapNative]::CloseHandle($readEvent) | Out-Null
 
@@ -181,6 +195,70 @@ try {
     Assert-True ($writeTransferred -eq $frame.Length) `
         "Valid write completed with $writeTransferred bytes."
     [WinTapNative]::CloseHandle($writeEvent) | Out-Null
+
+    if ($Extended) {
+        $extendedBuffer0 = [byte[]]::new(1514)
+        $extendedBuffer1 = [byte[]]::new(1514)
+        $extendedEvent0 = [WinTapNative]::CreateEvent(
+            [IntPtr]::Zero, $true, $false, $null)
+        $extendedEvent1 = [WinTapNative]::CreateEvent(
+            [IntPtr]::Zero, $true, $false, $null)
+        $extendedOverlapped0 = [WinTapNative+OVERLAPPED]::new()
+        $extendedOverlapped1 = [WinTapNative+OVERLAPPED]::new()
+        $extendedOverlapped0.hEvent = $extendedEvent0
+        $extendedOverlapped1.hEvent = $extendedEvent1
+        $extendedTransferred0 = 0
+        $extendedTransferred1 = 0
+        $extendedPending0 = $false
+        $extendedPending1 = $false
+
+        $extendedResult0 = [WinTapNative]::ReadFile(
+            $handle, $extendedBuffer0, $extendedBuffer0.Length,
+            [ref]$extendedTransferred0, [ref]$extendedOverlapped0)
+        if (-not $extendedResult0) {
+            $extendedError0 = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Assert-True ($extendedError0 -eq [WinTapNative]::ErrorIoPending) `
+                "Extended read 0 failed unexpectedly: $extendedError0"
+            $extendedPending0 = $true
+        }
+
+        $extendedResult1 = [WinTapNative]::ReadFile(
+            $handle, $extendedBuffer1, $extendedBuffer1.Length,
+            [ref]$extendedTransferred1, [ref]$extendedOverlapped1)
+        if (-not $extendedResult1) {
+            $extendedError1 = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Assert-True ($extendedError1 -eq [WinTapNative]::ErrorIoPending) `
+                "Extended read 1 failed unexpectedly: $extendedError1"
+            $extendedPending1 = $true
+        }
+
+        [WinTapNative]::CancelIoEx($handle, [IntPtr]::Zero) | Out-Null
+        if ($extendedPending0) {
+            [WinTapNative]::WaitForSingleObject($extendedEvent0, 5000) | Out-Null
+            $extendedResult0 = [WinTapNative]::GetOverlappedResult(
+                $handle, [ref]$extendedOverlapped0,
+                [ref]$extendedTransferred0, $false)
+            Assert-True (-not $extendedResult0) "Extended read 0 was not cancelled."
+            Assert-True (
+                [Runtime.InteropServices.Marshal]::GetLastWin32Error() `
+                    -eq [WinTapNative]::ErrorOperationAborted) `
+                "Extended read 0 returned an unexpected cancellation status."
+        }
+        if ($extendedPending1) {
+            [WinTapNative]::WaitForSingleObject($extendedEvent1, 5000) | Out-Null
+            $extendedResult1 = [WinTapNative]::GetOverlappedResult(
+                $handle, [ref]$extendedOverlapped1,
+                [ref]$extendedTransferred1, $false)
+            Assert-True (-not $extendedResult1) "Extended read 1 was not cancelled."
+            Assert-True (
+                [Runtime.InteropServices.Marshal]::GetLastWin32Error() `
+                    -eq [WinTapNative]::ErrorOperationAborted) `
+                "Extended read 1 returned an unexpected cancellation status."
+        }
+        [WinTapNative]::CloseHandle($extendedEvent0) | Out-Null
+        [WinTapNative]::CloseHandle($extendedEvent1) | Out-Null
+        Write-Host "Extended outstanding-read cancellation checks passed."
+    }
 }
 finally {
     [WinTapNative]::CloseHandle($handle) | Out-Null

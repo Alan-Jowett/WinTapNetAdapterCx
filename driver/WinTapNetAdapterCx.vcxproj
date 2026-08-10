@@ -82,7 +82,8 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
-    <WindowsSdkDir>$(NuGetPackageRoot)microsoft.windows.sdk.cpp\$(WintapWdkVersion)\c\</WindowsSdkDir>
+    <WindowsSdkDir Condition="'$(Platform)' == 'x64'">$(NuGetPackageRoot)microsoft.windows.wdk.x64\$(WintapWdkVersion)\c\</WindowsSdkDir>
+    <WindowsSdkDir Condition="'$(Platform)' == 'ARM64'">$(NuGetPackageRoot)microsoft.windows.wdk.arm64\$(WintapWdkVersion)\c\</WindowsSdkDir>
     <WindowsSdkDir_10>$(WindowsSdkDir)</WindowsSdkDir_10>
     <OutDir Condition="'$(OutDir)' == ''">$(MSBuildThisFileDirectory)..\out\driver\$(Platform)\$(Configuration)\</OutDir>
     <TargetName>WinTapNetAdapterCx</TargetName>
@@ -110,4 +111,7 @@
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <PropertyGroup>
+    <ApiValidator_Enable>false</ApiValidator_Enable>
+  </PropertyGroup>
 </Project>

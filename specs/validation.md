@@ -91,7 +91,22 @@ validates exclusive device open, malformed frame rejection, overlapped read
 cancellation, and successful overlapped writes; packet exchange and lifecycle
 stress remain separate acceptance tests.
 
-The implementation shall use CMake 3.25 or later, the Visual Studio 18
-generator, the four architecture-specific WDK/SDK NuGet packages listed in
-`specs/design.md`, and version `10.0.28000.2526`. The harness is implemented
-in PowerShell using P/Invoke to Win32 overlapped I/O.
+The implementation shall use CMake 3.25 or later and a supported Visual
+Studio generator. The repository presets target Visual Studio 18 2026; hosted
+CI uses Visual Studio 17 2022 when that is the runner-provided generator. The
+four architecture-specific WDK/SDK NuGet packages listed in `specs/design.md`
+remain pinned to version `10.0.28000.2526`. The harness is implemented in
+PowerShell using P/Invoke to Win32 overlapped I/O.
+
+## Current hosted and privileged split
+
+Hosted CI validates artifact presence, PowerShell syntax, WDK tool
+provisioning, CMake configure/build/package, and INF/driver package shape for
+x64 and ARM64. It does not install a kernel driver or claim packet-path,
+power-transition, removal, or Driver Verifier coverage.
+
+The elevated harness is a self-hosted/manual acceptance tool. It requires an
+installed test-signed driver and validates administrator access, exclusive
+open behavior, malformed writes, overlapped cancellation, and valid writes.
+Packet exchange, queue saturation, power, removal, and verifier scenarios
+remain privileged acceptance gates until a suitable test machine is available.

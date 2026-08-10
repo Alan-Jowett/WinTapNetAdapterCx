@@ -1,6 +1,8 @@
 # Build and restore outputs
 out/
 driver/obj/
+driver/x64/
+driver/ARM64/
 driver/WinTapNe.9A6E4C04/
 *.user
 *.suo

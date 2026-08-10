@@ -8,6 +8,7 @@
       "binaryDir": "${sourceDir}/out/build/vs2022-x64-debug",
       "cacheVariables": {
         "WINTAP_CONFIGURATION": "Debug",
+        "WINTAP_WDK_PACKAGE": "microsoft.windows.wdk.x64",
         "CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION": "10.0.26100.0"
       }
     },
@@ -18,6 +19,7 @@
       "binaryDir": "${sourceDir}/out/build/vs2022-arm64-debug",
       "cacheVariables": {
         "WINTAP_CONFIGURATION": "Debug",
+        "WINTAP_WDK_PACKAGE": "microsoft.windows.wdk.arm64",
         "CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION": "10.0.26100.0"
       }
     }
@@ -27,14 +29,14 @@
       "name": "vs18-x64-debug",
       "configurePreset": "vs18-x64-debug",
       "targets": [
-        "wintap_driver"
+        "wintap_package"
       ]
     },
     {
       "name": "vs18-arm64-debug",
       "configurePreset": "vs18-arm64-debug",
       "targets": [
-        "wintap_driver"
+        "wintap_package"
       ]
     }
   ]

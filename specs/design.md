@@ -104,6 +104,14 @@ addresses are obtained through the `ms_fragment_virtualaddress` fragment
 extension. This document specifies ownership transitions in addition to the
 verified API names.
 
+The pinned WDK 10.0.28000.2526 NetAdapterCx 2.5 headers verify
+`EVT_PACKET_QUEUE_START`, `EVT_PACKET_QUEUE_STOP`, and
+`EVT_PACKET_QUEUE_ADVANCE` callbacks, with queue advance allowed up to
+DISPATCH_LEVEL. They also expose `NetAdapterStart` and `NetAdapterStop`.
+No separate NetAdapter pause/restart callback API was found in the installed
+headers, so pause/restart remains deferred rather than being represented by
+an invented callback.
+
 ## Queue state and backpressure
 
 The design shall maintain separate bounded queues for:
@@ -126,6 +134,15 @@ configuration shall reject zero, overflowed, or unsupported sizes.
 The implementation resumes blocked user writes from a passive WDF work item
 after RX ring capacity is consumed; this keeps request-buffer capture on a WDF
 I/O/work-item path rather than doing it from the packet callback.
+
+Pending reads and writes are held by WDF manual queues. WDF owns cancellation
+while a request is queued, and synchronous queue purge owns terminal
+completion during cleanup; the driver does not register a second cancellation
+owner for those requests.
+
+RX ring index ownership is intentionally not changed by the maintenance
+patches. The existing `BeginIndex` advancement requires runtime or verified
+sample evidence before a semantic correction is safe.
 
 ## Synchronization
 

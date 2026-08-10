@@ -24,16 +24,19 @@ typedef struct _WINTAP_DEVICE_CONTEXT {
     ULONG FrameLimit;
     BOOLEAN Closing;
     BOOLEAN Removed;
+    BOOLEAN Suspended;
     BOOLEAN WriteDrainQueued;
+    BOOLEAN WriteDrainRunning;
     LONG ActiveCallbacks;
     KEVENT CallbackIdle;
+    KEVENT WriteDrainIdle;
 } WINTAP_DEVICE_CONTEXT, *PWINTAP_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WINTAP_DEVICE_CONTEXT, WintapGetDeviceContext);
 
 typedef struct _WINTAP_QUEUE_CONTEXT {
     BOOLEAN IsTransmit;
-    BOOLEAN Started;
+    LONG Started;
     const NET_RING_COLLECTION* Rings;
     NET_EXTENSION FragmentVirtualAddress;
 } WINTAP_QUEUE_CONTEXT, *PWINTAP_QUEUE_CONTEXT;
@@ -46,13 +49,14 @@ DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD WintapEvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE WintapEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE WintapEvtReleaseHardware;
+EVT_WDF_DEVICE_D0_ENTRY WintapEvtDeviceD0Entry;
+EVT_WDF_DEVICE_D0_EXIT WintapEvtDeviceD0Exit;
 EVT_WDF_DEVICE_FILE_CREATE WintapEvtFileCreate;
 EVT_WDF_FILE_CLEANUP WintapEvtFileCleanup;
 EVT_WDF_FILE_CLOSE WintapEvtFileClose;
 EVT_WDF_IO_QUEUE_IO_READ WintapEvtIoRead;
 EVT_WDF_IO_QUEUE_IO_WRITE WintapEvtIoWrite;
 EVT_WDF_WORKITEM WintapEvtWriteDrainWorkItem;
-EVT_WDF_REQUEST_CANCEL WintapEvtRequestCancel;
 EVT_NET_ADAPTER_CREATE_TXQUEUE WintapEvtCreateTxQueue;
 EVT_NET_ADAPTER_CREATE_RXQUEUE WintapEvtCreateRxQueue;
 EVT_PACKET_QUEUE_ADVANCE WintapEvtPacketQueueAdvance;

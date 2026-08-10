@@ -19,8 +19,13 @@ Ethernet frames with the Windows networking stack.
 
 ## Status
 
-This project is under active development. APIs, installation procedures, and
-behavior may change as the driver implementation evolves.
+The approved `CHG-001` through `CHG-014` maintenance patch set is applied.
+Hosted validation covers repository artifacts, WDK tool provisioning, CMake
+configure/build/package, and package shape for x64 and ARM64. The privileged
+runtime harness requires an installed test-signed driver and an elevated
+administrator session; hosted CI does not claim packet-path, power, removal,
+or Driver Verifier coverage. See [`specs/current-status.md`](specs/current-status.md)
+for deferred evidence and WDK findings.
 
 ## Intended platform
 
@@ -28,8 +33,8 @@ behavior may change as the driver implementation evolves.
 - Windows Driver Kit (WDK) with NetAdapterCx support
 - Visual Studio with the Windows driver development workload
 
-The exact supported Windows versions and build instructions will be documented
-as the implementation is established.
+The project targets Windows 10 version 2004 and later on x64 and ARM64. Build
+dependencies use the pinned WDK/SDK NuGet version `10.0.28000.2526`.
 
 ## Related technologies
 

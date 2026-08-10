@@ -11,6 +11,7 @@ permissions:
 
 env:
   WINTAP_WDK_VERSION: 10.0.28000.2526
+  WINDOWS_SDK_VERSION: 10.0.28000.0
   BUILD_CONFIGURATION: Release
 
 jobs:
@@ -28,15 +29,17 @@ jobs:
       - name: Validate PowerShell syntax
         shell: pwsh
         run: |
-          $tokens = $null
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            "$PWD\tests\run-wintap-harness.ps1",
-            [ref]$tokens,
-            [ref]$errors) | Out-Null
-          if ($errors.Count -ne 0) {
-            $errors | Format-List | Out-String | Write-Error
-            exit 1
+          foreach ($script in Get-ChildItem .\scripts,.\tests -Filter *.ps1 -File) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $script.FullName,
+              [ref]$tokens,
+              [ref]$errors) | Out-Null
+            if ($errors.Count -ne 0) {
+              $errors | Format-List | Out-String | Write-Error
+              exit 1
+            }
           }
 
   build:
@@ -62,8 +65,15 @@ jobs:
             /p:Configuration=${{ env.BUILD_CONFIGURATION }} `
             /p:Platform=${{ matrix.architecture }} `
             /p:WintapWdkVersion=${{ env.WINTAP_WDK_VERSION }} `
-            /p:WindowsTargetPlatformVersion=10.0.28000.0 `
+            /p:WindowsTargetPlatformVersion=${{ env.WINDOWS_SDK_VERSION }} `
             /v:minimal
+
+      - name: Provision WDK tools
+        shell: pwsh
+        run: |
+          .\scripts\prepare-wdk-tools.ps1 `
+            -WdkVersion "${{ env.WINTAP_WDK_VERSION }}" `
+            -Architecture "${{ matrix.architecture }}"
 
       - name: Build driver
         shell: pwsh
@@ -74,16 +84,21 @@ jobs:
             /p:Configuration=${{ env.BUILD_CONFIGURATION }} `
             /p:Platform=${{ matrix.architecture }} `
             /p:WintapWdkVersion=${{ env.WINTAP_WDK_VERSION }} `
-            /p:WindowsTargetPlatformVersion=10.0.28000.0 `
+            /p:WindowsTargetPlatformVersion=${{ env.WINDOWS_SDK_VERSION }} `
+            /p:TargetPlatformVersion=${{ env.WINDOWS_SDK_VERSION }} `
+            /p:WindowsSDKInstalled=true `
+            /p:WindowsSDK_Desktop_Support=true `
+            /p:WindowsSDK_UAP_Support=true `
+            /p:ApiValidator_Enable=${{ env.WINTAP_API_VALIDATOR_ENABLE }} `
             /p:OutDir="$PWD\out\driver\${{ matrix.architecture }}\${{ env.BUILD_CONFIGURATION }}\"
 
       - name: Validate driver artifact
         shell: pwsh
         run: |
-          $driver = ".\out\driver\${{ matrix.architecture }}\${{ env.BUILD_CONFIGURATION }}\WinTapNetAdapterCx.sys"
-          if (-not (Test-Path -LiteralPath $driver -PathType Leaf)) {
-            throw "Driver artifact was not produced: $driver"
-          }
+          .\tests\validate-package.ps1 `
+            -Architecture "${{ matrix.architecture }}" `
+            -Configuration "${{ env.BUILD_CONFIGURATION }}" `
+            -PackageRoot ".\out\driver"
 
       - name: Upload driver artifact
         uses: actions/upload-artifact@v4
@@ -92,3 +107,70 @@ jobs:
           path: |
             out/driver/${{ matrix.architecture }}/${{ env.BUILD_CONFIGURATION }}/WinTapNetAdapterCx.sys
             driver/WinTapNetAdapterCx.inf
+
+  cmake-validation:
+    name: CMake validation ${{ matrix.architecture }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x64, ARM64]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore WDK and SDK packages
+        shell: pwsh
+        run: |
+          msbuild .\driver\WinTapNetAdapterCx.vcxproj `
+            /t:Restore `
+            /m `
+            /p:Configuration=${{ env.BUILD_CONFIGURATION }} `
+            /p:Platform=${{ matrix.architecture }} `
+            /p:WintapWdkVersion=${{ env.WINTAP_WDK_VERSION }} `
+            /p:WindowsTargetPlatformVersion=${{ env.WINDOWS_SDK_VERSION }} `
+            /v:minimal
+
+      - name: Provision WDK tools
+        shell: pwsh
+        run: |
+          .\scripts\prepare-wdk-tools.ps1 `
+            -WdkVersion "${{ env.WINTAP_WDK_VERSION }}" `
+            -Architecture "${{ matrix.architecture }}"
+
+      - name: Configure with CMake
+        shell: pwsh
+        run: |
+          $wdkPackage = if ("${{ matrix.architecture }}" -eq "ARM64") {
+            "microsoft.windows.wdk.arm64"
+          } else {
+            "microsoft.windows.wdk.x64"
+          }
+          cmake -S . -B ".\out\cmake\${{ matrix.architecture }}" `
+            -G "Visual Studio 17 2022" `
+            -A "${{ matrix.architecture }}" `
+            -DWINTAP_CONFIGURATION="${{ env.BUILD_CONFIGURATION }}" `
+            -DWINTAP_WDK_VERSION="${{ env.WINTAP_WDK_VERSION }}" `
+            -DWINTAP_WINDOWS_SDK_VERSION="${{ env.WINDOWS_SDK_VERSION }}" `
+            -DWINTAP_API_VALIDATOR_ENABLE="${{ env.WINTAP_API_VALIDATOR_ENABLE }}" `
+            -DWINTAP_WDK_PACKAGE="$wdkPackage"
+
+      - name: Build and package with CMake
+        shell: pwsh
+        run: |
+          cmake --build ".\out\cmake\${{ matrix.architecture }}" `
+            --config "${{ env.BUILD_CONFIGURATION }}" `
+            --target wintap_package `
+            --parallel 2
+
+      - name: Validate CMake package
+        shell: pwsh
+        run: |
+          .\tests\validate-package.ps1 `
+            -Architecture "${{ matrix.architecture }}" `
+            -Configuration "${{ env.BUILD_CONFIGURATION }}" `
+            -PackageRoot ".\out\cmake\${{ matrix.architecture }}\driver" `
+            -PackageDirectory ".\out\cmake\${{ matrix.architecture }}\package\${{ matrix.architecture }}\${{ env.BUILD_CONFIGURATION }}"
