@@ -104,9 +104,46 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: WinTapNetAdapterCx-${{ matrix.architecture }}
-          path: |
-            out/driver/${{ matrix.architecture }}/${{ env.BUILD_CONFIGURATION }}/WinTapNetAdapterCx.sys
-            driver/WinTapNetAdapterCx.inf
+          path: out/driver/${{ matrix.architecture }}/${{ env.BUILD_CONFIGURATION }}/
+
+  privileged-integration:
+    name: Privileged REQ-008/REQ-009 integration
+    runs-on: windows-latest
+    needs: build
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download x64 driver package
+        uses: actions/download-artifact@v4
+        with:
+          name: WinTapNetAdapterCx-x64
+          path: .\out\driver\x64\${{ env.BUILD_CONFIGURATION }}
+
+      - name: Complete integration package
+        shell: pwsh
+        run: |
+          Copy-Item .\driver\WinTapNetAdapterCx.inf `
+            .\out\driver\x64\${{ env.BUILD_CONFIGURATION }}\WinTapNetAdapterCx.inf `
+            -Force
+
+      - name: Run privileged ICMP/TAP round trip
+        shell: pwsh
+        run: |
+          .\tests\run-wintap-harness.ps1 `
+            -Integration `
+            -InstallDriver `
+            -RequireTestSigning `
+            -PackageDirectory ".\out\driver\x64\${{ env.BUILD_CONFIGURATION }}" `
+            -DiagnosticsPath ".\artifacts\wintap-harness"
+
+      - name: Upload privileged integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wintap-privileged-integration-diagnostics
+          if-no-files-found: warn
+          path: artifacts/wintap-harness/
 
   cmake-validation:
     name: CMake validation ${{ matrix.architecture }}

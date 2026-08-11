@@ -14,6 +14,8 @@
 - Queues are bounded and use cancellation-aware backpressure.
 - Every asynchronous operation has one terminal completion and one owner at
   every transition.
+- Protocol tests exercise the existing Ethernet/TAP boundary and do not add
+  an IP/TUN mode or test-only driver path.
 
 ## Build and dependency design
 
@@ -230,6 +232,90 @@ reschedules required passive drain/completion work.
   partway through.
 - No broad catch-all or silent success fallback is permitted.
 
+## ICMP/TAP integration-test design
+
+The REQ-008 test is an external user-mode acceptance workflow. It shall use
+the existing named device and overlapped read/write contract; the driver shall
+not contain test-only ARP or ICMP handling.
+
+### Provisioning and isolation
+
+1. Install and start the test-signed package, then uniquely identify the
+   virtual Ethernet interface using stable adapter identity rather than an
+   interface index alone.
+2. Record the interface address, routes, administrative state, and driver
+   state needed for restoration.
+3. Assign `192.0.2.1/30` only to the test interface. Do not add a default
+   route; reject address collisions or ambiguous adapter matches.
+4. Open `\\.\WinTapNetAdapterCx` exclusively with overlapped I/O before the
+   protocol exchange.
+
+### Request/reply packet flow
+
+The test shall cause the Windows networking stack to issue an Echo Request to
+`192.0.2.2`, then use the TAP handle as the observation and injection
+boundary. Because the test network has no external peer, the workflow shall
+first handle address resolution:
+
+1. A pending overlapped read receives the Ethernet ARP request generated for
+   `192.0.2.2`.
+2. The test validates the ARP request fields and writes the corresponding
+   Ethernet ARP reply for the test interface and peer address.
+3. The Windows stack then emits the ICMP Echo Request, which the workflow
+   reads and validates.
+
+4. The test validates Ethernet endpoints and EtherType, IPv4 version/header
+   length/total length/addresses/TTL/protocol, and ICMP type/code,
+   identifier/sequence, payload, and checksum.
+5. The reply swaps IPv4 addresses and Ethernet endpoints, changes ICMP type
+   to Echo Reply, preserves identifier, sequence, and payload, and
+   recomputes IPv4 and ICMP checksums.
+6. The reply is submitted with an overlapped write and completes with the
+   complete frame length.
+7. The test verifies that the Windows stack reports the matching successful
+   Echo Reply within a bounded timeout.
+
+The parser rejects truncated headers, inconsistent lengths, invalid ARP
+fields, fragments, unexpected protocols, invalid checksums, and packets that
+do not match the request identity. Unrelated well-formed frames may be
+ignored only while the bounded timeout remains enforceable; unrelated
+malformed frames fail the test.
+
+### Cleanup and failure handling
+
+Cleanup runs from a guaranteed finalization path and is idempotent. It
+cancel/completes pending operations before closing the handle, removes only
+the test address and any test-created route, restores the interface and
+driver state, removes the test package where permitted, and retains command
+output, packet bytes, driver status, and event logs on failure.
+
+Provisioning, packet-validation, timeout, or cleanup errors are test
+failures. Cleanup failures are reported in addition to the primary failure
+and cannot be converted into success.
+
+## Execution-environment design
+
+The hosted and VM paths share one test entry point, packet parser, packet
+builder, timeout policy, and acceptance assertions. Only provisioning inputs
+such as package location, architecture, signing mode, and cleanup policy may
+vary.
+
+### GitHub-hosted Windows runner
+
+The workflow shall provision the WDK/SDK and test package, enable the required
+test-signing/install state, install and start the driver, configure the
+isolated address, run REQ-008, upload diagnostics, and restore the runner.
+The job must use the privileges required by the driver and network commands.
+If the runner rejects any required operation, the job fails with the
+operation and platform error.
+
+### Manual Hyper-V VM
+
+Documentation shall define a clean VM setup, supported Windows build,
+architecture, administrator/test-signing prerequisites, package install,
+test invocation, diagnostic collection, and cleanup. The VM test uses the
+same assertions as hosted CI and does not rely on an external network peer.
+
 ## Unresolved implementation details
 
 - The selected WDK baseline uses `EVT_PACKET_QUEUE_ADVANCE` for both directions
@@ -241,3 +327,7 @@ reschedules required passive drain/completion work.
 - **[ASSUMPTION]** A copy at the user/kernel boundary is acceptable for the
   initial implementation; zero-copy is not required by the approved
   requirements.
+- **[UNKNOWN]** The exact GitHub-hosted runner policy for test-signed driver
+  installation and virtual-interface configuration must be confirmed during
+  implementation validation; rejection is a required failure outcome under
+  REQ-009.

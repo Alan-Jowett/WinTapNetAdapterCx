@@ -12,6 +12,10 @@
 - Define the intended TAP-style user-mode packet exchange contract.
 - Define lifecycle, compatibility, security, and verification decisions needed
   before implementation specifications are approved.
+- Add a privileged end-to-end ICMP round-trip acceptance test over the
+  Ethernet/TAP boundary.
+- Require the same full test on a GitHub-hosted Windows runner and manually in
+  a Hyper-V-capable development VM.
 - Do not modify C source, headers, INF files, project files, tests, generated
   artifacts, or build configuration during discovery.
 
@@ -112,6 +116,56 @@ resolved reproducibly for x64 and ARM64 builds.
 dependency set; unsupported or unresolved dependencies must fail during
 configuration rather than producing an ambiguous driver package.
 
+### REQ-008 — ICMP/TAP end-to-end round trip
+
+**Before:** Packet exchange is specified only as generic Ethernet frame
+read/write behavior; no protocol-level test proves traversal through the
+Windows networking stack in both directions.
+**After:** A privileged integration test shall load the test-signed driver,
+identify the resulting TAP Ethernet interface, assign `192.0.2.1/30`
+without creating an unintended default route, and open
+`\\.\WinTapNetAdapterCx` with an overlapped Win32 device handle. It shall
+cause the Windows networking stack to generate an ICMP Echo Request to
+`192.0.2.2`. It shall service the required Ethernet ARP exchange through the
+TAP handle so the stack can resolve the peer, then read and validate the
+Ethernet/IPv4/ICMP request from the TAP handle, write a correctly formed Echo
+Reply through the handle, and verify that the Windows stack receives the
+matching reply. It shall restore addressing, routes, handles, and driver
+state on success and failure.
+
+The test shall use documentation-only TEST-NET space and shall not depend on
+an external peer, internet connectivity, bridge, NAT, or production route.
+
+**Trace:** User-requested `/evolve` change; selected address pair
+`192.0.2.1/30` and `192.0.2.2`; extends REQ-001, REQ-002, REQ-003, REQ-005,
+and REQ-006.
+**Invariant impact:** The test preserves Ethernet framing and driver
+ownership rules, distinguishes timeout from malformed-packet failure, and
+leaves no test-created network or driver state after cleanup.
+
+### REQ-009 — Dual-mode privileged integration execution
+
+**Before:** Hosted CI validates build and package artifacts only; privileged
+packet-path validation is manual/self-hosted.
+**After:** The complete REQ-008 flow shall run without changing its assertions
+in both a GitHub-hosted Windows CI/CD runner and a manually operated Windows
+VM on a Hyper-V-capable development machine. The hosted workflow shall
+provision the test-signed package, install/load the driver, configure the
+interface, execute the packet exchange, collect diagnostics, and clean up.
+The VM path shall use the same test entry point and assertions.
+
+The test shall fail if required privileged operations are unavailable. It
+shall not silently downgrade to a capability check or skip packet-path
+assertions. Provisioning, signing, and cleanup may be parameterized by
+environment, but the ICMP/TAP assertions shall remain identical.
+
+**Trace:** Additional user requirement; extends REQ-004, REQ-006, and
+REQ-007.
+**Invariant impact:** Provisioning and cleanup must be deterministic,
+idempotent, isolated to the test interface, and diagnostic-preserving. A
+hosted-platform policy that blocks required execution is a validation failure,
+not a pass.
+
 ## Scope boundaries
 
 - **In scope:** A NetAdapterCx software Ethernet adapter and a TAP-style
@@ -119,6 +173,8 @@ configuration rather than producing an ambiguous driver package.
 - **In scope:** Driver lifecycle, packet ownership, synchronization, IRQL and
   pageable-code rules, power management, access control, installation, and
   verification specifications.
+- **In scope:** The complete privileged ICMP Echo Request/Echo Reply test and
+  its GitHub-hosted runner and Hyper-V VM execution environments.
 - **Out of scope unless explicitly added:** IP/TUN mode (decision: excluded
   from the initial milestone), protocol-specific
   user-mode libraries, packet capture beyond the virtual adapter contract,
@@ -142,9 +198,14 @@ configuration rather than producing an ambiguous driver package.
    implementation patch set.
 9. **Resolved:** The project shall use CMake with a Visual Studio generator and
    NuGet-managed WDK/SDK dependencies.
+10. **Resolved:** The ICMP integration test performs a complete Echo
+    Request/Echo Reply round trip.
+11. **Resolved:** The test network is `192.0.2.1/30` with peer
+    `192.0.2.2`.
+12. **Resolved:** Full privileged execution is required on both a
+    GitHub-hosted Windows runner and a Hyper-V-capable development VM.
 
 ## Discovery gate
 
-Phase 2 is blocked until the user resolves material open questions and
-explicitly indicates that discovery is complete, for example by replying
-`READY` or `proceed`.
+Requirements discovery is complete. Phase 3 remains blocked until the
+requirements, design, and validation patches are approved together.

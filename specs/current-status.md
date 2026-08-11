@@ -1,7 +1,7 @@
 # Current Project Status
 
 **Status date:** 2026-08-10  
-**Requirements:** Approved baseline `REQ-001` through `REQ-007`  
+**Requirements:** Approved baseline `REQ-001` through `REQ-009`
 **Implementation:** Corrective patch sets `CHG-001` through `CHG-014` and
 `CHG-015` through `CHG-020` plus `CHG-022` applied without changing the
 approved Ethernet/TAP scope. `CHG-021` was superseded by `CHG-019`.
@@ -17,15 +17,20 @@ approved Ethernet/TAP scope. `CHG-021` was superseded by `CHG-019`.
 - Fragment metadata is checked before every packet copy.
 - The user-mode harness covers administrator access, exclusive open behavior,
   malformed writes, overlapped cancellation, and valid writes.
+- The opt-in privileged harness path discovers the root-enumerated adapter,
+  isolates `192.0.2.1/30`, handles ARP, validates/builds IPv4 ICMP frames with
+  checksums, verifies the Windows Ping result, captures diagnostics, and
+  performs idempotent address/device cleanup.
 - The maintenance alignment corrections bound pending operations, defer
   packet-path user-buffer completion to passive work, preserve frames for
   undersized reads, and define D0 request/frame behavior.
 
 ## Deferred evidence
 
-- The harness requires an installed, test-signed driver and an elevated
-  administrator session. Hosted GitHub runners do not claim privileged
-  installation, packet-path, power, removal, or Driver Verifier coverage.
+- The harness requires an elevated administrator session and test signing for
+  test-signed packages. Hosted GitHub runners may reject the required
+  test-signing/reboot policy; the privileged job fails with that platform
+  error and uploads diagnostics instead of skipping packet-path coverage.
 - The pinned NetAdapterCx 2.5 headers expose packet queue start/stop/advance
   callbacks and `NetAdapterStart`/`NetAdapterStop`; no separate adapter
   pause/restart callback API was found. Pause/restart behavior remains
@@ -37,6 +42,9 @@ approved Ethernet/TAP scope. `CHG-021` was superseded by `CHG-019`.
   removal, power transition, and Driver Verifier execution remain
   self-hosted/manual gates. Hosted/local builds do produce test-signed `.sys`
   files.
+- The REQ-009 hosted job is wired to run the same privileged entry point as the
+  VM path. A hosted result remains blocked until a runner already configured
+  for test signing permits driver installation and virtual-interface setup.
 - The restored `10.0.28000.2526` WDK package on this host does not include
   `ApiValidator.exe`; the default build disables that target and provisioning
   reports the limitation rather than claiming API validation. A runner that

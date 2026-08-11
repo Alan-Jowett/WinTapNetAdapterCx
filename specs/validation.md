@@ -16,6 +16,8 @@
 | VAL-005 | REQ-005 | Verify non-administrator open/control attempts fail; verify malformed lengths and invalid I/O requests cannot corrupt memory or disclose data. |
 | VAL-006 | REQ-006 | Run the complete build, install, packet-path, concurrency, cancellation, power, malformed-input, and cleanup suite with Driver Verifier-compatible settings. |
 | VAL-007 | REQ-007 | Configure and build from a clean environment with CMake and the Visual Studio generator for x64 and ARM64; verify NuGet WDK/SDK dependencies resolve reproducibly and missing prerequisites fail at configuration. |
+| VAL-008 | REQ-008 | Run the complete privileged ICMP Echo Request/Echo Reply round trip through the Ethernet/TAP handle using `192.0.2.1/30` and `192.0.2.2`; verify packet fields, checksums, stack completion, timeout behavior, and cleanup. |
+| VAL-009 | REQ-009 | Execute the full REQ-008 assertion set in a GitHub-hosted Windows job and manually in a Hyper-V-capable Windows VM using the same test entry point; fail on unavailable privileged operations rather than skipping. |
 
 | Test | Coverage |
 |---|---|
@@ -26,6 +28,12 @@
 | TC-019 | Verify D0 exit/entry request, frame, callback, and work-item transitions. |
 | TC-020 | Verify an undersized pending read fails without losing the queued frame. |
 | TC-022 | Verify hosted/runtime readiness status matches the evidence actually available. |
+| TC-023 | Verify the test-signed driver loads, the intended TAP interface is uniquely identified, and `192.0.2.1/30` is assigned without an unintended default route. |
+| TC-024 | Generate the ARP request for `192.0.2.2`, read it from the Win32 handle, validate it, write the matching ARP reply, then read and validate the resulting Ethernet/IPv4/ICMP Echo Request and checksums. |
+| TC-025 | Construct and write the matching ICMP Echo Reply, then verify the Windows networking stack reports the successful reply within the bounded timeout. |
+| TC-026 | Exercise malformed, unrelated, truncated, invalid-ARP, fragmented, mismatched, and checksum-invalid frames during the ICMP test and verify deterministic rejection or filtering. |
+| TC-027 | Interrupt the ICMP test at provisioning, read, write, timeout, driver-stop, and cleanup stages and verify idempotent restoration plus preserved diagnostics. |
+| TC-028 | Execute TC-023 through TC-027 on a GitHub-hosted runner and in a Hyper-V VM; verify no capability-only skip is reported. |
 
 ## Functional tests
 
@@ -98,8 +106,11 @@ The implementation validation package shall include:
 The current harness is `tests/run-wintap-harness.ps1`. It requires an elevated
 administrator PowerShell session and an installed test-signed driver. It
 validates exclusive device open, malformed frame rejection, overlapped read
-cancellation, and successful overlapped writes; packet exchange and lifecycle
-stress remain separate acceptance tests.
+cancellation, and successful overlapped writes. The REQ-008 implementation
+shall extend or compose this harness with interface discovery/address
+provisioning, Ethernet/IPv4/ICMP parsing and construction, stack-triggered
+request generation, reply verification, bounded timeouts, diagnostics, and
+idempotent cleanup.
 
 The implementation shall use CMake 3.25 or later and a supported Visual
 Studio generator. The repository presets target Visual Studio 18 2026; hosted
@@ -108,19 +119,26 @@ four architecture-specific WDK/SDK NuGet packages listed in `specs/design.md`
 remain pinned to version `10.0.28000.2526`. The harness is implemented in
 PowerShell using P/Invoke to Win32 overlapped I/O.
 
-## Current hosted and privileged split
+## Required hosted and privileged execution
 
-Hosted CI validates artifact presence, PowerShell syntax, WDK tool
-provisioning, CMake configure/build/package, and INF/driver package shape for
-x64 and ARM64. It does not install a kernel driver or claim packet-path,
-power-transition, removal, or Driver Verifier coverage.
+Hosted CI shall continue to validate artifact presence, PowerShell syntax, WDK
+tool provisioning, CMake configure/build/package, and INF/driver package shape
+for x64 and ARM64. In addition, a privileged Windows job shall install/load
+the test-signed driver and execute the hosted-runner instance of VAL-008 and
+VAL-009 using the same test entry point as the manual VM path. The job must
+upload diagnostics and fail if driver installation, address configuration,
+ARP/ICMP packet exchange, or cleanup is blocked.
 
-The elevated harness is a self-hosted/manual acceptance tool. It requires an
-installed test-signed driver and validates administrator access, exclusive
-open behavior, malformed writes, overlapped cancellation, and valid writes.
-Packet exchange, queue saturation, power, removal, and verifier scenarios
-remain privileged acceptance gates until a suitable test machine is available.
+The elevated harness remains runnable manually in a Hyper-V-capable VM. It
+requires an installed test-signed driver and validates the existing I/O
+contract plus the complete REQ-008 round trip. Queue saturation, power,
+removal, and verifier scenarios remain additional privileged acceptance gates.
+
+The hosted job and VM procedure must report environment failures explicitly;
+they must not classify an unexecuted packet-path test as passed. VAL-009 is
+complete only after both the hosted-runner result and the manual-VM result are
+recorded; the hosted job alone cannot claim VM coverage.
 
 TC-015, TC-016, TC-017, TC-018, TC-019, TC-020, and TC-022 are implementation
 and specification trace points for the approved maintenance corrections.
-Privileged cases remain manual gates where noted above.
+TC-023 through TC-028 provide trace points for REQ-008 and REQ-009.
