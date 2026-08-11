@@ -3,6 +3,8 @@
 static constexpr ULONG WINTAP_FRAME_MINIMUM = 14;
 static constexpr ULONG WINTAP_FRAME_MAXIMUM = 1514;
 static constexpr ULONG WINTAP_FRAME_LIMIT = 256;
+static constexpr ULONG WINTAP_PENDING_READ_LIMIT = 256;
+static constexpr ULONG WINTAP_PENDING_WRITE_LIMIT = 256;
 static PWINTAP_DEVICE_CONTEXT g_ControlContext = nullptr;
 static WDFDEVICE g_ControlDevice = nullptr;
 static NETADAPTER g_Adapter = nullptr;
@@ -91,12 +93,14 @@ WintapWaitForWriteDrain(
     )
 {
     BOOLEAN running;
+    BOOLEAN queued;
 
     WdfSpinLockAcquire(Context->FrameLock);
     running = Context->WriteDrainRunning;
+    queued = Context->WriteDrainQueued;
     WdfSpinLockRelease(Context->FrameLock);
 
-    if (running) {
+    if (running || queued) {
         KeWaitForSingleObject(
             &Context->WriteDrainIdle,
             Executive,
@@ -104,6 +108,103 @@ WintapWaitForWriteDrain(
             FALSE,
             nullptr);
     }
+}
+
+static VOID
+WintapWaitForReadCompletion(
+    _In_ PWINTAP_DEVICE_CONTEXT Context
+    )
+{
+    BOOLEAN running;
+    BOOLEAN queued;
+
+    WdfSpinLockAcquire(Context->FrameLock);
+    running = Context->ReadCompletionRunning;
+    queued = Context->ReadCompletionQueued;
+    WdfSpinLockRelease(Context->FrameLock);
+
+    if (running || queued) {
+        KeWaitForSingleObject(
+            &Context->ReadCompletionIdle,
+            Executive,
+            KernelMode,
+            FALSE,
+            nullptr);
+    }
+}
+
+static NTSTATUS
+WintapMarkPendingRequest(
+    _In_ PWINTAP_DEVICE_CONTEXT Context,
+    _In_ WDFREQUEST Request,
+    _In_ BOOLEAN IsRead
+    )
+{
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(
+        &attributes,
+        WINTAP_REQUEST_CONTEXT);
+
+    PWINTAP_REQUEST_CONTEXT requestContext = nullptr;
+    NTSTATUS status = WdfObjectAllocateContext(
+        Request,
+        &attributes,
+        reinterpret_cast<PVOID*>(&requestContext));
+    if (status == STATUS_OBJECT_NAME_EXISTS) {
+        requestContext = WintapGetRequestContext(Request);
+        status = STATUS_SUCCESS;
+    }
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    WdfSpinLockAcquire(Context->FrameLock);
+    ULONG* count = IsRead
+        ? &Context->PendingReadCount
+        : &Context->PendingWriteCount;
+    ULONG limit = IsRead
+        ? Context->PendingReadLimit
+        : Context->PendingWriteLimit;
+    if (Context->Removed) {
+        WdfSpinLockRelease(Context->FrameLock);
+        return STATUS_DEVICE_REMOVED;
+    }
+    if (Context->Closing || Context->Suspended) {
+        WdfSpinLockRelease(Context->FrameLock);
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (requestContext->Counted || *count >= limit) {
+        WdfSpinLockRelease(Context->FrameLock);
+        return STATUS_DEVICE_BUSY;
+    }
+
+    requestContext->Counted = TRUE;
+    requestContext->IsRead = IsRead;
+    ++*count;
+    WdfSpinLockRelease(Context->FrameLock);
+    return STATUS_SUCCESS;
+}
+
+static VOID
+WintapReleasePendingRequest(
+    _In_ PWINTAP_DEVICE_CONTEXT Context,
+    _In_ WDFREQUEST Request
+    )
+{
+    PWINTAP_REQUEST_CONTEXT requestContext =
+        WintapGetRequestContext(Request);
+
+    WdfSpinLockAcquire(Context->FrameLock);
+    if (requestContext->Counted) {
+        ULONG* count = requestContext->IsRead
+            ? &Context->PendingReadCount
+            : &Context->PendingWriteCount;
+        if (*count != 0) {
+            --*count;
+        }
+        requestContext->Counted = FALSE;
+    }
+    WdfSpinLockRelease(Context->FrameLock);
 }
 
 static VOID
@@ -215,6 +316,7 @@ WintapCompletePendingReads(
             WdfSpinLockRelease(Context->FrameLock);
             return;
         }
+        WintapReleasePendingRequest(Context, request);
 
         PVOID outputBuffer = nullptr;
         size_t outputLength = 0;
@@ -226,11 +328,14 @@ WintapCompletePendingReads(
         if (NT_SUCCESS(status)) {
             RtlCopyMemory(outputBuffer, frame->Data, frame->Length);
             WdfRequestCompleteWithInformation(request, STATUS_SUCCESS, frame->Length);
+            ExFreePoolWithTag(frame, 'paTW');
         } else {
             WdfRequestComplete(request, status);
+            WdfSpinLockAcquire(Context->FrameLock);
+            InsertHeadList(&Context->FromStackQueue, &frame->ListEntry);
+            ++Context->FromStackCount;
+            WdfSpinLockRelease(Context->FrameLock);
         }
-
-        ExFreePoolWithTag(frame, 'paTW');
     }
 }
 
@@ -290,11 +395,18 @@ WintapDrainPendingWrites(
         if (!NT_SUCCESS(status)) {
             return;
         }
+        WintapReleasePendingRequest(Context, request);
 
         size_t bytesAccepted = 0;
         status = WintapProcessWriteRequest(Context, request, &bytesAccepted);
         if (status == STATUS_DEVICE_BUSY) {
-            status = WdfRequestForwardToIoQueue(request, Context->WriteQueue);
+            status = WintapMarkPendingRequest(Context, request, FALSE);
+            if (NT_SUCCESS(status)) {
+                status = WdfRequestForwardToIoQueue(request, Context->WriteQueue);
+                if (!NT_SUCCESS(status)) {
+                    WintapReleasePendingRequest(Context, request);
+                }
+            }
             if (!NT_SUCCESS(status)) {
                 WdfRequestComplete(request, status);
             }
@@ -322,12 +434,35 @@ WintapScheduleWriteDrain(
     WdfSpinLockAcquire(Context->FrameLock);
     if (!Context->WriteDrainQueued && !Context->Closing) {
         Context->WriteDrainQueued = TRUE;
+        KeClearEvent(&Context->WriteDrainIdle);
         enqueue = TRUE;
     }
     WdfSpinLockRelease(Context->FrameLock);
 
     if (enqueue) {
         WdfWorkItemEnqueue(Context->WriteDrainWorkItem);
+    }
+}
+
+static VOID
+WintapScheduleReadCompletion(
+    _In_ PWINTAP_DEVICE_CONTEXT Context
+    )
+{
+    BOOLEAN enqueue = FALSE;
+    WdfSpinLockAcquire(Context->FrameLock);
+    if (!Context->ReadCompletionQueued &&
+        !Context->Closing &&
+        !Context->Removed &&
+        !Context->Suspended) {
+        Context->ReadCompletionQueued = TRUE;
+        KeClearEvent(&Context->ReadCompletionIdle);
+        enqueue = TRUE;
+    }
+    WdfSpinLockRelease(Context->FrameLock);
+
+    if (enqueue) {
+        WdfWorkItemEnqueue(Context->ReadCompletionWorkItem);
     }
 }
 
@@ -387,14 +522,21 @@ WintapCreateControlDevice(
 
     PWINTAP_DEVICE_CONTEXT context = WintapGetDeviceContext(device);
     context->FrameLimit = WINTAP_FRAME_LIMIT;
+    context->PendingReadLimit = WINTAP_PENDING_READ_LIMIT;
+    context->PendingWriteLimit = WINTAP_PENDING_WRITE_LIMIT;
+    context->PendingReadCount = 0;
+    context->PendingWriteCount = 0;
     context->Closing = FALSE;
     context->Removed = FALSE;
     context->Suspended = FALSE;
     context->WriteDrainQueued = FALSE;
     context->WriteDrainRunning = FALSE;
+    context->ReadCompletionQueued = FALSE;
+    context->ReadCompletionRunning = FALSE;
     context->ActiveCallbacks = 0;
     KeInitializeEvent(&context->CallbackIdle, NotificationEvent, TRUE);
     KeInitializeEvent(&context->WriteDrainIdle, NotificationEvent, TRUE);
+    KeInitializeEvent(&context->ReadCompletionIdle, NotificationEvent, TRUE);
     InitializeListHead(&context->ToStackQueue);
     InitializeListHead(&context->FromStackQueue);
 
@@ -412,6 +554,7 @@ WintapCreateControlDevice(
 
     WDF_IO_QUEUE_CONFIG readConfig;
     WDF_IO_QUEUE_CONFIG_INIT(&readConfig, WdfIoQueueDispatchManual);
+    readConfig.EvtIoStop = WintapEvtIoStop;
     WDF_OBJECT_ATTRIBUTES readAttributes;
     WDF_OBJECT_ATTRIBUTES_INIT(&readAttributes);
     status = WdfIoQueueCreate(device, &readConfig, &readAttributes, &context->ReadQueue);
@@ -421,6 +564,7 @@ WintapCreateControlDevice(
 
     WDF_IO_QUEUE_CONFIG writeConfig;
     WDF_IO_QUEUE_CONFIG_INIT(&writeConfig, WdfIoQueueDispatchManual);
+    writeConfig.EvtIoStop = WintapEvtIoStop;
     WDF_OBJECT_ATTRIBUTES writeAttributes;
     WDF_OBJECT_ATTRIBUTES_INIT(&writeAttributes);
     status = WdfIoQueueCreate(
@@ -443,6 +587,17 @@ WintapCreateControlDevice(
         &workItemConfig,
         &workItemAttributes,
         &context->WriteDrainWorkItem);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    WDF_WORKITEM_CONFIG_INIT(
+        &workItemConfig,
+        WintapEvtReadCompletionWorkItem);
+    status = WdfWorkItemCreate(
+        &workItemConfig,
+        &workItemAttributes,
+        &context->ReadCompletionWorkItem);
     if (!NT_SUCCESS(status)) {
         return status;
     }
@@ -585,21 +740,23 @@ WintapEvtDeviceAdd(
         return status;
     }
 
-    status = WintapCreateAdapter(device);
+    status = WintapCreateControlDevice(WdfDeviceGetDriver(device));
     if (!NT_SUCCESS(status)) {
         return status;
     }
 
-    status = WintapCreateControlDevice(WdfDeviceGetDriver(device));
+    status = WintapCreateAdapter(device);
     if (!NT_SUCCESS(status)) {
-        NETADAPTER adapterToStop;
+        WDFDEVICE controlDevice;
         KIRQL oldIrql;
         KeAcquireSpinLock(&g_ControlContextLock, &oldIrql);
-        adapterToStop = g_Adapter;
+        controlDevice = g_ControlDevice;
         g_Adapter = nullptr;
+        g_ControlDevice = nullptr;
+        g_ControlContext = nullptr;
         KeReleaseSpinLock(&g_ControlContextLock, oldIrql);
-        if (adapterToStop != nullptr) {
-            NetAdapterStop(adapterToStop);
+        if (controlDevice != nullptr) {
+            WdfObjectDelete(controlDevice);
         }
     }
     return status;
@@ -671,7 +828,12 @@ WintapEvtReleaseHardware(
         WdfIoQueuePurgeSynchronously(context->ReadQueue);
         WdfIoQueuePurgeSynchronously(context->WriteQueue);
     }
+    WdfSpinLockAcquire(context->FrameLock);
+    context->PendingReadCount = 0;
+    context->PendingWriteCount = 0;
+    WdfSpinLockRelease(context->FrameLock);
     WintapWaitForWriteDrain(context);
+    WintapWaitForReadCompletion(context);
     WintapFreeFrames(context);
     if (controlDevice != nullptr) {
         WdfObjectDelete(controlDevice);
@@ -696,6 +858,8 @@ WintapEvtDeviceD0Entry(
             context->Suspended = FALSE;
         }
         WdfSpinLockRelease(context->FrameLock);
+        WintapScheduleWriteDrain(context);
+        WintapScheduleReadCompletion(context);
     }
     return STATUS_SUCCESS;
 }
@@ -728,7 +892,12 @@ WintapEvtDeviceD0Exit(
         WdfIoQueuePurgeSynchronously(context->ReadQueue);
         WdfIoQueuePurgeSynchronously(context->WriteQueue);
     }
+    WdfSpinLockAcquire(context->FrameLock);
+    context->PendingReadCount = 0;
+    context->PendingWriteCount = 0;
+    WdfSpinLockRelease(context->FrameLock);
     WintapWaitForWriteDrain(context);
+    WintapWaitForReadCompletion(context);
     WintapFreeFrames(context);
     return STATUS_SUCCESS;
 }
@@ -779,6 +948,10 @@ WintapEvtFileCleanup(
     WdfSpinLockRelease(context->FrameLock);
     WdfIoQueuePurgeSynchronously(context->ReadQueue);
     WdfIoQueuePurgeSynchronously(context->WriteQueue);
+    WdfSpinLockAcquire(context->FrameLock);
+    context->PendingReadCount = 0;
+    context->PendingWriteCount = 0;
+    WdfSpinLockRelease(context->FrameLock);
     KeWaitForSingleObject(
         &context->CallbackIdle,
         Executive,
@@ -786,6 +959,7 @@ WintapEvtFileCleanup(
         FALSE,
         nullptr);
     WintapWaitForWriteDrain(context);
+    WintapWaitForReadCompletion(context);
     WintapFreeFrames(context);
     WdfSpinLockAcquire(context->FrameLock);
     context->Closing = context->Removed;
@@ -827,6 +1001,29 @@ WintapEvtWriteDrainWorkItem(
 
 _Use_decl_annotations_
 VOID
+WintapEvtReadCompletionWorkItem(
+    WDFWORKITEM WorkItem
+    )
+{
+    WDFDEVICE device = static_cast<WDFDEVICE>(
+        WdfWorkItemGetParentObject(WorkItem));
+    PWINTAP_DEVICE_CONTEXT context = WintapGetDeviceContext(device);
+    WdfSpinLockAcquire(context->FrameLock);
+    context->ReadCompletionQueued = FALSE;
+    context->ReadCompletionRunning = TRUE;
+    KeClearEvent(&context->ReadCompletionIdle);
+    WdfSpinLockRelease(context->FrameLock);
+
+    WintapCompletePendingReads(context);
+
+    WdfSpinLockAcquire(context->FrameLock);
+    context->ReadCompletionRunning = FALSE;
+    KeSetEvent(&context->ReadCompletionIdle, IO_NO_INCREMENT, FALSE);
+    WdfSpinLockRelease(context->FrameLock);
+}
+
+_Use_decl_annotations_
+VOID
 WintapEvtIoRead(
     WDFQUEUE Queue,
     WDFREQUEST Request,
@@ -852,8 +1049,17 @@ WintapEvtIoRead(
         &context->FromStackQueue,
         &context->FromStackCount);
     if (frame == nullptr) {
+        NTSTATUS markStatus = WintapMarkPendingRequest(
+            context,
+            Request,
+            TRUE);
+        if (!NT_SUCCESS(markStatus)) {
+            WdfRequestComplete(Request, markStatus);
+            return;
+        }
         NTSTATUS status = WdfRequestForwardToIoQueue(Request, context->ReadQueue);
         if (!NT_SUCCESS(status)) {
+            WintapReleasePendingRequest(context, Request);
             WdfRequestComplete(Request, status);
         }
         return;
@@ -904,8 +1110,14 @@ WintapEvtIoWrite(
         Request,
         &bytesAccepted);
     if (status == STATUS_DEVICE_BUSY) {
+        status = WintapMarkPendingRequest(context, Request, FALSE);
+        if (!NT_SUCCESS(status)) {
+            WdfRequestComplete(Request, status);
+            return;
+        }
         status = WdfRequestForwardToIoQueue(Request, context->WriteQueue);
         if (!NT_SUCCESS(status)) {
+            WintapReleasePendingRequest(context, Request);
             WdfRequestComplete(Request, status);
         }
         return;
@@ -919,6 +1131,35 @@ WintapEvtIoWrite(
     } else {
         WdfRequestComplete(Request, status);
     }
+}
+
+_Use_decl_annotations_
+VOID
+WintapEvtIoStop(
+    WDFQUEUE Queue,
+    WDFREQUEST Request,
+    ULONG ActionFlags
+    )
+{
+    WDFDEVICE device = WdfIoQueueGetDevice(Queue);
+    PWINTAP_DEVICE_CONTEXT context = WintapGetDeviceContext(device);
+
+    if ((ActionFlags & WdfRequestStopActionSuspend) != 0) {
+        WdfRequestStopAcknowledge(Request, TRUE);
+        return;
+    }
+
+    WintapReleasePendingRequest(context, Request);
+    WdfSpinLockAcquire(context->FrameLock);
+    BOOLEAN removed = context->Removed;
+    WdfSpinLockRelease(context->FrameLock);
+    WdfRequestComplete(
+        Request,
+        (ActionFlags & WdfRequestStopActionPurge) != 0
+            ? (removed
+                ? STATUS_DEVICE_REMOVED
+                : STATUS_DEVICE_NOT_READY)
+            : STATUS_DEVICE_NOT_READY);
 }
 
 _Use_decl_annotations_
@@ -1116,7 +1357,7 @@ WintapCaptureTransmitPackets(
             packet->FragmentCount);
     }
 
-    WintapCompletePendingReads(ControlContext);
+    WintapScheduleReadCompletion(ControlContext);
 }
 
 static VOID

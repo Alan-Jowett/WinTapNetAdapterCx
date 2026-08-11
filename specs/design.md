@@ -95,6 +95,9 @@ state shall be annotated and placed accordingly.
    discarded during an explicitly defined stop/error path.
 5. Framework packet ownership is returned at the framework-required completion
    point and never retained across adapter teardown.
+6. If a pending read cannot accept the frame because its output buffer is too
+   small, that request completes with `STATUS_BUFFER_TOO_SMALL` and the frame
+   remains queued for a later compatible read.
 
 The implementation uses the installed WDK ring iterator contract:
 `NetTxQueueGetRingCollection`, `NetRxQueueGetRingCollection`,
@@ -120,6 +123,12 @@ The design shall maintain separate bounded queues for:
 - received Ethernet frames awaiting user reads;
 - pending overlapped reads and writes.
 
+The pending read and write queues each have a finite limit of 256 requests.
+Requests beyond the limit fail with an explicit busy status. Request counters
+are owned by the queue transition that marks a request pending and are
+decremented exactly once when the request is retrieved, cancelled, purged, or
+removed after a forwarding failure.
+
 Each queue shall have explicit states: `OPEN`, `CLOSING`, and `CLOSED`.
 
 - `OPEN`: new work may be accepted.
@@ -134,6 +143,9 @@ configuration shall reject zero, overflowed, or unsupported sizes.
 The implementation resumes blocked user writes from a passive WDF work item
 after RX ring capacity is consumed; this keeps request-buffer capture on a WDF
 I/O/work-item path rather than doing it from the packet callback.
+
+Packet callbacks only manipulate nonpaged driver-owned state and schedule
+passive work for user-buffer access and request completion.
 
 Pending reads and writes are held by WDF manual queues. WDF owns cancellation
 while a request is queued, and synchronous queue purge owns terminal
@@ -200,6 +212,12 @@ pause network traffic before resources become unavailable, preserve or fail
 user requests deterministically, and restart only after hardware-independent
 software state is valid. Since the adapter is software-only, no power-state
 shortcut may bypass framework-required pause, stop, or restart callbacks.
+
+On D0 exit, the control path enters `Suspended`, pending user requests fail
+with `STATUS_DEVICE_NOT_READY`, queued frames are discarded through the
+documented stop/error path, and callbacks and passive work items quiesce before
+frame cleanup. D0 entry clears `Suspended` only after state is valid and
+reschedules required passive drain/completion work.
 
 ## Error handling and cleanup
 
