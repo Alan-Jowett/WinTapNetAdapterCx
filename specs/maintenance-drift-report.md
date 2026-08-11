@@ -54,3 +54,14 @@ The corrective patch set reduces specification-to-implementation drift and
 hardens callback, power, queue, fragment-copy, and teardown paths. The project
 remains **REVISE-IMPLEMENTATION** until the deferred privileged runtime evidence
 and RX ownership verification are completed.
+
+## Alignment audit continuation
+
+The subsequent `/maintain` audit used collision-free finding identifiers
+`F-015` through `F-026` and approved changes `CHG-015` through `CHG-022`.
+`CHG-021` was superseded by the consolidated D0 semantics in `CHG-019`.
+The approved rationale was: "Align the implementation with the spec."
+
+Applied changes are traced by `specs/current-status.md` and validation cases
+`TC-015` through `TC-022`. Findings F-017, F-018, F-022, and F-023 remain
+deferred.

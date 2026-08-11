@@ -17,6 +17,16 @@
 | VAL-006 | REQ-006 | Run the complete build, install, packet-path, concurrency, cancellation, power, malformed-input, and cleanup suite with Driver Verifier-compatible settings. |
 | VAL-007 | REQ-007 | Configure and build from a clean environment with CMake and the Visual Studio generator for x64 and ARM64; verify NuGet WDK/SDK dependencies resolve reproducibly and missing prerequisites fail at configuration. |
 
+| Test | Coverage |
+|---|---|
+| TC-015 | Verify the control context exists before adapter start and early packet callbacks are not dropped. |
+| TC-016 | Verify pending read/write limits reject excess requests deterministically. |
+| TC-017 | Verify pending-operation counters remain correct across retrieval, cancellation, purge, and requeue. |
+| TC-018 | Verify packet callbacks schedule passive completion and never access user buffers at DISPATCH_LEVEL. |
+| TC-019 | Verify D0 exit/entry request, frame, callback, and work-item transitions. |
+| TC-020 | Verify an undersized pending read fails without losing the queued frame. |
+| TC-022 | Verify hosted/runtime readiness status matches the evidence actually available. |
+
 ## Functional tests
 
 1. **Adapter publication:** install, enumerate, enable, disable, and uninstall
@@ -110,3 +120,7 @@ installed test-signed driver and validates administrator access, exclusive
 open behavior, malformed writes, overlapped cancellation, and valid writes.
 Packet exchange, queue saturation, power, removal, and verifier scenarios
 remain privileged acceptance gates until a suitable test machine is available.
+
+TC-015 through TC-022 are implementation and specification trace points for
+the approved maintenance corrections. Privileged cases remain manual gates
+where noted above.

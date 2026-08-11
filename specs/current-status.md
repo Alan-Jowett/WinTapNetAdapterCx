@@ -2,8 +2,9 @@
 
 **Status date:** 2026-08-10  
 **Requirements:** Approved baseline `REQ-001` through `REQ-007`  
-**Implementation:** Corrective patch set `CHG-001` through `CHG-014` applied
-without changing the approved Ethernet/TAP scope.
+**Implementation:** Corrective patch sets `CHG-001` through `CHG-014` and
+`CHG-015` through `CHG-020` plus `CHG-022` applied without changing the
+approved Ethernet/TAP scope. `CHG-021` was superseded by `CHG-019`.
 
 ## Verified in the repository
 
@@ -16,6 +17,9 @@ without changing the approved Ethernet/TAP scope.
 - Fragment metadata is checked before every packet copy.
 - The user-mode harness covers administrator access, exclusive open behavior,
   malformed writes, overlapped cancellation, and valid writes.
+- The maintenance alignment corrections bound pending operations, defer
+  packet-path user-buffer completion to passive work, preserve frames for
+  undersized reads, and define D0 request/frame behavior.
 
 ## Deferred evidence
 
@@ -40,3 +44,29 @@ without changing the approved Ethernet/TAP scope.
 
 This page is the current status record. Historical phase and audit documents
 remain unchanged for traceability.
+
+## Maintenance alignment trace
+
+| Finding | Change | Verification | Status |
+|---|---|---|---|
+| F-015 | CHG-015 | TC-015 | Applied |
+| F-016 | CHG-016 | TC-016, TC-017 | Applied |
+| F-019 | CHG-017 | Specification trace | Applied |
+| F-020 | CHG-018 | TC-018 | Applied |
+| F-021, F-025 | CHG-019 | TC-019 | Applied |
+| F-024 | CHG-020 | TC-020 | Applied |
+| F-026 | CHG-022 | TC-022 | Applied |
+
+F-017, F-018, F-022, and F-023 remain deferred pending privileged or
+authoritative NetAdapterCx evidence.
+
+## Post-alignment verification
+
+- Specification artifact validation passed.
+- PowerShell syntax validation passed.
+- x64 Debug direct MSBuild build and test signing passed.
+- ARM64 Debug direct MSBuild build and test signing passed.
+- x64 and ARM64 package artifact validation passed.
+- CMake x64 package build passed.
+- Catalog generation, installation, packet-path, power-transition, removal,
+  and Driver Verifier execution remain deferred as documented above.

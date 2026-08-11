@@ -16,23 +16,38 @@ typedef struct _WINTAP_DEVICE_CONTEXT {
     WDFQUEUE WriteQueue;
     WDFQUEUE DefaultQueue;
     WDFWORKITEM WriteDrainWorkItem;
+    WDFWORKITEM ReadCompletionWorkItem;
     WDFSPINLOCK FrameLock;
     LIST_ENTRY ToStackQueue;
     LIST_ENTRY FromStackQueue;
     ULONG ToStackCount;
     ULONG FromStackCount;
     ULONG FrameLimit;
+    ULONG PendingReadCount;
+    ULONG PendingWriteCount;
+    ULONG PendingReadLimit;
+    ULONG PendingWriteLimit;
     BOOLEAN Closing;
     BOOLEAN Removed;
     BOOLEAN Suspended;
     BOOLEAN WriteDrainQueued;
     BOOLEAN WriteDrainRunning;
+    BOOLEAN ReadCompletionQueued;
+    BOOLEAN ReadCompletionRunning;
     LONG ActiveCallbacks;
     KEVENT CallbackIdle;
     KEVENT WriteDrainIdle;
+    KEVENT ReadCompletionIdle;
 } WINTAP_DEVICE_CONTEXT, *PWINTAP_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WINTAP_DEVICE_CONTEXT, WintapGetDeviceContext);
+
+typedef struct _WINTAP_REQUEST_CONTEXT {
+    BOOLEAN Counted;
+    BOOLEAN IsRead;
+} WINTAP_REQUEST_CONTEXT, *PWINTAP_REQUEST_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WINTAP_REQUEST_CONTEXT, WintapGetRequestContext);
 
 typedef struct _WINTAP_QUEUE_CONTEXT {
     BOOLEAN IsTransmit;
@@ -56,7 +71,9 @@ EVT_WDF_FILE_CLEANUP WintapEvtFileCleanup;
 EVT_WDF_FILE_CLOSE WintapEvtFileClose;
 EVT_WDF_IO_QUEUE_IO_READ WintapEvtIoRead;
 EVT_WDF_IO_QUEUE_IO_WRITE WintapEvtIoWrite;
+EVT_WDF_IO_QUEUE_IO_STOP WintapEvtIoStop;
 EVT_WDF_WORKITEM WintapEvtWriteDrainWorkItem;
+EVT_WDF_WORKITEM WintapEvtReadCompletionWorkItem;
 EVT_NET_ADAPTER_CREATE_TXQUEUE WintapEvtCreateTxQueue;
 EVT_NET_ADAPTER_CREATE_RXQUEUE WintapEvtCreateRxQueue;
 EVT_PACKET_QUEUE_ADVANCE WintapEvtPacketQueueAdvance;

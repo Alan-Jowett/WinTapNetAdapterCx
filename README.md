@@ -19,7 +19,9 @@ Ethernet frames with the Windows networking stack.
 
 ## Status
 
-The approved `CHG-001` through `CHG-014` maintenance patch set is applied.
+The approved `CHG-001` through `CHG-014` maintenance patch set is applied, and
+the approved `CHG-015` through `CHG-020` plus `CHG-022` alignment corrections
+are applied. `CHG-021` was superseded by the consolidated D0 change.
 Hosted validation covers repository artifacts, WDK tool provisioning, CMake
 configure/build/package, and package shape for x64 and ARM64. The privileged
 runtime harness requires an installed test-signed driver and an elevated
