@@ -121,6 +121,6 @@ open behavior, malformed writes, overlapped cancellation, and valid writes.
 Packet exchange, queue saturation, power, removal, and verifier scenarios
 remain privileged acceptance gates until a suitable test machine is available.
 
-TC-015 through TC-022 are implementation and specification trace points for
-the approved maintenance corrections. Privileged cases remain manual gates
-where noted above.
+TC-015, TC-016, TC-017, TC-018, TC-019, TC-020, and TC-022 are implementation
+and specification trace points for the approved maintenance corrections.
+Privileged cases remain manual gates where noted above.

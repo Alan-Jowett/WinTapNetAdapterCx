@@ -165,8 +165,15 @@ WintapMarkPendingRequest(
     ULONG limit = IsRead
         ? Context->PendingReadLimit
         : Context->PendingWriteLimit;
-    if (Context->Closing || Context->Removed || Context->Suspended ||
-        requestContext->Counted || *count >= limit) {
+    if (Context->Removed) {
+        WdfSpinLockRelease(Context->FrameLock);
+        return STATUS_DEVICE_REMOVED;
+    }
+    if (Context->Closing || Context->Suspended) {
+        WdfSpinLockRelease(Context->FrameLock);
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (requestContext->Counted || *count >= limit) {
         WdfSpinLockRelease(Context->FrameLock);
         return STATUS_DEVICE_BUSY;
     }
@@ -1134,11 +1141,25 @@ WintapEvtIoStop(
     ULONG ActionFlags
     )
 {
-    UNREFERENCED_PARAMETER(ActionFlags);
     WDFDEVICE device = WdfIoQueueGetDevice(Queue);
-    WintapReleasePendingRequest(
-        WintapGetDeviceContext(device),
-        Request);
+    PWINTAP_DEVICE_CONTEXT context = WintapGetDeviceContext(device);
+
+    if ((ActionFlags & WdfRequestStopActionSuspend) != 0) {
+        WdfRequestStopAcknowledge(Request, TRUE);
+        return;
+    }
+
+    WintapReleasePendingRequest(context, Request);
+    WdfSpinLockAcquire(context->FrameLock);
+    BOOLEAN removed = context->Removed;
+    WdfSpinLockRelease(context->FrameLock);
+    WdfRequestComplete(
+        Request,
+        (ActionFlags & WdfRequestStopActionPurge) != 0
+            ? (removed
+                ? STATUS_DEVICE_REMOVED
+                : STATUS_DEVICE_NOT_READY)
+            : STATUS_DEVICE_NOT_READY);
 }
 
 _Use_decl_annotations_

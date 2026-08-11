@@ -63,5 +63,5 @@ The subsequent `/maintain` audit used collision-free finding identifiers
 The approved rationale was: "Align the implementation with the spec."
 
 Applied changes are traced by `specs/current-status.md` and validation cases
-`TC-015` through `TC-022`. Findings F-017, F-018, F-022, and F-023 remain
-deferred.
+`TC-015`, `TC-016`, `TC-017`, `TC-018`, `TC-019`, `TC-020`, and `TC-022`.
+Findings F-017, F-018, F-022, and F-023 remain deferred.
