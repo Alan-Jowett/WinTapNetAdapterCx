@@ -11,8 +11,8 @@ mod frame_queue;
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{
     DRIVER_OBJECT, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, UNICODE_STRING,
-    WDF_DRIVER_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDFDEVICE, WDFDEVICE_INIT,
-    WDFDRIVER,
+    WDFCMRESLIST, WDF_DRIVER_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDFDEVICE,
+    WDFDEVICE_INIT, WDFDRIVER, WDF_PNPPOWER_EVENT_CALLBACKS,
     call_unsafe_wdf_function_binding,
 };
 
@@ -22,6 +22,9 @@ static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 const STATUS_SUCCESS: NTSTATUS = 0;
 const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as i32;
+const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as i32;
+const FRAME_MINIMUM: usize = 14;
+const FRAME_MAXIMUM: usize = 1514;
 const CONTROL_DEVICE_NAME: [u16; 27] = [
     b'\\' as u16, b'D' as u16, b'e' as u16, b'v' as u16, b'i' as u16, b'c' as u16,
     b'e' as u16, b'\\' as u16, b'W' as u16, b'i' as u16, b'n' as u16, b'T' as u16,
@@ -41,6 +44,9 @@ const CONTROL_SDDL: [u16; 15] = [
     b';' as u16, b'G' as u16, b'A' as u16, b';' as u16, b';' as u16, b'B' as u16,
     b'A' as u16, b')' as u16, 0,
 ];
+
+static mut ADAPTER: netadaptercx_sys::NETADAPTER = core::ptr::null_mut();
+static mut CONTROL_DEVICE: WDFDEVICE = core::ptr::null_mut();
 
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_STATE>();
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES>();
@@ -96,6 +102,29 @@ extern "C" fn evt_driver_device_add(
     driver: WDFDRIVER,
     device_init: *mut WDFDEVICE_INIT,
 ) -> NTSTATUS {
+    let status = unsafe {
+        // SAFETY: NetDeviceInitConfig is called once at PASSIVE_LEVEL before
+        // the WDF device is created.
+        net_call_device_init_config(device_init)
+    };
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+
+    let mut pnp_callbacks = WDF_PNPPOWER_EVENT_CALLBACKS {
+        Size: core::mem::size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG,
+        EvtDevicePrepareHardware: Some(evt_device_prepare_hardware),
+        EvtDeviceReleaseHardware: Some(evt_device_release_hardware),
+        ..WDF_PNPPOWER_EVENT_CALLBACKS::default()
+    };
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceInitSetPnpPowerEventCallbacks,
+            device_init,
+            &mut pnp_callbacks,
+        );
+    }
+
     let mut pnp_init = device_init;
     let mut _pnp_device: WDFDEVICE = core::ptr::null_mut();
     let status = unsafe {
@@ -110,7 +139,312 @@ extern "C" fn evt_driver_device_add(
         return status;
     }
 
-    create_control_device(driver)
+    let status = create_control_device(driver);
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+
+    // SAFETY: The WDF device has been created and this callback runs at
+    // PASSIVE_LEVEL during device addition.
+    unsafe { create_adapter(_pnp_device) }
+}
+
+unsafe fn net_function<T: Copy>(index: usize) -> T {
+    // NetAdapterCx exposes its ABI as a versioned function table. The
+    // generated bindings provide the table symbol and exact handle types.
+    let table = core::ptr::addr_of!(netadaptercx_sys::NetFunctions)
+        as *const netadaptercx_sys::NETFUNC;
+    let entry = unsafe { table.add(index).read() };
+    unsafe { core::mem::transmute_copy(&entry) }
+}
+
+unsafe fn net_call_device_init_config(device_init: *mut WDFDEVICE_INIT) -> NTSTATUS {
+    let function: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        *mut WDFDEVICE_INIT,
+    ) -> NTSTATUS = unsafe {
+        net_function(netadaptercx_sys::_NETFUNCENUM_NetDeviceInitConfigTableIndex as usize)
+    };
+    // SAFETY: NetDriverGlobals and DeviceInit are supplied by NetAdapterCx/WDF.
+    unsafe { function(netadaptercx_sys::NetDriverGlobals, device_init) }
+}
+
+unsafe fn create_adapter(device: WDFDEVICE) -> NTSTATUS {
+    let allocate: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        WDFDEVICE,
+    ) -> *mut netadaptercx_sys::NETADAPTER_INIT = unsafe {
+        net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterInitAllocateTableIndex as usize)
+    };
+    let adapter_init = unsafe { allocate(netadaptercx_sys::NetDriverGlobals, device) };
+    if adapter_init.is_null() {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    let mut callbacks = netadaptercx_sys::NET_ADAPTER_DATAPATH_CALLBACKS {
+        Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_DATAPATH_CALLBACKS>() as ULONG,
+        EvtAdapterCreateTxQueue: Some(evt_create_tx_queue),
+        EvtAdapterCreateRxQueue: Some(evt_create_rx_queue),
+    };
+    let set_callbacks: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        *mut netadaptercx_sys::NETADAPTER_INIT,
+        *mut netadaptercx_sys::NET_ADAPTER_DATAPATH_CALLBACKS,
+    ) = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetAdapterInitSetDatapathCallbacksTableIndex
+                as usize,
+        )
+    };
+    // SAFETY: AdapterInit and callback storage remain valid for this call.
+    unsafe {
+        set_callbacks(
+            netadaptercx_sys::NetDriverGlobals,
+            adapter_init,
+            &mut callbacks,
+        );
+    }
+
+    let create: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        *mut netadaptercx_sys::NETADAPTER_INIT,
+        *mut wdk_sys::WDF_OBJECT_ATTRIBUTES,
+        *mut netadaptercx_sys::NETADAPTER,
+    ) -> NTSTATUS = unsafe {
+        net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterCreateTableIndex as usize)
+    };
+    let mut adapter = core::ptr::null_mut();
+    // SAFETY: The adapter-init object is consumed by NetAdapterCreate.
+    let status = unsafe {
+        create(
+            netadaptercx_sys::NetDriverGlobals,
+            adapter_init,
+            core::ptr::null_mut(),
+            &mut adapter,
+        )
+    };
+    if status == STATUS_SUCCESS {
+        unsafe {
+            ADAPTER = adapter;
+        }
+    } else {
+        let free: unsafe extern "system" fn(
+            netadaptercx_sys::PNET_DRIVER_GLOBALS,
+            *mut netadaptercx_sys::NETADAPTER_INIT,
+        ) = unsafe {
+            net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterInitFreeTableIndex as usize)
+        };
+        // SAFETY: AdapterCreate did not consume the failed init object.
+        unsafe { free(netadaptercx_sys::NetDriverGlobals, adapter_init) };
+    }
+    status
+}
+
+extern "C" fn evt_create_tx_queue(
+    _adapter: netadaptercx_sys::NETADAPTER,
+    _queue_init: *mut netadaptercx_sys::NETTXQUEUE_INIT,
+) -> NTSTATUS {
+    STATUS_NOT_SUPPORTED
+}
+
+extern "C" fn evt_create_rx_queue(
+    _adapter: netadaptercx_sys::NETADAPTER,
+    _queue_init: *mut netadaptercx_sys::NETRXQUEUE_INIT,
+) -> NTSTATUS {
+    STATUS_NOT_SUPPORTED
+}
+
+extern "C" fn evt_device_prepare_hardware(
+    _device: WDFDEVICE,
+    _resources_raw: WDFCMRESLIST,
+    _resources_translated: WDFCMRESLIST,
+) -> NTSTATUS {
+    let adapter = unsafe { ADAPTER };
+    if adapter.is_null() {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    let mut tx = netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES {
+        Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES>() as ULONG,
+        MaximumNumberOfFragments: u64::MAX,
+        MaximumNumberOfQueues: 1,
+        ..netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES::default()
+    };
+    let mut rx = netadaptercx_sys::NET_ADAPTER_RX_CAPABILITIES {
+        Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_RX_CAPABILITIES>() as ULONG,
+        AllocationMode:
+            netadaptercx_sys::_NET_RX_FRAGMENT_BUFFER_ALLOCATION_MODE_NetRxFragmentBufferAllocationModeSystem,
+        AttachmentMode:
+            netadaptercx_sys::_NET_RX_FRAGMENT_BUFFER_ATTACHMENT_MODE_NetRxFragmentBufferAttachmentModeSystem,
+        FragmentRingNumberOfElementsHint: 0,
+        MaximumFrameSize: FRAME_MAXIMUM as u64,
+        MaximumNumberOfQueues: 1,
+        ..netadaptercx_sys::NET_ADAPTER_RX_CAPABILITIES::default()
+    };
+    let set_data_path: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        *mut netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES,
+        *mut netadaptercx_sys::NET_ADAPTER_RX_CAPABILITIES,
+    ) = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetDataPathCapabilitiesTableIndex as usize,
+        )
+    };
+    // SAFETY: Adapter and capability structures are valid for this PASSIVE_LEVEL callback.
+    unsafe {
+        set_data_path(
+            netadaptercx_sys::NetDriverGlobals,
+            adapter,
+            &mut tx,
+            &mut rx,
+        );
+    }
+
+    let mut link_layer = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES {
+        Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES>()
+            as ULONG,
+        MaxTxLinkSpeed: 1_000_000_000,
+        MaxRxLinkSpeed: 1_000_000_000,
+    };
+    let set_link_layer: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        *mut netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES,
+    ) = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetLinkLayerCapabilitiesTableIndex as usize,
+        )
+    };
+    unsafe {
+        set_link_layer(
+            netadaptercx_sys::NetDriverGlobals,
+            adapter,
+            &mut link_layer,
+        );
+    }
+
+    let set_mtu: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        ULONG,
+    ) = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetLinkLayerMtuSizeTableIndex as usize,
+        )
+    };
+    unsafe {
+        set_mtu(
+            netadaptercx_sys::NetDriverGlobals,
+            adapter,
+            (FRAME_MAXIMUM - FRAME_MINIMUM) as ULONG,
+        );
+    }
+
+    let address = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS {
+        Length: 6,
+        Address: [
+            0x02, 0x57, 0x54, 0x41, 0x50, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
+    };
+    let set_permanent: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        *const netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS,
+    ) = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetPermanentLinkLayerAddressTableIndex
+                as usize,
+        )
+    };
+    let set_current: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        *const netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS,
+    ) = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetCurrentLinkLayerAddressTableIndex as usize,
+        )
+    };
+    unsafe {
+        set_permanent(netadaptercx_sys::NetDriverGlobals, adapter, &address);
+        set_current(netadaptercx_sys::NetDriverGlobals, adapter, &address);
+    }
+
+    let mut link_state = netadaptercx_sys::NET_ADAPTER_LINK_STATE {
+        Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_STATE>() as ULONG,
+        TxLinkSpeed: 1_000_000_000,
+        RxLinkSpeed: 1_000_000_000,
+        MediaConnectState:
+            netadaptercx_sys::_NET_IF_MEDIA_CONNECT_STATE_MediaConnectStateConnected,
+        MediaDuplexState: netadaptercx_sys::_NET_IF_MEDIA_DUPLEX_STATE_MediaDuplexStateFull,
+        SupportedPauseFunctions:
+            netadaptercx_sys::_NET_ADAPTER_PAUSE_FUNCTION_TYPE_NetAdapterPauseFunctionTypeUnsupported,
+        AutoNegotiationFlags:
+            netadaptercx_sys::_NET_ADAPTER_AUTO_NEGOTIATION_FLAGS_NetAdapterAutoNegotiationFlagNone,
+    };
+    let set_link_state: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        *mut netadaptercx_sys::NET_ADAPTER_LINK_STATE,
+    ) = unsafe {
+        net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterSetLinkStateTableIndex as usize)
+    };
+    unsafe {
+        set_link_state(
+            netadaptercx_sys::NetDriverGlobals,
+            adapter,
+            &mut link_state,
+        );
+    }
+
+    let start: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+    ) -> NTSTATUS = unsafe {
+        net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterStartTableIndex as usize)
+    };
+    // SAFETY: Adapter was created by NetAdapterCx and is started once here.
+    unsafe { start(netadaptercx_sys::NetDriverGlobals, adapter) }
+}
+
+extern "C" fn evt_device_release_hardware(
+    _device: WDFDEVICE,
+    _resources_translated: WDFCMRESLIST,
+) -> NTSTATUS {
+    let adapter = unsafe {
+        let adapter = ADAPTER;
+        ADAPTER = core::ptr::null_mut();
+        adapter
+    };
+    let control_device = unsafe {
+        let device = CONTROL_DEVICE;
+        CONTROL_DEVICE = core::ptr::null_mut();
+        device
+    };
+
+    if !adapter.is_null() {
+        let stop: unsafe extern "system" fn(
+            netadaptercx_sys::PNET_DRIVER_GLOBALS,
+            netadaptercx_sys::NETADAPTER,
+        ) = unsafe {
+            net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterStopTableIndex as usize)
+        };
+        // SAFETY: NetAdapterCx owns the adapter and release-hardware runs
+        // after the framework has stopped datapath activity.
+        unsafe { stop(netadaptercx_sys::NetDriverGlobals, adapter) };
+    }
+
+    if !control_device.is_null() {
+        // SAFETY: The control device was created by this driver and is
+        // deleted exactly once after its global handle is cleared.
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, control_device.cast());
+        }
+    }
+
+    STATUS_SUCCESS
 }
 
 fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
@@ -172,6 +506,7 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
 
     unsafe {
         call_unsafe_wdf_function_binding!(WdfControlFinishInitializing, device);
+        CONTROL_DEVICE = device;
     }
     STATUS_SUCCESS
 }
