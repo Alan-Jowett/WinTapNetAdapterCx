@@ -9,7 +9,7 @@ mod frame_queue;
 use frame_queue::{Frame, FrameQueue, QueueError};
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
 use wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchParallel;
@@ -127,6 +127,10 @@ static mut READ_WORK_ITEM: WDFWORKITEM = core::ptr::null_mut();
 static mut WRITE_WORK_ITEM: WDFWORKITEM = core::ptr::null_mut();
 static mut TX_QUEUE: netadaptercx_sys::NETPACKETQUEUE = core::ptr::null_mut();
 static mut RX_QUEUE: netadaptercx_sys::NETPACKETQUEUE = core::ptr::null_mut();
+static mut TX_RINGS: *const netadaptercx_sys::NET_RING_COLLECTION = core::ptr::null();
+static mut RX_RINGS: *const netadaptercx_sys::NET_RING_COLLECTION = core::ptr::null();
+static TX_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
+static RX_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
 static PENDING_READS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_WRITES: AtomicUsize = AtomicUsize::new(0);
 
@@ -388,20 +392,47 @@ fn create_packet_queue(queue_init: *mut c_void, is_transmit: bool) -> NTSTATUS {
         )
     };
     if status == STATUS_SUCCESS {
+        let get_rings: unsafe extern "system" fn(
+            netadaptercx_sys::PNET_DRIVER_GLOBALS,
+            netadaptercx_sys::NETPACKETQUEUE,
+        ) -> *const netadaptercx_sys::NET_RING_COLLECTION = unsafe {
+            net_function(if is_transmit {
+                netadaptercx_sys::_NETFUNCENUM_NetTxQueueGetRingCollectionTableIndex
+            } else {
+                netadaptercx_sys::_NETFUNCENUM_NetRxQueueGetRingCollectionTableIndex
+            } as usize)
+        };
+        let rings = unsafe { get_rings(netadaptercx_sys::NetDriverGlobals, packet_queue) };
         unsafe {
             if is_transmit {
                 TX_QUEUE = packet_queue;
+                TX_RINGS = rings;
             } else {
                 RX_QUEUE = packet_queue;
+                RX_RINGS = rings;
             }
         }
     }
     status
 }
 
-extern "C" fn evt_packet_queue_start(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
+extern "C" fn evt_packet_queue_start(queue: netadaptercx_sys::NETPACKETQUEUE) {
+    let (tx_queue, rx_queue) = unsafe { (TX_QUEUE, RX_QUEUE) };
+    if queue == tx_queue {
+        TX_QUEUE_STARTED.store(true, Ordering::Release);
+    } else if queue == rx_queue {
+        RX_QUEUE_STARTED.store(true, Ordering::Release);
+    }
+}
 
-extern "C" fn evt_packet_queue_stop(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
+extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
+    let (tx_queue, rx_queue) = unsafe { (TX_QUEUE, RX_QUEUE) };
+    if queue == tx_queue {
+        TX_QUEUE_STARTED.store(false, Ordering::Release);
+    } else if queue == rx_queue {
+        RX_QUEUE_STARTED.store(false, Ordering::Release);
+    }
+}
 
 extern "C" fn evt_packet_queue_advance(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
 
@@ -609,7 +640,11 @@ extern "C" fn evt_device_release_hardware(
         FRAME_QUEUE = None;
         TX_QUEUE = core::ptr::null_mut();
         RX_QUEUE = core::ptr::null_mut();
+        TX_RINGS = core::ptr::null();
+        RX_RINGS = core::ptr::null();
     }
+    TX_QUEUE_STARTED.store(false, Ordering::Release);
+    RX_QUEUE_STARTED.store(false, Ordering::Release);
 
     STATUS_SUCCESS
 }
