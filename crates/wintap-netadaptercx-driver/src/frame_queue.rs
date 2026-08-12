@@ -48,7 +48,7 @@ pub struct FrameQueue {
 impl FrameQueue {
     pub fn new(limit: usize) -> Self {
         Self {
-            frames: VecDeque::new(),
+            frames: VecDeque::with_capacity(limit),
             limit,
             state: QueueState::Open,
         }
