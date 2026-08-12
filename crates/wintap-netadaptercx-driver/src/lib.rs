@@ -11,16 +11,19 @@ mod frame_queue;
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{
     DRIVER_OBJECT, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, UNICODE_STRING,
-    WDFCMRESLIST, WDF_DRIVER_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDFDEVICE,
-    WDFDEVICE_INIT, WDFDRIVER, WDF_PNPPOWER_EVENT_CALLBACKS,
+    WDFCMRESLIST, WDF_DRIVER_CONFIG, WDFDEVICE, WDFDEVICE_INIT, WDFDRIVER, WDF_FILEOBJECT_CONFIG,
+    WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
+    WDFQUEUE, WDFREQUEST, WDFFILEOBJECT,
     call_unsafe_wdf_function_binding,
 };
+use wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchParallel;
 
 #[cfg(not(test))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 const STATUS_SUCCESS: NTSTATUS = 0;
+const STATUS_CANCELLED: NTSTATUS = 0xC000_0120_u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as i32;
 const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as i32;
 const FRAME_MINIMUM: usize = 14;
@@ -47,6 +50,8 @@ const CONTROL_SDDL: [u16; 15] = [
 
 static mut ADAPTER: netadaptercx_sys::NETADAPTER = core::ptr::null_mut();
 static mut CONTROL_DEVICE: WDFDEVICE = core::ptr::null_mut();
+static mut READ_QUEUE: WDFQUEUE = core::ptr::null_mut();
+static mut WRITE_QUEUE: WDFQUEUE = core::ptr::null_mut();
 
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_STATE>();
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES>();
@@ -122,6 +127,21 @@ extern "C" fn evt_driver_device_add(
             WdfDeviceInitSetPnpPowerEventCallbacks,
             device_init,
             &mut pnp_callbacks,
+        );
+    }
+    let mut file_config = WDF_FILEOBJECT_CONFIG {
+        Size: core::mem::size_of::<WDF_FILEOBJECT_CONFIG>() as ULONG,
+        EvtDeviceFileCreate: Some(evt_file_create),
+        EvtFileClose: Some(evt_file_close),
+        EvtFileCleanup: Some(evt_file_cleanup),
+        ..WDF_FILEOBJECT_CONFIG::default()
+    };
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceInitSetFileObjectConfig,
+            device_init,
+            &mut file_config,
+            WDF_NO_OBJECT_ATTRIBUTES,
         );
     }
 
@@ -418,6 +438,12 @@ extern "C" fn evt_device_release_hardware(
         ADAPTER = core::ptr::null_mut();
         adapter
     };
+    let (read_queue, write_queue) = unsafe {
+        let queues = (READ_QUEUE, WRITE_QUEUE);
+        READ_QUEUE = core::ptr::null_mut();
+        WRITE_QUEUE = core::ptr::null_mut();
+        queues
+    };
     let control_device = unsafe {
         let device = CONTROL_DEVICE;
         CONTROL_DEVICE = core::ptr::null_mut();
@@ -435,6 +461,9 @@ extern "C" fn evt_device_release_hardware(
         // after the framework has stopped datapath activity.
         unsafe { stop(netadaptercx_sys::NetDriverGlobals, adapter) };
     }
+
+    purge_queue(read_queue);
+    purge_queue(write_queue);
 
     if !control_device.is_null() {
         // SAFETY: The control device was created by this driver and is
@@ -492,6 +521,71 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
         return status;
     }
 
+    let mut default_queue_config = WDF_IO_QUEUE_CONFIG {
+        Size: core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
+        DispatchType: WdfIoQueueDispatchParallel,
+        AllowZeroLengthRequests: 1,
+        DefaultQueue: 1,
+        EvtIoRead: Some(evt_io_read),
+        EvtIoWrite: Some(evt_io_write),
+        ..WDF_IO_QUEUE_CONFIG::default()
+    };
+    let mut default_queue: WDFQUEUE = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoQueueCreate,
+            device,
+            &mut default_queue_config,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut default_queue,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+
+    let mut read_queue_config = WDF_IO_QUEUE_CONFIG {
+        Size: core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
+        DispatchType: wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchManual,
+        AllowZeroLengthRequests: 1,
+        EvtIoStop: Some(evt_io_stop),
+        ..WDF_IO_QUEUE_CONFIG::default()
+    };
+    let mut read_queue: WDFQUEUE = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoQueueCreate,
+            device,
+            &mut read_queue_config,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut read_queue,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+
+    let mut write_queue_config = WDF_IO_QUEUE_CONFIG {
+        Size: core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
+        DispatchType: wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchManual,
+        AllowZeroLengthRequests: 1,
+        EvtIoStop: Some(evt_io_stop),
+        ..WDF_IO_QUEUE_CONFIG::default()
+    };
+    let mut write_queue: WDFQUEUE = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoQueueCreate,
+            device,
+            &mut write_queue_config,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut write_queue,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+
     let symbolic_link = unicode_string(&CONTROL_SYMBOLIC_LINK);
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
@@ -507,8 +601,68 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
     unsafe {
         call_unsafe_wdf_function_binding!(WdfControlFinishInitializing, device);
         CONTROL_DEVICE = device;
+        READ_QUEUE = read_queue;
+        WRITE_QUEUE = write_queue;
     }
     STATUS_SUCCESS
+}
+
+extern "C" fn evt_file_create(
+    _device: WDFDEVICE,
+    request: WDFREQUEST,
+    _file_object: WDFFILEOBJECT,
+) {
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_SUCCESS);
+    }
+}
+
+extern "C" fn evt_file_close(_file_object: WDFFILEOBJECT) {}
+
+extern "C" fn evt_file_cleanup(_file_object: WDFFILEOBJECT) {}
+
+extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize) {
+    forward_request(request, unsafe { READ_QUEUE });
+}
+
+extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize) {
+    forward_request(request, unsafe { WRITE_QUEUE });
+}
+
+extern "C" fn evt_io_stop(_queue: WDFQUEUE, request: WDFREQUEST, _action_flags: ULONG) {
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_CANCELLED);
+    }
+}
+
+fn forward_request(request: WDFREQUEST, target_queue: WDFQUEUE) {
+    if target_queue.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_NOT_SUPPORTED);
+        }
+        return;
+    }
+
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestForwardToIoQueue,
+            request,
+            target_queue
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfRequestComplete, request, status);
+        }
+    }
+}
+
+fn purge_queue(queue: WDFQUEUE) {
+    if !queue.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfIoQueuePurgeSynchronously, queue);
+        }
+    }
 }
 
 fn unicode_string(buffer: &[u16]) -> UNICODE_STRING {
