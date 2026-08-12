@@ -125,6 +125,8 @@ static mut FRAME_LOCK: WDFSPINLOCK = core::ptr::null_mut();
 static mut FRAME_QUEUE: Option<FrameQueue> = None;
 static mut READ_WORK_ITEM: WDFWORKITEM = core::ptr::null_mut();
 static mut WRITE_WORK_ITEM: WDFWORKITEM = core::ptr::null_mut();
+static mut TX_QUEUE: netadaptercx_sys::NETPACKETQUEUE = core::ptr::null_mut();
+static mut RX_QUEUE: netadaptercx_sys::NETPACKETQUEUE = core::ptr::null_mut();
 static PENDING_READS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_WRITES: AtomicUsize = AtomicUsize::new(0);
 
@@ -335,17 +337,81 @@ unsafe fn create_adapter(device: WDFDEVICE) -> NTSTATUS {
 
 extern "C" fn evt_create_tx_queue(
     _adapter: netadaptercx_sys::NETADAPTER,
-    _queue_init: *mut netadaptercx_sys::NETTXQUEUE_INIT,
+    queue_init: *mut netadaptercx_sys::NETTXQUEUE_INIT,
 ) -> NTSTATUS {
-    STATUS_NOT_SUPPORTED
+    create_packet_queue(
+        queue_init.cast(),
+        true,
+    )
 }
 
 extern "C" fn evt_create_rx_queue(
     _adapter: netadaptercx_sys::NETADAPTER,
-    _queue_init: *mut netadaptercx_sys::NETRXQUEUE_INIT,
+    queue_init: *mut netadaptercx_sys::NETRXQUEUE_INIT,
 ) -> NTSTATUS {
-    STATUS_NOT_SUPPORTED
+    create_packet_queue(
+        queue_init.cast(),
+        false,
+    )
 }
+
+fn create_packet_queue(queue_init: *mut c_void, is_transmit: bool) -> NTSTATUS {
+    let mut config = netadaptercx_sys::NET_PACKET_QUEUE_CONFIG {
+        Size: core::mem::size_of::<netadaptercx_sys::NET_PACKET_QUEUE_CONFIG>() as ULONG,
+        EvtStart: Some(evt_packet_queue_start),
+        EvtStop: Some(evt_packet_queue_stop),
+        EvtAdvance: Some(evt_packet_queue_advance),
+        EvtSetNotificationEnabled: Some(evt_packet_queue_set_notification_enabled),
+        EvtCancel: Some(evt_packet_queue_cancel),
+        ..netadaptercx_sys::NET_PACKET_QUEUE_CONFIG::default()
+    };
+    let mut packet_queue = core::ptr::null_mut();
+    let status = unsafe {
+        let function_index = if is_transmit {
+            netadaptercx_sys::_NETFUNCENUM_NetTxQueueCreateTableIndex
+        } else {
+            netadaptercx_sys::_NETFUNCENUM_NetRxQueueCreateTableIndex
+        };
+        let create: unsafe extern "system" fn(
+            netadaptercx_sys::PNET_DRIVER_GLOBALS,
+            *mut c_void,
+            *mut WDF_OBJECT_ATTRIBUTES,
+            *mut netadaptercx_sys::NET_PACKET_QUEUE_CONFIG,
+            *mut netadaptercx_sys::NETPACKETQUEUE,
+        ) -> NTSTATUS = net_function(function_index as usize);
+        create(
+            netadaptercx_sys::NetDriverGlobals,
+            queue_init,
+            core::ptr::null_mut(),
+            &mut config,
+            &mut packet_queue,
+        )
+    };
+    if status == STATUS_SUCCESS {
+        unsafe {
+            if is_transmit {
+                TX_QUEUE = packet_queue;
+            } else {
+                RX_QUEUE = packet_queue;
+            }
+        }
+    }
+    status
+}
+
+extern "C" fn evt_packet_queue_start(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
+
+extern "C" fn evt_packet_queue_stop(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
+
+extern "C" fn evt_packet_queue_advance(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
+
+extern "C" fn evt_packet_queue_set_notification_enabled(
+    _queue: netadaptercx_sys::NETPACKETQUEUE,
+    _enabled: wdk_sys::BOOLEAN,
+) {
+}
+
+extern "C" fn evt_packet_queue_cancel(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
 
 extern "C" fn evt_device_prepare_hardware(
     _device: WDFDEVICE,
@@ -541,6 +607,8 @@ extern "C" fn evt_device_release_hardware(
         READ_WORK_ITEM = core::ptr::null_mut();
         WRITE_WORK_ITEM = core::ptr::null_mut();
         FRAME_QUEUE = None;
+        TX_QUEUE = core::ptr::null_mut();
+        RX_QUEUE = core::ptr::null_mut();
     }
 
     STATUS_SUCCESS
