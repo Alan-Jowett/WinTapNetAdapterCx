@@ -9,6 +9,37 @@ static PWINTAP_DEVICE_CONTEXT g_ControlContext = nullptr;
 static WDFDEVICE g_ControlDevice = nullptr;
 static NETADAPTER g_Adapter = nullptr;
 static KSPIN_LOCK g_ControlContextLock;
+static PDRIVER_OBJECT g_DriverObject = nullptr;
+
+static VOID
+WintapLogStatus(
+    _In_ PCSTR Stage,
+    _In_ ULONG StageId,
+    _In_ NTSTATUS Status
+    )
+{
+    DbgPrintEx(
+        DPFLTR_IHVNETWORK_ID,
+        DPFLTR_ERROR_LEVEL,
+        "WinTapNetAdapterCx: %s status=0x%08X\n",
+        Stage,
+        Status);
+
+    if (g_DriverObject != nullptr) {
+        const UCHAR packetSize = static_cast<UCHAR>(
+            sizeof(IO_ERROR_LOG_PACKET) + sizeof(NTSTATUS));
+        PIO_ERROR_LOG_PACKET packet = static_cast<PIO_ERROR_LOG_PACKET>(
+            IoAllocateErrorLogEntry(g_DriverObject, packetSize));
+        if (packet != nullptr) {
+            packet->ErrorCode = Status;
+            packet->FinalStatus = Status;
+            packet->UniqueErrorValue = StageId;
+            packet->DumpDataSize = sizeof(NTSTATUS);
+            RtlCopyMemory(packet->DumpData, &Status, sizeof(Status));
+            IoWriteErrorLogEntry(packet);
+        }
+    }
+}
 
 static BOOLEAN
 WintapAcquireCallback(
@@ -641,6 +672,7 @@ WintapCreateAdapter(
         &adapter);
 
     if (!NT_SUCCESS(status)) {
+        WintapLogStatus("NetAdapterCreate", 5, status);
         NetAdapterInitFree(adapterInit);
         return status;
     }
@@ -653,8 +685,18 @@ WintapCreateAdapter(
     NetAdapterSetLinkLayerCapabilities(adapter, &capabilities);
     NetAdapterSetLinkLayerMtuSize(adapter, WINTAP_FRAME_MAXIMUM - WINTAP_FRAME_MINIMUM);
 
+    const UCHAR macAddress[] = {0x02, 0x57, 0x54, 0x41, 0x50, 0x01};
+    NET_ADAPTER_LINK_LAYER_ADDRESS linkLayerAddress;
+    NET_ADAPTER_LINK_LAYER_ADDRESS_INIT(
+        &linkLayerAddress,
+        ARRAYSIZE(macAddress),
+        macAddress);
+    NetAdapterSetPermanentLinkLayerAddress(adapter, &linkLayerAddress);
+    NetAdapterSetCurrentLinkLayerAddress(adapter, &linkLayerAddress);
+
     status = NetAdapterStart(adapter);
     if (!NT_SUCCESS(status)) {
+        WintapLogStatus("NetAdapterStart", 6, status);
         WdfObjectDelete(adapter);
     } else {
         KIRQL oldIrql;
@@ -700,16 +742,21 @@ DriverEntry(
     PUNICODE_STRING RegistryPath
     )
 {
+    g_DriverObject = DriverObject;
     WDF_DRIVER_CONFIG config;
     WDF_DRIVER_CONFIG_INIT(&config, WintapEvtDeviceAdd);
     KeInitializeSpinLock(&g_ControlContextLock);
 
-    return WdfDriverCreate(
+    NTSTATUS status = WdfDriverCreate(
         DriverObject,
         RegistryPath,
         WDF_NO_OBJECT_ATTRIBUTES,
         &config,
         WDF_NO_HANDLE);
+    if (!NT_SUCCESS(status)) {
+        WintapLogStatus("WdfDriverCreate", 1, status);
+    }
+    return status;
 }
 
 _Use_decl_annotations_
@@ -723,6 +770,7 @@ WintapEvtDeviceAdd(
 
     NTSTATUS status = NetDeviceInitConfig(DeviceInit);
     if (!NT_SUCCESS(status)) {
+        WintapLogStatus("NetDeviceInitConfig", 2, status);
         return status;
     }
 
@@ -737,16 +785,19 @@ WintapEvtDeviceAdd(
     WDFDEVICE device = nullptr;
     status = WdfDeviceCreate(&DeviceInit, WDF_NO_OBJECT_ATTRIBUTES, &device);
     if (!NT_SUCCESS(status)) {
+        WintapLogStatus("WdfDeviceCreate", 3, status);
         return status;
     }
 
     status = WintapCreateControlDevice(WdfDeviceGetDriver(device));
     if (!NT_SUCCESS(status)) {
+        WintapLogStatus("WintapCreateControlDevice", 4, status);
         return status;
     }
 
     status = WintapCreateAdapter(device);
     if (!NT_SUCCESS(status)) {
+        WintapLogStatus("WintapCreateAdapter", 7, status);
         WDFDEVICE controlDevice;
         KIRQL oldIrql;
         KeAcquireSpinLock(&g_ControlContextLock, &oldIrql);
@@ -758,6 +809,7 @@ WintapEvtDeviceAdd(
         if (controlDevice != nullptr) {
             WdfObjectDelete(controlDevice);
         }
+        WintapLogStatus("WintapEvtDeviceAdd", 8, status);
     }
     return status;
 }
@@ -1189,6 +1241,7 @@ WintapEvtCreateTxQueue(
         &config,
         &queue);
     if (!NT_SUCCESS(status)) {
+        WintapLogStatus("NetTxQueueCreate", 9, status);
         return status;
     }
 
@@ -1233,6 +1286,7 @@ WintapEvtCreateRxQueue(
         &config,
         &queue);
     if (!NT_SUCCESS(status)) {
+        WintapLogStatus("NetRxQueueCreate", 10, status);
         return status;
     }
 
@@ -1434,6 +1488,11 @@ WintapEvtPacketQueueStart(
     NETPACKETQUEUE Queue
     )
 {
+    DbgPrintEx(
+        DPFLTR_IHVNETWORK_ID,
+        DPFLTR_INFO_LEVEL,
+        "WinTapNetAdapterCx: PacketQueueStart queue=%p\n",
+        Queue);
     InterlockedExchange(
         &WintapGetQueueContext(Queue)->Started,
         TRUE);

@@ -24,6 +24,7 @@ Characteristics = 0x1
 *AccessType      = 2
 *ConnectionType  = 1
 *DirectionType   = 0
+*IfConnectorPresent = 0
 CopyFiles       = WinTap_CopyFiles
 AddReg          = WinTap_AddReg
 
@@ -32,6 +33,12 @@ AddService = WinTapNetAdapterCx, 2, WinTap_Service
 
 [WinTap_CopyFiles]
 WinTapNetAdapterCx.sys
+
+[SourceDisksNames]
+1 = %DiskName%,,
+
+[SourceDisksFiles]
+WinTapNetAdapterCx.sys = 1
 
 [WinTap_Service]
 DisplayName   = %WinTapServiceDesc%
@@ -49,5 +56,6 @@ HKR, , NetworkAddress, 0, "02-57-54-41-50-01"
 
 [Strings]
 ProviderName      = "WinTapNetAdapterCx contributors"
+DiskName          = "WinTapNetAdapterCx installation media"
 WinTapDeviceDesc  = "WinTapNetAdapterCx Virtual Ethernet Adapter"
 WinTapServiceDesc = "WinTapNetAdapterCx Driver"
