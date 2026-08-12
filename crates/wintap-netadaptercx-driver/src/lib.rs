@@ -17,6 +17,7 @@ use wdk_sys::{
     call_unsafe_wdf_function_binding,
 };
 use wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchParallel;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(not(test))]
 #[global_allocator]
@@ -24,8 +25,11 @@ static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 const STATUS_SUCCESS: NTSTATUS = 0;
 const STATUS_CANCELLED: NTSTATUS = 0xC000_0120_u32 as i32;
+const STATUS_DEVICE_BUSY: NTSTATUS = 0xC000_00E8_u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as i32;
 const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as i32;
+const PENDING_READ_LIMIT: usize = 64;
+const PENDING_WRITE_LIMIT: usize = 64;
 const FRAME_MINIMUM: usize = 14;
 const FRAME_MAXIMUM: usize = 1514;
 const CONTROL_DEVICE_NAME: [u16; 27] = [
@@ -52,6 +56,8 @@ static mut ADAPTER: netadaptercx_sys::NETADAPTER = core::ptr::null_mut();
 static mut CONTROL_DEVICE: WDFDEVICE = core::ptr::null_mut();
 static mut READ_QUEUE: WDFQUEUE = core::ptr::null_mut();
 static mut WRITE_QUEUE: WDFQUEUE = core::ptr::null_mut();
+static PENDING_READS: AtomicUsize = AtomicUsize::new(0);
+static PENDING_WRITES: AtomicUsize = AtomicUsize::new(0);
 
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_STATE>();
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES>();
@@ -439,10 +445,7 @@ extern "C" fn evt_device_release_hardware(
         adapter
     };
     let (read_queue, write_queue) = unsafe {
-        let queues = (READ_QUEUE, WRITE_QUEUE);
-        READ_QUEUE = core::ptr::null_mut();
-        WRITE_QUEUE = core::ptr::null_mut();
-        queues
+        (READ_QUEUE, WRITE_QUEUE)
     };
     let control_device = unsafe {
         let device = CONTROL_DEVICE;
@@ -464,6 +467,12 @@ extern "C" fn evt_device_release_hardware(
 
     purge_queue(read_queue);
     purge_queue(write_queue);
+    PENDING_READS.store(0, Ordering::Release);
+    PENDING_WRITES.store(0, Ordering::Release);
+    unsafe {
+        READ_QUEUE = core::ptr::null_mut();
+        WRITE_QUEUE = core::ptr::null_mut();
+    }
 
     if !control_device.is_null() {
         // SAFETY: The control device was created by this driver and is
@@ -622,25 +631,42 @@ extern "C" fn evt_file_close(_file_object: WDFFILEOBJECT) {}
 extern "C" fn evt_file_cleanup(_file_object: WDFFILEOBJECT) {}
 
 extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize) {
-    forward_request(request, unsafe { READ_QUEUE });
-}
-
-extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize) {
-    forward_request(request, unsafe { WRITE_QUEUE });
-}
-
-extern "C" fn evt_io_stop(_queue: WDFQUEUE, request: WDFREQUEST, _action_flags: ULONG) {
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_CANCELLED);
+    if !try_admit(&PENDING_READS, PENDING_READ_LIMIT) {
+        complete_request(request, STATUS_DEVICE_BUSY);
+        return;
+    }
+    let target = unsafe { READ_QUEUE };
+    if !forward_request(request, target) {
+        release_request(&PENDING_READS);
     }
 }
 
-fn forward_request(request: WDFREQUEST, target_queue: WDFQUEUE) {
-    if target_queue.is_null() {
-        unsafe {
-            call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_NOT_SUPPORTED);
-        }
+extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize) {
+    if !try_admit(&PENDING_WRITES, PENDING_WRITE_LIMIT) {
+        complete_request(request, STATUS_DEVICE_BUSY);
         return;
+    }
+    let target = unsafe { WRITE_QUEUE };
+    if !forward_request(request, target) {
+        release_request(&PENDING_WRITES);
+    }
+}
+
+extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: ULONG) {
+    let read_queue = unsafe { READ_QUEUE };
+    let write_queue = unsafe { WRITE_QUEUE };
+    if queue == read_queue {
+        release_request(&PENDING_READS);
+    } else if queue == write_queue {
+        release_request(&PENDING_WRITES);
+    }
+    complete_request(request, STATUS_CANCELLED);
+}
+
+fn forward_request(request: WDFREQUEST, target_queue: WDFQUEUE) -> bool {
+    if target_queue.is_null() {
+        complete_request(request, STATUS_NOT_SUPPORTED);
+        return false;
     }
 
     let status = unsafe {
@@ -651,9 +677,39 @@ fn forward_request(request: WDFREQUEST, target_queue: WDFQUEUE) {
         )
     };
     if status != STATUS_SUCCESS {
-        unsafe {
-            call_unsafe_wdf_function_binding!(WdfRequestComplete, request, status);
+        complete_request(request, status);
+        return false;
+    }
+    true
+}
+
+fn try_admit(counter: &AtomicUsize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return false;
         }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn release_request(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        count.checked_sub(1)
+    });
+}
+
+fn complete_request(request: WDFREQUEST, status: NTSTATUS) {
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfRequestComplete, request, status);
     }
 }
 
