@@ -18,6 +18,7 @@
 | VAL-007 | REQ-007 | Configure and build from a clean environment with CMake and the Visual Studio generator for x64 and ARM64; verify NuGet WDK/SDK dependencies resolve reproducibly and missing prerequisites fail at configuration. |
 | VAL-008 | REQ-008 | Run the complete privileged ICMP Echo Request/Echo Reply round trip through the Ethernet/TAP handle using `192.0.2.1/30` and `192.0.2.2`; verify packet fields, checksums, stack completion, timeout behavior, and cleanup. |
 | VAL-009 | REQ-009 | Execute the full REQ-008 assertion set in a GitHub-hosted Windows job and manually in a Hyper-V-capable Windows VM using the same test entry point; fail on unavailable privileged operations rather than skipping. |
+| VAL-010 | REQ-010 | Build the Rust driver and generated NetAdapterCx bindings from a clean pinned environment for x64 and ARM64; verify binding regeneration, ABI/layout checks, panic-abort configuration, and package production. |
 
 | Test | Coverage |
 |---|---|
@@ -34,6 +35,10 @@
 | TC-026 | Exercise malformed, unrelated, truncated, invalid-ARP, fragmented, mismatched, and checksum-invalid frames during the ICMP test and verify deterministic rejection or filtering. |
 | TC-027 | Interrupt the ICMP test at provisioning, read, write, timeout, driver-stop, and cleanup stages and verify idempotent restoration plus preserved diagnostics. |
 | TC-028 | Execute TC-023 through TC-027 on a GitHub-hosted runner and in a Hyper-V VM; verify no capability-only skip is reported. |
+| TC-029 | Verify generated NetAdapterCx bindings match the pinned WDK declarations for sizes, offsets, constants, calling conventions, callback signatures, and status values. |
+| TC-030 | Verify every Rust framework callback has the required IRQL/pageability annotation and no callback can unwind across the FFI boundary. |
+| TC-031 | Run Rust ownership, queue, cancellation, adapter-stop, surprise-removal, and power-transition tests under Driver Verifier-compatible settings; verify no use-after-free, double completion, leaked reference, or retained framework packet. |
+| TC-032 | Remove or make unavailable the WDK headers, Rust target, or binding-generation input and verify configuration fails with an actionable diagnostic rather than using stale or partial bindings. |
 
 ## Functional tests
 

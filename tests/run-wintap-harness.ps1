@@ -555,6 +555,21 @@ function Wait-WinTapAdapter([int]$WaitSeconds = 20) {
     throw "WinTap adapter was not discovered before the timeout."
 }
 
+function Test-WinTapAdapterIdentity($Adapter) {
+    $hardwareIds = @(
+        Get-PnpDeviceProperty -InstanceId $Adapter.PnPDeviceID `
+            -KeyName "DEVPKEY_Device_HardwareIds" -ErrorAction Stop
+    ).Data
+    $service = (
+        Get-PnpDeviceProperty -InstanceId $Adapter.PnPDeviceID `
+            -KeyName "DEVPKEY_Device_Service" -ErrorAction Stop
+    ).Data
+    return (
+        ($hardwareIds -contains "ROOT\WinTapNetAdapterCx") -and
+        $service -eq "WinTapNetAdapterCx"
+    )
+}
+
 function Invoke-DriverInstall {
     Assert-True (-not [string]::IsNullOrWhiteSpace($PackageDirectory)) `
         "-PackageDirectory is required with -InstallDriver."
@@ -639,8 +654,8 @@ function Invoke-IntegrationHarness {
         $script:IntegrationAdapter = $adapter
     }
     Add-TestAddress $adapter
-    Assert-True ($adapter.PnPDeviceID -like "ROOT\WINTAPNETADAPTERCX*") `
-        "The discovered adapter is not the expected root-enumerated WinTap device."
+    Assert-True (Test-WinTapAdapterIdentity $adapter) `
+        "The discovered adapter is not backed by the WinTapNetAdapterCx driver."
     Write-Host "Using adapter '$($adapter.Name)' ($($adapter.PnPDeviceID)), MAC $($adapter.MacAddress)."
 
     $localMac = Get-MacBytes $adapter.MacAddress

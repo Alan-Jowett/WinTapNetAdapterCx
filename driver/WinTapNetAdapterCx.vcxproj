@@ -98,7 +98,7 @@
       <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <DriverSign><FileDigestAlgorithm>sha256</FileDigestAlgorithm></DriverSign>
-    <Inf><TimeStamp>1.0</TimeStamp></Inf>
+    <Inf><TimeStamp>1.0.0.1</TimeStamp></Inf>
   </ItemDefinitionGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Windows.WDK.x64" Version="$(WintapWdkVersion)" Condition="'$(Platform)' == 'x64'" />

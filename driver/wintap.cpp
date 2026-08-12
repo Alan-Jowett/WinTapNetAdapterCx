@@ -694,18 +694,22 @@ WintapCreateAdapter(
     NetAdapterSetPermanentLinkLayerAddress(adapter, &linkLayerAddress);
     NetAdapterSetCurrentLinkLayerAddress(adapter, &linkLayerAddress);
 
-    status = NetAdapterStart(adapter);
-    if (!NT_SUCCESS(status)) {
-        WintapLogStatus("NetAdapterStart", 6, status);
-        WdfObjectDelete(adapter);
-    } else {
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_ControlContextLock, &oldIrql);
-        g_Adapter = adapter;
-        KeReleaseSpinLock(&g_ControlContextLock, oldIrql);
-    }
+    NET_ADAPTER_LINK_STATE linkState;
+    NET_ADAPTER_LINK_STATE_INIT(
+        &linkState,
+        1000000000ULL,
+        MediaConnectStateConnected,
+        MediaDuplexStateFull,
+        NetAdapterPauseFunctionTypeUnsupported,
+        NetAdapterAutoNegotiationFlagNone);
+    NetAdapterSetLinkState(adapter, &linkState);
 
-    return status;
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_ControlContextLock, &oldIrql);
+    g_Adapter = adapter;
+    KeReleaseSpinLock(&g_ControlContextLock, oldIrql);
+
+    return STATUS_SUCCESS;
 }
 
 static BOOLEAN
@@ -777,7 +781,6 @@ WintapEvtDeviceAdd(
     WDF_PNPPOWER_EVENT_CALLBACKS callbacks;
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&callbacks);
     callbacks.EvtDevicePrepareHardware = WintapEvtPrepareHardware;
-    callbacks.EvtDeviceReleaseHardware = WintapEvtReleaseHardware;
     callbacks.EvtDeviceD0Entry = WintapEvtDeviceD0Entry;
     callbacks.EvtDeviceD0Exit = WintapEvtDeviceD0Exit;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &callbacks);
@@ -825,6 +828,44 @@ WintapEvtPrepareHardware(
     UNREFERENCED_PARAMETER(Device);
     UNREFERENCED_PARAMETER(ResourcesRaw);
     UNREFERENCED_PARAMETER(ResourcesTranslated);
+
+    NETADAPTER adapter;
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_ControlContextLock, &oldIrql);
+    adapter = g_Adapter;
+    KeReleaseSpinLock(&g_ControlContextLock, oldIrql);
+    if (adapter == nullptr) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    NET_ADAPTER_TX_CAPABILITIES txCapabilities;
+    NET_ADAPTER_TX_CAPABILITIES_INIT(&txCapabilities, 1);
+    NET_ADAPTER_RX_CAPABILITIES rxCapabilities;
+    NET_ADAPTER_RX_CAPABILITIES_INIT_SYSTEM_MANAGED(
+        &rxCapabilities,
+        WINTAP_FRAME_MAXIMUM,
+        1);
+    NetAdapterSetDataPathCapabilities(
+        adapter,
+        &txCapabilities,
+        &rxCapabilities);
+    NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES receiveFilterCapabilities;
+    NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES_INIT(
+        &receiveFilterCapabilities,
+        WintapEvtSetReceiveFilter);
+    receiveFilterCapabilities.SupportedPacketFilters =
+        NetPacketFilterFlagDirected |
+        NetPacketFilterFlagMulticast |
+        NetPacketFilterFlagBroadcast;
+    NetAdapterSetReceiveFilterCapabilities(
+        adapter,
+        &receiveFilterCapabilities);
+
+    NTSTATUS status = NetAdapterStart(adapter);
+    if (!NT_SUCCESS(status)) {
+        WintapLogStatus("NetAdapterStart", 6, status);
+        return status;
+    }
 
     return STATUS_SUCCESS;
 }
@@ -1212,6 +1253,17 @@ WintapEvtIoStop(
                 ? STATUS_DEVICE_REMOVED
                 : STATUS_DEVICE_NOT_READY)
             : STATUS_DEVICE_NOT_READY);
+}
+
+_Use_decl_annotations_
+VOID
+WintapEvtSetReceiveFilter(
+    NETADAPTER Adapter,
+    NETRECEIVEFILTER ReceiveFilter
+    )
+{
+    UNREFERENCED_PARAMETER(Adapter);
+    UNREFERENCED_PARAMETER(ReceiveFilter);
 }
 
 _Use_decl_annotations_

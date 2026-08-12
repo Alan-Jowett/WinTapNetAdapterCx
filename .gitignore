@@ -9,3 +9,7 @@ driver/WinTapNe.9A6E4C04/
 
 # NuGet packages
 packages/
+
+# Rust build outputs
+target/
+out/rust-target/

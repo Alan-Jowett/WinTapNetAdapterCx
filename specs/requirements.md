@@ -16,6 +16,9 @@
   Ethernet/TAP boundary.
 - Require the same full test on a GitHub-hosted Windows runner and manually in
   a Hyper-V-capable development VM.
+- Replace the C driver implementation with Rust, reusing the
+  `windows-drivers-rs` WDF ecosystem and adding generated NetAdapterCx FFI
+  bindings.
 - Do not modify C source, headers, INF files, project files, tests, generated
   artifacts, or build configuration during discovery.
 
@@ -166,6 +169,34 @@ idempotent, isolated to the test interface, and diagnostic-preserving. A
 hosted-platform policy that blocks required execution is a validation failure,
 not a pass.
 
+### REQ-010 — Rust NetAdapterCx implementation
+
+**Before:** The driver implementation is written in C and consumes WDF and
+NetAdapterCx APIs through the C toolchain.  
+**After:** Production driver behavior shall be implemented in Rust as a
+Windows kernel-mode NetAdapterCx miniport. The implementation shall reuse the
+`windows-drivers-rs` WDF crates and shall add a generated Rust
+`netadaptercx-sys` binding layer for the pinned WDK NetAdapterCx headers.
+
+The binding layer shall cover adapter initialization and creation,
+lifecycle/start/stop, link-layer and link-state configuration, datapath and
+receive-filter capabilities, TX/RX queues, packet rings, callback types,
+constants, structures, and status values. Any safe Rust wrapper shall
+preserve the underlying framework ABI and lifecycle contract.
+
+Binding-generation inputs, WDK/SDK headers, Rust toolchain, bindgen
+configuration, target triples, and generated-output policy shall be pinned or
+captured so a clean environment can reproduce the same bindings. Rust panics
+shall not unwind across kernel or framework callbacks.
+
+**Trace:** User-requested Rust implementation; ecosystem inspection confirmed
+that `windows-drivers-rs` provides WDF crates but no NetAdapterCx binding
+crate. Extends REQ-001, REQ-003, REQ-004, REQ-006, and REQ-007.
+**Invariant impact:** Rust FFI must preserve callback ABI and IRQL contracts,
+structure layout, packet ownership, queue cancellation, synchronization,
+nonpaged allocation, exactly-once completion, and teardown safety. Unsupported
+Rust, WDK, SDK, binding, or architecture combinations must fail explicitly.
+
 ## Scope boundaries
 
 - **In scope:** A NetAdapterCx software Ethernet adapter and a TAP-style
@@ -175,6 +206,9 @@ not a pass.
   verification specifications.
 - **In scope:** The complete privileged ICMP Echo Request/Echo Reply test and
   its GitHub-hosted runner and Hyper-V VM execution environments.
+- **In scope:** Rust kernel-mode driver behavior, generated NetAdapterCx FFI,
+  safe wrapper boundaries, Rust-specific panic and build configuration, and
+  ABI/layout validation.
 - **Out of scope unless explicitly added:** IP/TUN mode (decision: excluded
   from the initial milestone), protocol-specific
   user-mode libraries, packet capture beyond the virtual adapter contract,

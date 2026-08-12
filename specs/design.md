@@ -42,6 +42,29 @@ The initial NuGet package IDs are `Microsoft.Windows.WDK.x64`,
 `Microsoft.Windows.SDK.CPP.ARM64`, all pinned to version `10.0.28000.2526`.
 They are required implementation dependencies, not implicit machine paths.
 
+### Rust driver and binding design
+
+The production driver shall be a Rust kernel-mode crate built with the
+`windows-drivers-rs` WDF ecosystem. The repository shall add a
+`netadaptercx-sys`-style raw FFI crate generated from the pinned WDK
+NetAdapterCx headers using the existing `wdk-build`/bindgen workflow.
+
+Generated bindings shall be treated as an ABI boundary. Higher-level Rust
+modules may wrap the raw bindings, but every wrapper shall document required
+IRQL and pageability, framework-versus-driver ownership, callback lifetime,
+status and failure behavior, and nonpaged allocation requirements.
+
+The Rust target shall use `panic = "abort"` and shall not permit unwinding
+across WDF, NetAdapterCx, or C ABI callbacks. Unsafe code shall be isolated
+around FFI, raw packet-ring access, pointer validation, and kernel memory
+operations. Rust references and ownership types shall never outlive the
+framework object they represent.
+
+Binding generation shall be reproducible from checked-in configuration and
+pinned headers. Generated source may be checked in only if regeneration is
+validated as equivalent; otherwise the build shall generate it deterministically
+and fail when required inputs are missing.
+
 ## Component boundaries
 
 ### Control/device boundary
@@ -68,6 +91,12 @@ selected NetAdapterCx version.
 The implementation shall record the exact WDK/SDK and NetAdapterCx API
 contracts used. Any callback whose IRQL or pageability depends on framework
 state shall be annotated and placed accordingly.
+
+The Rust implementation shall use the generated NetAdapterCx declarations for
+all framework calls. It shall not duplicate C declarations manually or invent
+Rust-specific lifecycle callbacks. The adapter shall be created during device
+addition, configured and started at the framework-required preparation stage,
+and stopped or deleted only through the verified NetAdapterCx/WDF lifecycle.
 
 ## Packet ownership and direction
 
