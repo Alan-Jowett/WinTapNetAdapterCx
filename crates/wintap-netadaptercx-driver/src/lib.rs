@@ -1,7 +1,11 @@
 #![no_std]
 
+extern crate alloc;
+
 #[cfg(not(test))]
 extern crate wdk_panic;
+
+mod frame_queue;
 
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
