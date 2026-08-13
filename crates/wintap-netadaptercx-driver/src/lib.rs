@@ -25,6 +25,43 @@ use wdk_sys::{
     WDFQUEUE, WDFREQUEST, WDFSPINLOCK, WDFWORKITEM, call_unsafe_wdf_function_binding,
 };
 
+unsafe extern "C" {
+    fn DbgPrintEx(component_id: ULONG, level: ULONG, format: *const i8, ...) -> ULONG;
+}
+
+const DPFLTR_IHVDRIVER_ID: ULONG = 77;
+
+fn debug_status(label: &[u8], status: NTSTATUS) {
+    let mut format = [0i8; 96];
+    let prefix = b"WinTapRust: ";
+    let suffix = b" status=0x%08X\n\0";
+    let mut offset = 0;
+    for byte in prefix {
+        format[offset] = *byte as i8;
+        offset += 1;
+    }
+    for byte in label {
+        format[offset] = *byte as i8;
+        offset += 1;
+    }
+    for byte in suffix {
+        format[offset] = *byte as i8;
+        offset += 1;
+    }
+    unsafe {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            0,
+            format.as_ptr(),
+            status as u32,
+        );
+    }
+}
+
+fn debug_marker(label: &[u8]) {
+    debug_status(label, STATUS_SUCCESS);
+}
+
 #[cfg(not(test))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
@@ -157,6 +194,25 @@ static RX_NOTIFICATION_ENABLED: AtomicBool = AtomicBool::new(false);
 static PENDING_READS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_WRITES: AtomicUsize = AtomicUsize::new(0);
 
+static QUEUE_CONTEXT_NAME: &[u8] = b"WINTAP_QUEUE_CONTEXT\0";
+
+static mut QUEUE_CONTEXT_TYPE_INFO: wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO =
+    wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO {
+        Size: core::mem::size_of::<wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO>() as ULONG,
+        ContextName: QUEUE_CONTEXT_NAME.as_ptr() as *const i8,
+        ContextSize: core::mem::size_of::<QueueContext>(),
+        UniqueType: core::ptr::null(),
+        EvtDriverGetUniqueContextType: None,
+    };
+
+#[repr(C)]
+struct QueueContext {
+    is_transmit: bool,
+    started: bool,
+    _padding: [u8; 6],
+    rings: netadaptercx_sys::NET_RING_COLLECTION,
+}
+
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_STATE>();
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES>();
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_RX_CAPABILITIES>();
@@ -171,6 +227,7 @@ pub unsafe extern "system" fn driver_entry(
     driver: &mut DRIVER_OBJECT,
     registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
+    debug_marker(b"DriverEntry enter");
     let mut driver_config = {
         let config_size = core::mem::size_of::<WDF_DRIVER_CONFIG>();
         const { assert!(core::mem::size_of::<WDF_DRIVER_CONFIG>() <= ULONG::MAX as usize) };
@@ -194,6 +251,7 @@ pub unsafe extern "system" fn driver_entry(
             WDF_NO_HANDLE.cast::<WDFDRIVER>(),
         )
     };
+    debug_status(b"WdfDriverCreate", status);
 
     if status == STATUS_SUCCESS {
         STATUS_SUCCESS
@@ -211,17 +269,21 @@ extern "C" fn evt_driver_device_add(
     driver: WDFDRIVER,
     device_init: *mut WDFDEVICE_INIT,
 ) -> NTSTATUS {
+    debug_marker(b"EvtDriverDeviceAdd enter");
     let status = unsafe {
         // SAFETY: NetDeviceInitConfig is called once at PASSIVE_LEVEL before
         // the WDF device is created.
         net_call_device_init_config(device_init)
     };
+    debug_status(b"NetDeviceInitConfig", status);
     if status != STATUS_SUCCESS {
         return status;
     }
 
     let mut pnp_callbacks = WDF_PNPPOWER_EVENT_CALLBACKS {
         Size: core::mem::size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG,
+        EvtDeviceD0Entry: Some(evt_device_d0_entry),
+        EvtDeviceD0Exit: Some(evt_device_d0_exit),
         EvtDevicePrepareHardware: Some(evt_device_prepare_hardware),
         EvtDeviceReleaseHardware: Some(evt_device_release_hardware),
         ..WDF_PNPPOWER_EVENT_CALLBACKS::default()
@@ -259,18 +321,22 @@ extern "C" fn evt_driver_device_add(
             &mut _pnp_device,
         )
     };
+    debug_status(b"WdfDeviceCreate", status);
     if status != STATUS_SUCCESS {
         return status;
     }
 
     let status = create_control_device(driver);
+    debug_status(b"CreateControlDevice", status);
     if status != STATUS_SUCCESS {
         return status;
     }
 
     // SAFETY: The WDF device has been created and this callback runs at
     // PASSIVE_LEVEL during device addition.
-    unsafe { create_adapter(_pnp_device) }
+    let status = unsafe { create_adapter(_pnp_device) };
+    debug_status(b"CreateAdapter", status);
+    status
 }
 
 unsafe fn net_function<T: Copy>(index: usize) -> T {
@@ -345,7 +411,9 @@ unsafe fn create_adapter(device: WDFDEVICE) -> NTSTATUS {
             &mut adapter,
         )
     };
+    debug_status(b"NetAdapterCreate", status);
     if status == STATUS_SUCCESS {
+        configure_adapter_link_state(adapter);
         unsafe {
             ADAPTER = adapter;
         }
@@ -360,6 +428,96 @@ unsafe fn create_adapter(device: WDFDEVICE) -> NTSTATUS {
         unsafe { free(netadaptercx_sys::NetDriverGlobals, adapter_init) };
     }
     status
+}
+
+fn configure_adapter_link_state(adapter: netadaptercx_sys::NETADAPTER) {
+    let mut link_layer = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES {
+        Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES>()
+            as ULONG,
+        MaxTxLinkSpeed: 1_000_000_000,
+        MaxRxLinkSpeed: 1_000_000_000,
+    };
+    let set_link_layer: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        *mut netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES,
+    ) = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetLinkLayerCapabilitiesTableIndex as usize,
+        )
+    };
+    unsafe {
+        set_link_layer(netadaptercx_sys::NetDriverGlobals, adapter, &mut link_layer);
+    }
+
+    let set_mtu: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        ULONG,
+    ) = unsafe {
+        net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterSetLinkLayerMtuSizeTableIndex as usize)
+    };
+    unsafe {
+        set_mtu(
+            netadaptercx_sys::NetDriverGlobals,
+            adapter,
+            (FRAME_MAXIMUM - FRAME_MINIMUM) as ULONG,
+        );
+    }
+
+    let address = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS {
+        Length: 6,
+        Address: [
+            0x02, 0x57, 0x54, 0x41, 0x50, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
+    };
+    let set_permanent: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        *const netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS,
+    ) = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetPermanentLinkLayerAddressTableIndex
+                as usize,
+        )
+    };
+    let set_current: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        *const netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS,
+    ) = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetCurrentLinkLayerAddressTableIndex as usize,
+        )
+    };
+    unsafe {
+        set_permanent(netadaptercx_sys::NetDriverGlobals, adapter, &address);
+        set_current(netadaptercx_sys::NetDriverGlobals, adapter, &address);
+    }
+
+    let mut link_state = netadaptercx_sys::NET_ADAPTER_LINK_STATE {
+        Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_STATE>() as ULONG,
+        TxLinkSpeed: 1_000_000_000,
+        RxLinkSpeed: 1_000_000_000,
+        MediaConnectState:
+            netadaptercx_sys::_NET_IF_MEDIA_CONNECT_STATE_MediaConnectStateConnected,
+        MediaDuplexState: netadaptercx_sys::_NET_IF_MEDIA_DUPLEX_STATE_MediaDuplexStateFull,
+        SupportedPauseFunctions:
+            netadaptercx_sys::_NET_ADAPTER_PAUSE_FUNCTION_TYPE_NetAdapterPauseFunctionTypeUnsupported,
+        AutoNegotiationFlags:
+            netadaptercx_sys::_NET_ADAPTER_AUTO_NEGOTIATION_FLAGS_NetAdapterAutoNegotiationFlagNone,
+    };
+    let set_link_state: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        *mut netadaptercx_sys::NET_ADAPTER_LINK_STATE,
+    ) = unsafe {
+        net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterSetLinkStateTableIndex as usize)
+    };
+    unsafe {
+        set_link_state(netadaptercx_sys::NetDriverGlobals, adapter, &mut link_state);
+    }
 }
 
 extern "C" fn evt_create_tx_queue(
@@ -383,6 +541,11 @@ extern "C" fn evt_create_rx_queue(
 }
 
 fn create_packet_queue(queue_init: *mut c_void, is_transmit: bool) -> NTSTATUS {
+    debug_marker(if is_transmit {
+        b"NetTxQueueCreate enter"
+    } else {
+        b"NetRxQueueCreate enter"
+    });
     let mut config = netadaptercx_sys::NET_PACKET_QUEUE_CONFIG {
         Size: core::mem::size_of::<netadaptercx_sys::NET_PACKET_QUEUE_CONFIG>() as ULONG,
         EvtStart: Some(evt_packet_queue_start),
@@ -393,6 +556,11 @@ fn create_packet_queue(queue_init: *mut c_void, is_transmit: bool) -> NTSTATUS {
         ..netadaptercx_sys::NET_PACKET_QUEUE_CONFIG::default()
     };
     let mut packet_queue = core::ptr::null_mut();
+    let mut attributes = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ContextTypeInfo: &raw const QUEUE_CONTEXT_TYPE_INFO,
+        ..WDF_OBJECT_ATTRIBUTES::default()
+    };
     let status = unsafe {
         let function_index = if is_transmit {
             netadaptercx_sys::_NETFUNCENUM_NetTxQueueCreateTableIndex
@@ -409,11 +577,19 @@ fn create_packet_queue(queue_init: *mut c_void, is_transmit: bool) -> NTSTATUS {
         create(
             netadaptercx_sys::NetDriverGlobals,
             queue_init,
-            core::ptr::null_mut(),
+            &mut attributes,
             &mut config,
             &mut packet_queue,
         )
     };
+    debug_status(
+        if is_transmit {
+            b"NetTxQueueCreate"
+        } else {
+            b"NetRxQueueCreate"
+        },
+        status,
+    );
     if status == STATUS_SUCCESS {
         let get_rings: unsafe extern "system" fn(
             netadaptercx_sys::PNET_DRIVER_GLOBALS,
@@ -788,6 +964,20 @@ extern "C" fn evt_set_receive_filter(
 ) {
 }
 
+unsafe extern "C" fn evt_device_d0_entry(
+    _device: WDFDEVICE,
+    _previous_state: wdk_sys::WDF_POWER_DEVICE_STATE,
+) -> NTSTATUS {
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn evt_device_d0_exit(
+    _device: WDFDEVICE,
+    _target_state: wdk_sys::WDF_POWER_DEVICE_STATE,
+) -> NTSTATUS {
+    STATUS_SUCCESS
+}
+
 extern "C" fn evt_device_prepare_hardware(
     _device: WDFDEVICE,
     _resources_raw: WDFCMRESLIST,
@@ -834,6 +1024,7 @@ extern "C" fn evt_device_prepare_hardware(
             &mut rx,
         );
     }
+    debug_marker(b"NetAdapterSetDataPathCapabilities");
 
     let mut receive_filter = netadaptercx_sys::NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES {
         Size: core::mem::size_of::<
@@ -862,96 +1053,7 @@ extern "C" fn evt_device_prepare_hardware(
             &mut receive_filter,
         );
     }
-
-    let mut link_layer = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES {
-        Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES>()
-            as ULONG,
-        MaxTxLinkSpeed: 1_000_000_000,
-        MaxRxLinkSpeed: 1_000_000_000,
-    };
-    let set_link_layer: unsafe extern "system" fn(
-        netadaptercx_sys::PNET_DRIVER_GLOBALS,
-        netadaptercx_sys::NETADAPTER,
-        *mut netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES,
-    ) = unsafe {
-        net_function(
-            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetLinkLayerCapabilitiesTableIndex as usize,
-        )
-    };
-    unsafe {
-        set_link_layer(netadaptercx_sys::NetDriverGlobals, adapter, &mut link_layer);
-    }
-
-    let set_mtu: unsafe extern "system" fn(
-        netadaptercx_sys::PNET_DRIVER_GLOBALS,
-        netadaptercx_sys::NETADAPTER,
-        ULONG,
-    ) = unsafe {
-        net_function(
-            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetLinkLayerMtuSizeTableIndex as usize,
-        )
-    };
-    unsafe {
-        set_mtu(
-            netadaptercx_sys::NetDriverGlobals,
-            adapter,
-            (FRAME_MAXIMUM - FRAME_MINIMUM) as ULONG,
-        );
-    }
-
-    let address = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS {
-        Length: 6,
-        Address: [
-            0x02, 0x57, 0x54, 0x41, 0x50, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ],
-    };
-    let set_permanent: unsafe extern "system" fn(
-        netadaptercx_sys::PNET_DRIVER_GLOBALS,
-        netadaptercx_sys::NETADAPTER,
-        *const netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS,
-    ) = unsafe {
-        net_function(
-            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetPermanentLinkLayerAddressTableIndex
-                as usize,
-        )
-    };
-    let set_current: unsafe extern "system" fn(
-        netadaptercx_sys::PNET_DRIVER_GLOBALS,
-        netadaptercx_sys::NETADAPTER,
-        *const netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS,
-    ) = unsafe {
-        net_function(
-            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetCurrentLinkLayerAddressTableIndex as usize,
-        )
-    };
-    unsafe {
-        set_permanent(netadaptercx_sys::NetDriverGlobals, adapter, &address);
-        set_current(netadaptercx_sys::NetDriverGlobals, adapter, &address);
-    }
-
-    let mut link_state = netadaptercx_sys::NET_ADAPTER_LINK_STATE {
-        Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_STATE>() as ULONG,
-        TxLinkSpeed: 1_000_000_000,
-        RxLinkSpeed: 1_000_000_000,
-        MediaConnectState:
-            netadaptercx_sys::_NET_IF_MEDIA_CONNECT_STATE_MediaConnectStateConnected,
-        MediaDuplexState: netadaptercx_sys::_NET_IF_MEDIA_DUPLEX_STATE_MediaDuplexStateFull,
-        SupportedPauseFunctions:
-            netadaptercx_sys::_NET_ADAPTER_PAUSE_FUNCTION_TYPE_NetAdapterPauseFunctionTypeUnsupported,
-        AutoNegotiationFlags:
-            netadaptercx_sys::_NET_ADAPTER_AUTO_NEGOTIATION_FLAGS_NetAdapterAutoNegotiationFlagNone,
-    };
-    let set_link_state: unsafe extern "system" fn(
-        netadaptercx_sys::PNET_DRIVER_GLOBALS,
-        netadaptercx_sys::NETADAPTER,
-        *mut netadaptercx_sys::NET_ADAPTER_LINK_STATE,
-    ) = unsafe {
-        net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterSetLinkStateTableIndex as usize)
-    };
-    unsafe {
-        set_link_state(netadaptercx_sys::NetDriverGlobals, adapter, &mut link_state);
-    }
+    debug_marker(b"NetAdapterSetReceiveFilterCapabilities");
 
     let start: unsafe extern "system" fn(
         netadaptercx_sys::PNET_DRIVER_GLOBALS,
@@ -959,7 +1061,10 @@ extern "C" fn evt_device_prepare_hardware(
     ) -> NTSTATUS =
         unsafe { net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterStartTableIndex as usize) };
     // SAFETY: Adapter was created by NetAdapterCx and is started once here.
-    unsafe { start(netadaptercx_sys::NetDriverGlobals, adapter) }
+    debug_marker(b"NetAdapterStart enter");
+    let status = unsafe { start(netadaptercx_sys::NetDriverGlobals, adapter) };
+    debug_status(b"NetAdapterStart", status);
+    status
 }
 
 extern "C" fn evt_device_release_hardware(
