@@ -1,6 +1,6 @@
 use core::ffi::c_void;
 
-use netadaptercx_sys::{NET_PACKET, NET_RING};
+use netadaptercx_sys::{NET_EXTENSION, NET_FRAGMENT, NET_FRAGMENT_VIRTUAL_ADDRESS, NET_PACKET, NET_RING};
 
 pub const PACKET_RING_INDEX: usize = 0;
 pub const FRAGMENT_RING_INDEX: usize = 1;
@@ -22,6 +22,25 @@ pub fn advance_index(ring: &NET_RING, index: u32, count: u32) -> Option<u32> {
 pub unsafe fn packet_at(ring: *mut NET_RING, index: u32) -> Option<*mut NET_PACKET> {
     let element = unsafe { element_at(ring, index, core::mem::size_of::<NET_PACKET>()) }?;
     Some(element.cast())
+}
+
+pub unsafe fn fragment_at(ring: *mut NET_RING, index: u32) -> Option<*mut NET_FRAGMENT> {
+    let element = unsafe { element_at(ring, index, core::mem::size_of::<NET_FRAGMENT>()) }?;
+    Some(element.cast())
+}
+
+pub unsafe fn fragment_virtual_address(
+    extension: &NET_EXTENSION,
+    index: u32,
+) -> Option<*mut NET_FRAGMENT_VIRTUAL_ADDRESS> {
+    if unsafe { extension.__bindgen_anon_1.Enabled } == 0 {
+        return None;
+    }
+    let base = extension.Reserved[0].cast::<NET_FRAGMENT_VIRTUAL_ADDRESS>();
+    if base.is_null() {
+        return None;
+    }
+    Some(unsafe { base.add(index as usize) })
 }
 
 pub unsafe fn element_at(

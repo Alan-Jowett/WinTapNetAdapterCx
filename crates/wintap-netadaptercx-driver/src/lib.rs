@@ -2,12 +2,15 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
 #[cfg(not(test))]
 extern crate wdk_panic;
 
 mod frame_queue;
 mod ring;
 use frame_queue::{Frame, FrameQueue, QueueError};
+use ring::{advance_index, fragment_at, fragment_virtual_address, increment_index, packet_at};
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -482,7 +485,156 @@ extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
     }
 }
 
-extern "C" fn evt_packet_queue_advance(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
+extern "C" fn evt_packet_queue_advance(queue: netadaptercx_sys::NETPACKETQUEUE) {
+    let (tx_queue, rings, extension) = unsafe { (TX_QUEUE, TX_RINGS, TX_FRAGMENT_EXTENSION) };
+    if queue == tx_queue && !rings.is_null() {
+        capture_transmit_packets(rings, &extension);
+    }
+}
+
+fn capture_transmit_packets(
+    rings: *const netadaptercx_sys::NET_RING_COLLECTION,
+    extension: &netadaptercx_sys::NET_EXTENSION,
+) {
+    let (packet_ring, fragment_ring) = unsafe {
+        let collection = match rings.as_ref() {
+            Some(collection) => collection,
+            None => return,
+        };
+        (collection.Rings[ring::PACKET_RING_INDEX], collection.Rings[ring::FRAGMENT_RING_INDEX])
+    };
+    if packet_ring.is_null() || fragment_ring.is_null() {
+        return;
+    }
+
+    let mut captured = false;
+    loop {
+        let (packet_begin, packet_end, fragment_end) = unsafe {
+            ((*packet_ring).BeginIndex, (*packet_ring).EndIndex, (*fragment_ring).EndIndex)
+        };
+        if packet_begin == packet_end {
+            break;
+        }
+
+        let packet = match unsafe { packet_at(packet_ring, packet_begin) } {
+            Some(packet) => unsafe { &*packet },
+            None => break,
+        };
+        let fragment_count = packet.FragmentCount as u32;
+        if fragment_count == 0 {
+            break;
+        }
+        let fragment_begin = packet.FragmentIndex;
+        if fragment_begin == fragment_end
+            || fragment_count > unsafe { (*fragment_ring).NumberOfElements }
+        {
+            break;
+        }
+
+        let mut total_length = 0usize;
+        let mut fragment_index = fragment_begin;
+        let mut valid = true;
+        for _ in 0..fragment_count {
+            let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
+                Some(fragment) => unsafe { &*fragment },
+                None => {
+                    valid = false;
+                    break;
+                }
+            };
+            let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
+                Some(address) => unsafe { &*address },
+                None => {
+                    valid = false;
+                    break;
+                }
+            };
+            if !validate_fragment(fragment, address, &mut total_length) {
+                valid = false;
+                break;
+            }
+            fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
+                Some(index) => index,
+                None => {
+                    valid = false;
+                    break;
+                }
+            };
+        }
+        if !valid || !(FRAME_MINIMUM..=FRAME_MAXIMUM).contains(&total_length) {
+            break;
+        }
+
+        let mut bytes = Vec::with_capacity(total_length);
+        fragment_index = fragment_begin;
+        for _ in 0..fragment_count {
+            let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
+                Some(fragment) => unsafe { &*fragment },
+                None => return,
+            };
+            let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
+                Some(address) => unsafe { &*address },
+                None => return,
+            };
+            let start = unsafe {
+                (address.VirtualAddress as *const u8).add(fragment.Offset() as usize)
+            };
+            let length = fragment.ValidLength() as usize;
+            let data = unsafe { core::slice::from_raw_parts(start, length) };
+            bytes.extend_from_slice(data);
+            fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
+                Some(index) => index,
+                None => return,
+            };
+        }
+
+        if let Ok(frame) = Frame::from_bytes(&bytes) {
+            if enqueue_existing_frame(frame).is_ok() {
+                captured = true;
+            }
+        }
+
+        let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
+            Some(index) => index,
+            None => break,
+        };
+        let next_fragment = match unsafe {
+            advance_index(&*fragment_ring, fragment_begin, fragment_count)
+        } {
+            Some(index) => index,
+            None => break,
+        };
+        unsafe {
+            (*packet_ring).BeginIndex = next_packet;
+            (*fragment_ring).BeginIndex = next_fragment;
+        }
+    }
+
+    if captured {
+        enqueue_work_item(unsafe { READ_WORK_ITEM });
+    }
+}
+
+fn validate_fragment(
+    fragment: &netadaptercx_sys::NET_FRAGMENT,
+    address: &netadaptercx_sys::NET_FRAGMENT_VIRTUAL_ADDRESS,
+    total_length: &mut usize,
+) -> bool {
+    if address.VirtualAddress.is_null() {
+        return false;
+    }
+    let offset = fragment.Offset() as usize;
+    let capacity = fragment.Capacity() as usize;
+    let valid_length = fragment.ValidLength() as usize;
+    offset <= capacity
+        && valid_length <= capacity - offset
+        && valid_length <= FRAME_MAXIMUM
+        && *total_length <= FRAME_MAXIMUM - valid_length
+        && {
+            *total_length += valid_length;
+            true
+        }
+}
 
 extern "C" fn evt_packet_queue_set_notification_enabled(
     _queue: netadaptercx_sys::NETPACKETQUEUE,
