@@ -5,12 +5,18 @@ param(
     [switch]$InstallDriver,
     [switch]$RemoveDevice,
     [switch]$RequireTestSigning,
+    [switch]$RustDriver,
     [string]$PackageDirectory,
     [string]$DiagnosticsPath = ".\artifacts\wintap-harness",
     [int]$TimeoutSeconds = 15
 )
 
 $ErrorActionPreference = "Stop"
+
+$driverService = if ($RustDriver) { "WinTapRust" } else { "WinTapNetAdapterCx" }
+$driverInf = if ($RustDriver) { "WinTapRust.inf" } else { "WinTapNetAdapterCx.inf" }
+$driverHardwareId = if ($RustDriver) { "ROOT\WinTapRust" } else { "ROOT\WinTapNetAdapterCx" }
+$driverDescription = if ($RustDriver) { "WinTapRust" } else { "WinTapNetAdapterCx" }
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -122,7 +128,7 @@ function Save-EnvironmentDiagnostics {
         Get-PnpDevice -Class Net | Format-List *
     }
     Save-Diagnostics "driver-service.txt" {
-        Get-Service -Name WinTapNetAdapterCx -ErrorAction SilentlyContinue |
+        Get-Service -Name $driverService -ErrorAction SilentlyContinue |
             Format-List *
     }
     Save-Diagnostics "driver-events.txt" {
@@ -131,7 +137,7 @@ function Save-EnvironmentDiagnostics {
             ProviderName = "Service Control Manager"
             StartTime = (Get-Date).AddMinutes(-10)
         } -ErrorAction SilentlyContinue |
-            Where-Object Message -Match "WinTapNetAdapterCx" |
+            Where-Object Message -Match $driverDescription |
             Format-List *
     }
 }
@@ -534,8 +540,8 @@ function Get-ValidIcmpRequest(
 
 function Get-WinTapAdapter {
     $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
-        $_.InterfaceDescription -like "*WinTapNetAdapterCx*" -or
-        $_.PnPDeviceID -like "ROOT\WINTAPNETADAPTERCX*"
+        $_.InterfaceDescription -like "*$driverDescription*" -or
+        $_.PnPDeviceID -like "$driverHardwareId*"
     })
     if ($adapters.Count -ne 1) {
         throw "Expected exactly one WinTap adapter; found $($adapters.Count)."
@@ -565,8 +571,8 @@ function Test-WinTapAdapterIdentity($Adapter) {
             -KeyName "DEVPKEY_Device_Service" -ErrorAction Stop
     ).Data
     return (
-        ($hardwareIds -contains "ROOT\WinTapNetAdapterCx") -and
-        $service -eq "WinTapNetAdapterCx"
+        ($hardwareIds -contains $driverHardwareId) -and
+        $service -eq $driverService
     )
 }
 
@@ -574,7 +580,7 @@ function Invoke-DriverInstall {
     Assert-True (-not [string]::IsNullOrWhiteSpace($PackageDirectory)) `
         "-PackageDirectory is required with -InstallDriver."
     $package = (Resolve-Path -LiteralPath $PackageDirectory).Path
-    $inf = Join-Path $package "WinTapNetAdapterCx.inf"
+    $inf = Join-Path $package $driverInf
     Assert-True (Test-Path -LiteralPath $inf -PathType Leaf) `
         "Driver INF is missing: $inf"
     $installOutput = & pnputil.exe /add-driver $inf /install 2>&1
@@ -583,9 +589,9 @@ function Invoke-DriverInstall {
     if ($LASTEXITCODE -ne 0) {
         throw "pnputil failed with exit code $LASTEXITCODE."
     }
-    $service = Get-Service -Name WinTapNetAdapterCx -ErrorAction SilentlyContinue
+    $service = Get-Service -Name $driverService -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne "Running") {
-        Start-Service -Name WinTapNetAdapterCx -ErrorAction Stop
+        Start-Service -Name $driverService -ErrorAction Stop
         $script:ServiceStartedByHarness = $true
     }
 }
@@ -655,7 +661,7 @@ function Invoke-IntegrationHarness {
     }
     Add-TestAddress $adapter
     Assert-True (Test-WinTapAdapterIdentity $adapter) `
-        "The discovered adapter is not backed by the WinTapNetAdapterCx driver."
+        "The discovered adapter is not backed by the expected driver."
     Write-Host "Using adapter '$($adapter.Name)' ($($adapter.PnPDeviceID)), MAC $($adapter.MacAddress)."
 
     $localMac = Get-MacBytes $adapter.MacAddress
@@ -672,7 +678,7 @@ function Invoke-IntegrationHarness {
     $ping = $null
     try {
         $ping = [System.Net.NetworkInformation.Ping]::new()
-        $payload = [Text.Encoding]::ASCII.GetBytes("WinTapNetAdapterCx REQ-008")
+        $payload = [Text.Encoding]::ASCII.GetBytes("$driverDescription REQ-008")
         $pingTask = $ping.SendPingAsync(
             "192.0.2.2", $TimeoutSeconds * 1000, $payload)
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -750,7 +756,7 @@ if ($Integration) {
                     -Confirm:$false -ErrorAction SilentlyContinue
             }
             if ($script:ServiceStartedByHarness) {
-                Stop-Service -Name WinTapNetAdapterCx `
+                Stop-Service -Name $driverService `
                     -ErrorAction SilentlyContinue
             }
             $removeInstalledDevice = $RemoveDevice -or (
