@@ -153,6 +153,7 @@ static FRAGMENT_VIRTUAL_ADDRESS_NAME: [u16; 28] = [
 ];
 static TX_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
 static RX_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
+static RX_NOTIFICATION_ENABLED: AtomicBool = AtomicBool::new(false);
 static PENDING_READS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_WRITES: AtomicUsize = AtomicUsize::new(0);
 
@@ -603,7 +604,7 @@ fn inject_receive_frames(
         injected += 1;
     }
 
-    if injected != 0 {
+    if injected != 0 && RX_NOTIFICATION_ENABLED.load(Ordering::Acquire) {
         let notify: unsafe extern "system" fn(
             netadaptercx_sys::PNET_DRIVER_GLOBALS,
             netadaptercx_sys::NETPACKETQUEUE,
@@ -764,9 +765,19 @@ fn validate_fragment(
 }
 
 extern "C" fn evt_packet_queue_set_notification_enabled(
-    _queue: netadaptercx_sys::NETPACKETQUEUE,
-    _enabled: wdk_sys::BOOLEAN,
+    queue: netadaptercx_sys::NETPACKETQUEUE,
+    enabled: wdk_sys::BOOLEAN,
 ) {
+    let rx_queue = unsafe { RX_QUEUE };
+    if queue == rx_queue {
+        RX_NOTIFICATION_ENABLED.store(enabled != 0, Ordering::Release);
+        if enabled != 0 {
+            let (rings, extension) = unsafe { (RX_RINGS, RX_FRAGMENT_EXTENSION) };
+            if !rings.is_null() {
+                inject_receive_frames(queue, rings, &extension);
+            }
+        }
+    }
 }
 
 extern "C" fn evt_packet_queue_cancel(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
@@ -980,6 +991,7 @@ extern "C" fn evt_device_release_hardware(
     }
     TX_QUEUE_STARTED.store(false, Ordering::Release);
     RX_QUEUE_STARTED.store(false, Ordering::Release);
+    RX_NOTIFICATION_ENABLED.store(false, Ordering::Release);
 
     STATUS_SUCCESS
 }
