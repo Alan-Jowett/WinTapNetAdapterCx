@@ -782,6 +782,12 @@ extern "C" fn evt_packet_queue_set_notification_enabled(
 
 extern "C" fn evt_packet_queue_cancel(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
 
+extern "C" fn evt_set_receive_filter(
+    _adapter: netadaptercx_sys::NETADAPTER,
+    _receive_filter: netadaptercx_sys::NETRECEIVEFILTER,
+) {
+}
+
 extern "C" fn evt_device_prepare_hardware(
     _device: WDFDEVICE,
     _resources_raw: WDFCMRESLIST,
@@ -826,6 +832,34 @@ extern "C" fn evt_device_prepare_hardware(
             adapter,
             &mut tx,
             &mut rx,
+        );
+    }
+
+    let mut receive_filter = netadaptercx_sys::NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES {
+        Size: core::mem::size_of::<
+            netadaptercx_sys::NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES,
+        >() as ULONG,
+        SupportedPacketFilters: netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagDirected
+            | netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagMulticast
+            | netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagBroadcast,
+        EvtSetReceiveFilter: Some(evt_set_receive_filter),
+        ..netadaptercx_sys::NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES::default()
+    };
+    let set_receive_filter: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETADAPTER,
+        *mut netadaptercx_sys::NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES,
+    ) = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetAdapterSetReceiveFilterCapabilitiesTableIndex
+                as usize,
+        )
+    };
+    unsafe {
+        set_receive_filter(
+            netadaptercx_sys::NetDriverGlobals,
+            adapter,
+            &mut receive_filter,
         );
     }
 
