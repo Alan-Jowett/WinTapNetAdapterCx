@@ -800,7 +800,7 @@ extern "C" fn evt_device_prepare_hardware(
 
     let mut tx = netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES {
         Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES>() as ULONG,
-        MaximumNumberOfFragments: u64::MAX,
+        MaximumNumberOfFragments: 1,
         MaximumNumberOfQueues: 1,
         ..netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES::default()
     };
