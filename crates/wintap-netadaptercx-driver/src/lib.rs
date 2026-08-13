@@ -6,6 +6,7 @@ extern crate alloc;
 extern crate wdk_panic;
 
 mod frame_queue;
+mod ring;
 use frame_queue::{Frame, FrameQueue, QueueError};
 
 use core::ffi::c_void;

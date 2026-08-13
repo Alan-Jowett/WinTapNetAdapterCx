@@ -1,0 +1,80 @@
+use core::ffi::c_void;
+
+use netadaptercx_sys::{NET_PACKET, NET_RING};
+
+pub const PACKET_RING_INDEX: usize = 0;
+pub const FRAGMENT_RING_INDEX: usize = 1;
+
+pub fn increment_index(ring: &NET_RING, index: u32) -> Option<u32> {
+    if !ring_is_valid(ring) || index & !ring.ElementIndexMask != 0 {
+        return None;
+    }
+    Some((index + 1) & ring.ElementIndexMask)
+}
+
+pub fn advance_index(ring: &NET_RING, index: u32, count: u32) -> Option<u32> {
+    if !ring_is_valid(ring) || index & !ring.ElementIndexMask != 0 {
+        return None;
+    }
+    Some(index.wrapping_add(count) & ring.ElementIndexMask)
+}
+
+pub unsafe fn packet_at(ring: *mut NET_RING, index: u32) -> Option<*mut NET_PACKET> {
+    let element = unsafe { element_at(ring, index, core::mem::size_of::<NET_PACKET>()) }?;
+    Some(element.cast())
+}
+
+pub unsafe fn element_at(
+    ring: *mut NET_RING,
+    index: u32,
+    minimum_size: usize,
+) -> Option<*mut c_void> {
+    let ring = unsafe { ring.as_ref()? };
+    if !ring_is_valid(ring)
+        || minimum_size > ring.ElementStride as usize
+        || index & !ring.ElementIndexMask != 0
+    {
+        return None;
+    }
+
+    let slot = (index & ring.ElementIndexMask) as usize;
+    let offset = slot.checked_mul(ring.ElementStride as usize)?;
+    let buffer = ring.Buffer.as_ptr() as *mut u8;
+    Some(unsafe { buffer.add(offset).cast() })
+}
+
+fn ring_is_valid(ring: &NET_RING) -> bool {
+    ring.NumberOfElements != 0
+        && ring.ElementIndexMask == ring.NumberOfElements - 1
+        && ring.ElementStride != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ring() -> NET_RING {
+        NET_RING {
+            ElementStride: 16,
+            NumberOfElements: 4,
+            ElementIndexMask: 3,
+            Buffer: [0],
+            ..NET_RING::default()
+        }
+    }
+
+    #[test]
+    fn wraps_indices_at_ring_mask() {
+        let ring = ring();
+        assert_eq!(increment_index(&ring, 3), Some(0));
+        assert_eq!(advance_index(&ring, 3, 5), Some(0));
+    }
+
+    #[test]
+    fn rejects_invalid_indices_and_ring_shape() {
+        let mut ring = ring();
+        assert_eq!(increment_index(&ring, 4), None);
+        ring.NumberOfElements = 3;
+        assert_eq!(increment_index(&ring, 0), None);
+    }
+}
