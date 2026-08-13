@@ -486,9 +486,136 @@ extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
 }
 
 extern "C" fn evt_packet_queue_advance(queue: netadaptercx_sys::NETPACKETQUEUE) {
-    let (tx_queue, rings, extension) = unsafe { (TX_QUEUE, TX_RINGS, TX_FRAGMENT_EXTENSION) };
-    if queue == tx_queue && !rings.is_null() {
-        capture_transmit_packets(rings, &extension);
+    let (tx_queue, rx_queue, tx_rings, rx_rings, tx_extension, rx_extension) = unsafe {
+        (
+            TX_QUEUE,
+            RX_QUEUE,
+            TX_RINGS,
+            RX_RINGS,
+            TX_FRAGMENT_EXTENSION,
+            RX_FRAGMENT_EXTENSION,
+        )
+    };
+    if queue == rx_queue && !rx_rings.is_null() {
+        inject_receive_frames(queue, rx_rings, &rx_extension);
+    }
+    if queue != tx_queue || tx_rings.is_null() {
+        return;
+    }
+    capture_transmit_packets(tx_rings, &tx_extension);
+}
+
+fn inject_receive_frames(
+    queue: netadaptercx_sys::NETPACKETQUEUE,
+    rings: *const netadaptercx_sys::NET_RING_COLLECTION,
+    extension: &netadaptercx_sys::NET_EXTENSION,
+) {
+    let (packet_ring, fragment_ring) = unsafe {
+        let collection = match rings.as_ref() {
+            Some(collection) => collection,
+            None => return,
+        };
+        (collection.Rings[ring::PACKET_RING_INDEX], collection.Rings[ring::FRAGMENT_RING_INDEX])
+    };
+    if packet_ring.is_null() || fragment_ring.is_null() {
+        return;
+    }
+
+    let mut injected = 0_u32;
+    loop {
+        let (packet_begin, packet_end, fragment_begin, fragment_end) = unsafe {
+            (
+                (*packet_ring).BeginIndex,
+                (*packet_ring).EndIndex,
+                (*fragment_ring).BeginIndex,
+                (*fragment_ring).EndIndex,
+            )
+        };
+        if packet_begin == packet_end || fragment_begin == fragment_end {
+            break;
+        }
+
+        let frame = match dequeue_frame() {
+            Some(frame) => frame,
+            None => break,
+        };
+        let packet = match unsafe { packet_at(packet_ring, packet_begin) } {
+            Some(packet) => unsafe { &mut *packet },
+            None => {
+                let _ = enqueue_existing_frame(frame);
+                break;
+            }
+        };
+        let fragment = match unsafe { fragment_at(fragment_ring, fragment_begin) } {
+            Some(fragment) => unsafe { &mut *fragment },
+            None => {
+                let _ = enqueue_existing_frame(frame);
+                break;
+            }
+        };
+        let address = match unsafe { fragment_virtual_address(extension, fragment_begin) } {
+            Some(address) => unsafe { &*address },
+            None => {
+                let _ = enqueue_existing_frame(frame);
+                break;
+            }
+        };
+        let mut total_length = 0usize;
+        if !validate_fragment(fragment, address, &mut total_length) {
+            let _ = enqueue_existing_frame(frame);
+            break;
+        }
+        let frame_length = frame.as_bytes().len();
+        let offset = fragment.Offset() as usize;
+        let capacity = fragment.Capacity() as usize;
+        if frame_length > capacity.saturating_sub(offset) {
+            let _ = enqueue_existing_frame(frame);
+            break;
+        }
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                frame.as_bytes().as_ptr(),
+                (address.VirtualAddress as *mut u8).add(offset),
+                frame_length,
+            );
+        }
+        fragment.set_ValidLength(frame_length as u64);
+        packet.FragmentIndex = fragment_begin;
+        packet.FragmentCount = 1;
+        packet.Layout.set_Layer2Type(
+            netadaptercx_sys::_NET_PACKET_LAYER2_TYPE_NetPacketLayer2TypeEthernet as u8,
+        );
+        packet.Layout.set_Layer2HeaderLength(FRAME_MINIMUM as u16);
+
+        let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
+            Some(index) => index,
+            None => break,
+        };
+        let next_fragment = match unsafe { increment_index(&*fragment_ring, fragment_begin) } {
+            Some(index) => index,
+            None => break,
+        };
+        unsafe {
+            (*packet_ring).BeginIndex = next_packet;
+            (*fragment_ring).BeginIndex = next_fragment;
+        }
+        injected += 1;
+    }
+
+    if injected != 0 {
+        let notify: unsafe extern "system" fn(
+            netadaptercx_sys::PNET_DRIVER_GLOBALS,
+            netadaptercx_sys::NETPACKETQUEUE,
+        ) = unsafe {
+            net_function(
+                netadaptercx_sys::_NETFUNCENUM_NetRxQueueNotifyMoreReceivedPacketsAvailableTableIndex
+                    as usize,
+            )
+        };
+        unsafe {
+            notify(netadaptercx_sys::NetDriverGlobals, queue);
+        }
     }
 }
 
