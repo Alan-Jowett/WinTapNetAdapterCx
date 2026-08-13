@@ -1,0 +1,61 @@
+[Version]
+Signature = "$WINDOWS NT$"
+Class = Net
+ClassGuid = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider = %ProviderName%
+DriverVer = 08/12/2026,1.0.0.1
+CatalogFile = wintap_netadaptercx_driver.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderName% = Standard,NTamd64,NTarm64
+
+[Standard.NTamd64]
+%WinTapDeviceDesc% = WinTap_Install, Root\WinTapRust
+
+[Standard.NTarm64]
+%WinTapDeviceDesc% = WinTap_Install, Root\WinTapRust
+
+[WinTap_Install]
+Characteristics = 0x1
+*IfType = 0x6
+*MediaType = 0x0
+*PhysicalMediaType = 0
+*AccessType = 2
+*ConnectionType = 1
+*DirectionType = 0
+*IfConnectorPresent = 0
+CopyFiles = WinTap_CopyFiles
+AddReg = WinTap_AddReg
+
+[WinTap_Install.Services]
+AddService = wintap_netadaptercx_driver, 2, WinTap_Service
+
+[WinTap_CopyFiles]
+wintap_netadaptercx_driver.sys
+
+[SourceDisksNames]
+1 = %DiskName%,,
+
+[SourceDisksFiles]
+wintap_netadaptercx_driver.sys = 1
+
+[WinTap_Service]
+DisplayName = %WinTapServiceDesc%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %13%\wintap_netadaptercx_driver.sys
+LoadOrderGroup = NDIS
+
+[WinTap_AddReg]
+HKR, Ndi, Service, 0, "wintap_netadaptercx_driver"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
+HKR, , NetworkAddress, 0, "02-57-54-41-50-01"
+
+[Strings]
+ProviderName = "WinTapRust contributors"
+DiskName = "WinTapRust installation media"
+WinTapDeviceDesc = "WinTapRust Virtual Ethernet Adapter"
+WinTapServiceDesc = "WinTapRust Driver"
