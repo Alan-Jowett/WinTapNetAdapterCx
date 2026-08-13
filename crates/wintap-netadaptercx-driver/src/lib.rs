@@ -129,6 +129,24 @@ static mut TX_QUEUE: netadaptercx_sys::NETPACKETQUEUE = core::ptr::null_mut();
 static mut RX_QUEUE: netadaptercx_sys::NETPACKETQUEUE = core::ptr::null_mut();
 static mut TX_RINGS: *const netadaptercx_sys::NET_RING_COLLECTION = core::ptr::null();
 static mut RX_RINGS: *const netadaptercx_sys::NET_RING_COLLECTION = core::ptr::null();
+static mut TX_FRAGMENT_EXTENSION: netadaptercx_sys::NET_EXTENSION =
+    netadaptercx_sys::NET_EXTENSION {
+        Reserved: [core::ptr::null_mut(); 4],
+        __bindgen_anon_1: netadaptercx_sys::_NET_EXTENSION__bindgen_ty_1 {
+            Enabled: 0,
+        },
+    };
+static mut RX_FRAGMENT_EXTENSION: netadaptercx_sys::NET_EXTENSION =
+    netadaptercx_sys::NET_EXTENSION {
+        Reserved: [core::ptr::null_mut(); 4],
+        __bindgen_anon_1: netadaptercx_sys::_NET_EXTENSION__bindgen_ty_1 {
+            Enabled: 0,
+        },
+    };
+static FRAGMENT_VIRTUAL_ADDRESS_NAME: [u16; 28] = [
+    109, 115, 95, 102, 114, 97, 103, 109, 101, 110, 116, 95, 118, 105, 114, 116, 117, 97, 108,
+    95, 97, 100, 100, 114, 101, 115, 115, 0,
+];
 static TX_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
 static RX_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
 static PENDING_READS: AtomicUsize = AtomicUsize::new(0);
@@ -403,13 +421,42 @@ fn create_packet_queue(queue_init: *mut c_void, is_transmit: bool) -> NTSTATUS {
             } as usize)
         };
         let rings = unsafe { get_rings(netadaptercx_sys::NetDriverGlobals, packet_queue) };
+        let get_extension: unsafe extern "system" fn(
+            netadaptercx_sys::PNET_DRIVER_GLOBALS,
+            netadaptercx_sys::NETPACKETQUEUE,
+            *const netadaptercx_sys::NET_EXTENSION_QUERY,
+            *mut netadaptercx_sys::NET_EXTENSION,
+        ) = unsafe {
+            net_function(if is_transmit {
+                netadaptercx_sys::_NETFUNCENUM_NetTxQueueGetExtensionTableIndex
+            } else {
+                netadaptercx_sys::_NETFUNCENUM_NetRxQueueGetExtensionTableIndex
+            } as usize)
+        };
+        let query = netadaptercx_sys::NET_EXTENSION_QUERY {
+            Size: core::mem::size_of::<netadaptercx_sys::NET_EXTENSION_QUERY>() as ULONG,
+            Name: FRAGMENT_VIRTUAL_ADDRESS_NAME.as_ptr(),
+            Version: 1,
+            Type: netadaptercx_sys::_NET_EXTENSION_TYPE_NetExtensionTypeFragment,
+        };
+        let mut extension = netadaptercx_sys::NET_EXTENSION::default();
+        unsafe {
+            get_extension(
+                netadaptercx_sys::NetDriverGlobals,
+                packet_queue,
+                &query,
+                &mut extension,
+            );
+        }
         unsafe {
             if is_transmit {
                 TX_QUEUE = packet_queue;
                 TX_RINGS = rings;
+                TX_FRAGMENT_EXTENSION = extension;
             } else {
                 RX_QUEUE = packet_queue;
                 RX_RINGS = rings;
+                RX_FRAGMENT_EXTENSION = extension;
             }
         }
     }
@@ -642,6 +689,14 @@ extern "C" fn evt_device_release_hardware(
         RX_QUEUE = core::ptr::null_mut();
         TX_RINGS = core::ptr::null();
         RX_RINGS = core::ptr::null();
+        TX_FRAGMENT_EXTENSION = netadaptercx_sys::NET_EXTENSION {
+            Reserved: [core::ptr::null_mut(); 4],
+            __bindgen_anon_1: netadaptercx_sys::_NET_EXTENSION__bindgen_ty_1 { Enabled: 0 },
+        };
+        RX_FRAGMENT_EXTENSION = netadaptercx_sys::NET_EXTENSION {
+            Reserved: [core::ptr::null_mut(); 4],
+            __bindgen_anon_1: netadaptercx_sys::_NET_EXTENSION__bindgen_ty_1 { Enabled: 0 },
+        };
     }
     TX_QUEUE_STARTED.store(false, Ordering::Release);
     RX_QUEUE_STARTED.store(false, Ordering::Release);
