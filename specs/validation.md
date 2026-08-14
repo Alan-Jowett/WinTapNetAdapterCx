@@ -19,6 +19,9 @@
 | VAL-008 | REQ-008 | Run the complete privileged ICMP Echo Request/Echo Reply round trip through the Ethernet/TAP handle using `192.0.2.1/30` and `192.0.2.2`; verify packet fields, checksums, stack completion, timeout behavior, and cleanup. |
 | VAL-009 | REQ-009 | Execute the full REQ-008 assertion set in a GitHub-hosted Windows job and manually in a Hyper-V-capable Windows VM using the same test entry point; fail on unavailable privileged operations rather than skipping. |
 | VAL-010 | REQ-010 | Build the Rust driver and generated NetAdapterCx bindings from a clean pinned environment for x64 and ARM64; verify binding regeneration, ABI/layout checks, panic-abort configuration, and package production. |
+| VAL-011 | REQ-011 | Verify the repository, CMake targets, workflow, harness, and package validation contain no C/C++ driver source, project, INF, fallback, or selector. |
+| VAL-012 | REQ-012 | Build each package and verify `wintap_netadaptercx_driver.inf`, `wintap_netadaptercx_driver.cat`, service `WinTapRust`, and hardware ID `ROOT\WinTapRust`. |
+| VAL-013 | REQ-013 | Load the test-signed Rust package with NetAdapterCx verifier enabled and verify receive-filter capability initialization does not trigger `0x19E/0xB`. |
 
 | Test | Coverage |
 |---|---|
@@ -39,6 +42,9 @@
 | TC-030 | Verify every Rust framework callback has the required IRQL/pageability annotation and no callback can unwind across the FFI boundary. |
 | TC-031 | Run Rust ownership, queue, cancellation, adapter-stop, surprise-removal, and power-transition tests under Driver Verifier-compatible settings; verify no use-after-free, double completion, leaked reference, or retained framework packet. |
 | TC-032 | Remove or make unavailable the WDK headers, Rust target, or binding-generation input and verify configuration fails with an actionable diagnostic rather than using stale or partial bindings. |
+| TC-036 | Install the test-signed root-enumerated adapter with NetAdapterCx verifier enabled; verify `WintapEvtPrepareHardware` succeeds without bugcheck `0x19E/0xB` and the advertised receive-filter capabilities omit multicast. |
+| TC-037 | Build Rust x64 and ARM64 packages through CMake and verify each contains the Rust driver binary, `wintap_netadaptercx_driver.inf`, and `wintap_netadaptercx_driver.cat`. |
+| TC-038 | Install `ROOT\WinTapRust` after removing any stale C package; verify service `WinTapRust` starts and no C device or service is selected. |
 
 ## Functional tests
 

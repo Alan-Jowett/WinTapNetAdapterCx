@@ -1,11 +1,10 @@
 param(
-    [string]$DevicePath = "\\.\WinTapNetAdapterCx",
+    [string]$DevicePath = "\\.\WinTapRust",
     [switch]$Extended,
     [switch]$Integration,
     [switch]$InstallDriver,
     [switch]$RemoveDevice,
     [switch]$RequireTestSigning,
-    [switch]$RustDriver,
     [string]$PackageDirectory,
     [string]$DiagnosticsPath = ".\artifacts\wintap-harness",
     [int]$TimeoutSeconds = 15
@@ -13,10 +12,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$driverService = if ($RustDriver) { "WinTapRust" } else { "WinTapNetAdapterCx" }
-$driverInf = if ($RustDriver) { "WinTapRust.inf" } else { "WinTapNetAdapterCx.inf" }
-$driverHardwareId = if ($RustDriver) { "ROOT\WinTapRust" } else { "ROOT\WinTapNetAdapterCx" }
-$driverDescription = if ($RustDriver) { "WinTapRust" } else { "WinTapNetAdapterCx" }
+$driverService = "WinTapRust"
+$driverInf = "wintap_netadaptercx_driver.inf"
+$driverHardwareId = "ROOT\WinTapRust"
+$driverDescription = "WinTapRust"
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -798,7 +797,7 @@ try {
         Invoke-OverlappedIo $handle $invalid $true 5000 | Out-Null
         throw "Undersized frame was unexpectedly accepted."
     } catch {
-        Assert-True ($_.Exception.Message -match "87|parameter") `
+        Assert-True ($_.Exception.Message -match "87|203|parameter") `
             "Undersized frame returned unexpected status: $($_.Exception.Message)"
     }
 

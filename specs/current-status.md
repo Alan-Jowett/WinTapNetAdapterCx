@@ -1,29 +1,25 @@
 # Current Project Status
 
 **Status date:** 2026-08-10  
-**Requirements:** Approved baseline `REQ-001` through `REQ-009`
-**Implementation:** Corrective patch sets `CHG-001` through `CHG-014` and
-`CHG-015` through `CHG-020` plus `CHG-022` applied without changing the
-approved Ethernet/TAP scope. `CHG-021` was superseded by `CHG-019`.
+**Requirements:** Approved baseline `REQ-001` through `REQ-013`
+**Implementation:** Rust-only package migration is in progress. The obsolete
+C/C++ implementation has been removed from the branch.
 
 ## Verified in the repository
 
-- x64 and ARM64 project configurations and INF declarations are present.
-- Hosted validation covers specification artifacts, PowerShell syntax, WDK
-  `stampinf.exe` provisioning, CMake configure/build/package, and package
-  artifact checks.
-- Driver lifetime paths now synchronize control-context acquisition, packet
-  callbacks, power quiescence, frame cleanup, and the write-drain work item.
-- Fragment metadata is checked before every packet copy.
+- The Rust driver exports `DriverEntry` and uses generated NetAdapterCx
+  bindings from the pinned NuGet WDK.
+- CMake invokes `cargo wdk build` after restoring the pinned NuGet packages
+  and exposes both `stampinf` and `inf2cat` to cargo-wdk.
+- Rust packages use `ROOT\WinTapRust`, service `WinTapRust`,
+  `wintap_netadaptercx_driver.inf`, and `wintap_netadaptercx_driver.cat`.
+- Receive-filter capabilities advertise directed and broadcast filtering only.
 - The user-mode harness covers administrator access, exclusive open behavior,
   malformed writes, overlapped cancellation, and valid writes.
 - The opt-in privileged harness path discovers the root-enumerated adapter,
   isolates `192.0.2.1/30`, handles ARP, validates/builds IPv4 ICMP frames with
   checksums, verifies the Windows Ping result, captures diagnostics, and
   performs idempotent address/device cleanup.
-- The maintenance alignment corrections bound pending operations, defer
-  packet-path user-buffer completion to passive work, preserve frames for
-  undersized reads, and define D0 request/frame behavior.
 
 ## Deferred evidence
 

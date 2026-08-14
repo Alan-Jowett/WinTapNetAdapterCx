@@ -65,6 +65,22 @@ pinned headers. Generated source may be checked in only if regeneration is
 validated as equivalent; otherwise the build shall generate it deterministically
 and fail when required inputs are missing.
 
+### Rust-only package design
+
+`cargo wdk build` is the sole driver build and package operation. CMake shall
+remain a thin Rust-only wrapper that restores the pinned NuGet packages,
+places the pinned `stampinf` x64 and `inf2cat` x86 tool directories on `PATH`,
+and invokes `cargo wdk build` for the selected target architecture. Debug uses
+the cargo-wdk default profile; Release passes `--profile release`.
+
+The package template is `wintap_netadaptercx_driver.inx`; cargo-wdk generates
+`wintap_netadaptercx_driver.inf` and `wintap_netadaptercx_driver.cat` beside
+the Rust driver binary. The
+hardware ID is `ROOT\WinTapRust` and the service is `WinTapRust`. No C/C++
+driver project, INF, source, service, hardware ID, package fallback, or
+selection switch remains in this branch. The Rust control device is exposed as
+`\\.\WinTapRust`.
+
 ## Component boundaries
 
 ### Control/device boundary
@@ -91,6 +107,10 @@ selected NetAdapterCx version.
 The implementation shall record the exact WDK/SDK and NetAdapterCx API
 contracts used. Any callback whose IRQL or pageability depends on framework
 state shall be annotated and placed accordingly.
+
+The receive-filter capability structure shall advertise directed and broadcast
+filters only. Its multicast-address capacity shall remain zero because the TAP
+adapter does not implement multicast filtering.
 
 The Rust implementation shall use the generated NetAdapterCx declarations for
 all framework calls. It shall not duplicate C declarations manually or invent
@@ -276,7 +296,7 @@ not contain test-only ARP or ICMP handling.
    state needed for restoration.
 3. Assign `192.0.2.1/30` only to the test interface. Do not add a default
    route; reject address collisions or ambiguous adapter matches.
-4. Open `\\.\WinTapNetAdapterCx` exclusively with overlapped I/O before the
+4. Open `\\.\WinTapRust` exclusively with overlapped I/O before the
    protocol exchange.
 
 ### Request/reply packet flow

@@ -78,7 +78,7 @@ const PENDING_WRITE_LIMIT: usize = 64;
 const FRAME_QUEUE_LIMIT: usize = 256;
 const FRAME_MINIMUM: usize = 14;
 const FRAME_MAXIMUM: usize = 1514;
-const CONTROL_DEVICE_NAME: [u16; 27] = [
+const CONTROL_DEVICE_NAME: [u16; 19] = [
     b'\\' as u16,
     b'D' as u16,
     b'e' as u16,
@@ -93,21 +93,13 @@ const CONTROL_DEVICE_NAME: [u16; 27] = [
     b'T' as u16,
     b'a' as u16,
     b'p' as u16,
-    b'N' as u16,
-    b'e' as u16,
+    b'R' as u16,
+    b'u' as u16,
+    b's' as u16,
     b't' as u16,
-    b'A' as u16,
-    b'd' as u16,
-    b'a' as u16,
-    b'p' as u16,
-    b't' as u16,
-    b'e' as u16,
-    b'r' as u16,
-    b'C' as u16,
-    b'x' as u16,
     0,
 ];
-const CONTROL_SYMBOLIC_LINK: [u16; 31] = [
+const CONTROL_SYMBOLIC_LINK: [u16; 23] = [
     b'\\' as u16,
     b'D' as u16,
     b'o' as u16,
@@ -126,21 +118,13 @@ const CONTROL_SYMBOLIC_LINK: [u16; 31] = [
     b'T' as u16,
     b'a' as u16,
     b'p' as u16,
-    b'N' as u16,
-    b'e' as u16,
+    b'R' as u16,
+    b'u' as u16,
+    b's' as u16,
     b't' as u16,
-    b'A' as u16,
-    b'd' as u16,
-    b'a' as u16,
-    b'p' as u16,
-    b't' as u16,
-    b'e' as u16,
-    b'r' as u16,
-    b'C' as u16,
-    b'x' as u16,
     0,
 ];
-const CONTROL_SDDL: [u16; 15] = [
+const CONTROL_SDDL: [u16; 16] = [
     b'D' as u16,
     b':' as u16,
     b'P' as u16,
@@ -150,6 +134,7 @@ const CONTROL_SDDL: [u16; 15] = [
     b';' as u16,
     b'G' as u16,
     b'A' as u16,
+    b';' as u16,
     b';' as u16,
     b';' as u16,
     b'B' as u16,
@@ -184,9 +169,10 @@ static mut RX_FRAGMENT_EXTENSION: netadaptercx_sys::NET_EXTENSION =
             Enabled: 0,
         },
     };
-static FRAGMENT_VIRTUAL_ADDRESS_NAME: [u16; 28] = [
+static PNP_DEVICE_ADDED: AtomicBool = AtomicBool::new(false);
+static FRAGMENT_VIRTUAL_ADDRESS_NAME: [u16; 27] = [
     109, 115, 95, 102, 114, 97, 103, 109, 101, 110, 116, 95, 118, 105, 114, 116, 117, 97, 108,
-    95, 97, 100, 100, 114, 101, 115, 115, 0,
+    97, 100, 100, 114, 101, 115, 115, 0,
 ];
 static TX_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
 static RX_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
@@ -195,13 +181,23 @@ static PENDING_READS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_WRITES: AtomicUsize = AtomicUsize::new(0);
 
 static QUEUE_CONTEXT_NAME: &[u8] = b"WINTAP_QUEUE_CONTEXT\0";
+static DEVICE_CONTEXT_NAME: &[u8] = b"WINTAP_DEVICE_CONTEXT\0";
 
 static mut QUEUE_CONTEXT_TYPE_INFO: wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO =
     wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO {
         Size: core::mem::size_of::<wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO>() as ULONG,
         ContextName: QUEUE_CONTEXT_NAME.as_ptr() as *const i8,
         ContextSize: core::mem::size_of::<QueueContext>(),
-        UniqueType: core::ptr::null(),
+        UniqueType: &raw const QUEUE_CONTEXT_TYPE_INFO,
+        EvtDriverGetUniqueContextType: None,
+    };
+
+static mut DEVICE_CONTEXT_TYPE_INFO: wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO =
+    wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO {
+        Size: core::mem::size_of::<wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO>() as ULONG,
+        ContextName: DEVICE_CONTEXT_NAME.as_ptr() as *const i8,
+        ContextSize: core::mem::size_of::<DeviceContext>(),
+        UniqueType: &raw const DEVICE_CONTEXT_TYPE_INFO,
         EvtDriverGetUniqueContextType: None,
     };
 
@@ -211,6 +207,11 @@ struct QueueContext {
     started: bool,
     _padding: [u8; 6],
     rings: netadaptercx_sys::NET_RING_COLLECTION,
+}
+
+#[repr(C)]
+struct DeviceContext {
+    _reserved: u8,
 }
 
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_STATE>();
@@ -241,6 +242,7 @@ pub unsafe extern "system" fn driver_entry(
     // SAFETY: DriverEntry receives valid WDF-owned driver and registry path
     // pointers, the object attributes output is intentionally null, and the
     // driver config lives until WdfDriverCreate returns.
+    let mut wdf_driver: WDFDRIVER = core::ptr::null_mut();
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDriverCreate,
@@ -248,14 +250,16 @@ pub unsafe extern "system" fn driver_entry(
             registry_path,
             WDF_NO_OBJECT_ATTRIBUTES,
             &mut driver_config,
-            WDF_NO_HANDLE.cast::<WDFDRIVER>(),
+            &mut wdf_driver,
         )
     };
     debug_status(b"WdfDriverCreate", status);
 
-    if status == STATUS_SUCCESS {
-        STATUS_SUCCESS
+    if status != STATUS_SUCCESS {
+        status
     } else {
+        let status = create_control_device(wdf_driver);
+        debug_status(b"CreateControlDevice", status);
         status
     }
 }
@@ -266,9 +270,14 @@ pub unsafe extern "system" fn driver_entry(
 /// implementation slice; the device is deliberately not exposed as a
 /// functional data path until those callbacks are complete.
 extern "C" fn evt_driver_device_add(
-    driver: WDFDRIVER,
+    _driver: WDFDRIVER,
     device_init: *mut WDFDEVICE_INIT,
 ) -> NTSTATUS {
+    if PNP_DEVICE_ADDED.swap(true, Ordering::AcqRel) {
+        debug_status(b"EvtDriverDeviceAdd duplicate", STATUS_DEVICE_BUSY);
+        return STATUS_DEVICE_BUSY;
+    }
+
     debug_marker(b"EvtDriverDeviceAdd enter");
     let status = unsafe {
         // SAFETY: NetDeviceInitConfig is called once at PASSIVE_LEVEL before
@@ -277,6 +286,7 @@ extern "C" fn evt_driver_device_add(
     };
     debug_status(b"NetDeviceInitConfig", status);
     if status != STATUS_SUCCESS {
+        PNP_DEVICE_ADDED.store(false, Ordering::Release);
         return status;
     }
 
@@ -300,6 +310,9 @@ extern "C" fn evt_driver_device_add(
         EvtDeviceFileCreate: Some(evt_file_create),
         EvtFileClose: Some(evt_file_close),
         EvtFileCleanup: Some(evt_file_cleanup),
+        FileObjectClass:
+            wdk_sys::_WDF_FILEOBJECT_CLASS::WdfFileObjectWdfCannotUseFsContexts,
+        AutoForwardCleanupClose: wdk_sys::_WDF_TRI_STATE::WdfUseDefault,
         ..WDF_FILEOBJECT_CONFIG::default()
     };
     unsafe {
@@ -323,12 +336,7 @@ extern "C" fn evt_driver_device_add(
     };
     debug_status(b"WdfDeviceCreate", status);
     if status != STATUS_SUCCESS {
-        return status;
-    }
-
-    let status = create_control_device(driver);
-    debug_status(b"CreateControlDevice", status);
-    if status != STATUS_SUCCESS {
+        PNP_DEVICE_ADDED.store(false, Ordering::Release);
         return status;
     }
 
@@ -336,6 +344,9 @@ extern "C" fn evt_driver_device_add(
     // PASSIVE_LEVEL during device addition.
     let status = unsafe { create_adapter(_pnp_device) };
     debug_status(b"CreateAdapter", status);
+    if status != STATUS_SUCCESS {
+        PNP_DEVICE_ADDED.store(false, Ordering::Release);
+    }
     status
 }
 
@@ -559,6 +570,10 @@ fn create_packet_queue(queue_init: *mut c_void, is_transmit: bool) -> NTSTATUS {
     let mut attributes = WDF_OBJECT_ATTRIBUTES {
         Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
         ContextTypeInfo: &raw const QUEUE_CONTEXT_TYPE_INFO,
+        ExecutionLevel:
+            wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
         ..WDF_OBJECT_ATTRIBUTES::default()
     };
     let status = unsafe {
@@ -956,7 +971,37 @@ extern "C" fn evt_packet_queue_set_notification_enabled(
     }
 }
 
-extern "C" fn evt_packet_queue_cancel(_queue: netadaptercx_sys::NETPACKETQUEUE) {}
+extern "C" fn evt_packet_queue_cancel(queue: netadaptercx_sys::NETPACKETQUEUE) {
+    let (rings, is_receive) = unsafe {
+        if queue == TX_QUEUE {
+            (TX_RINGS, false)
+        } else if queue == RX_QUEUE {
+            (RX_RINGS, true)
+        } else {
+            return;
+        }
+    };
+
+    if rings.is_null() {
+        return;
+    }
+
+    unsafe {
+        let rings = &*rings;
+        for ring_index in [ring::PACKET_RING_INDEX, ring::FRAGMENT_RING_INDEX] {
+            let ring = rings.Rings[ring_index];
+            if !ring.is_null() {
+                // Advancing BeginIndex to EndIndex returns all outstanding
+                // packet and fragment entries to NetAdapterCx.
+                (*ring).BeginIndex = (*ring).EndIndex;
+            }
+        }
+    }
+
+    if is_receive {
+        RX_NOTIFICATION_ENABLED.store(false, Ordering::Release);
+    }
+}
 
 extern "C" fn evt_set_receive_filter(
     _adapter: netadaptercx_sys::NETADAPTER,
@@ -990,6 +1035,7 @@ extern "C" fn evt_device_prepare_hardware(
 
     let mut tx = netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES {
         Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES>() as ULONG,
+        FragmentBufferAlignment: 1,
         MaximumNumberOfFragments: 1,
         MaximumNumberOfQueues: 1,
         ..netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES::default()
@@ -1003,6 +1049,14 @@ extern "C" fn evt_device_prepare_hardware(
         FragmentRingNumberOfElementsHint: 0,
         MaximumFrameSize: FRAME_MAXIMUM as u64,
         MaximumNumberOfQueues: 1,
+        __bindgen_anon_1:
+            netadaptercx_sys::_NET_ADAPTER_RX_CAPABILITIES__bindgen_ty_1 {
+                __bindgen_anon_2:
+                    netadaptercx_sys::_NET_ADAPTER_RX_CAPABILITIES__bindgen_ty_1__bindgen_ty_2 {
+                        FragmentBufferAlignment: 1,
+                        ..netadaptercx_sys::_NET_ADAPTER_RX_CAPABILITIES__bindgen_ty_1__bindgen_ty_2::default()
+                    },
+            },
         ..netadaptercx_sys::NET_ADAPTER_RX_CAPABILITIES::default()
     };
     let set_data_path: unsafe extern "system" fn(
@@ -1031,7 +1085,6 @@ extern "C" fn evt_device_prepare_hardware(
             netadaptercx_sys::NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES,
         >() as ULONG,
         SupportedPacketFilters: netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagDirected
-            | netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagMulticast
             | netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagBroadcast,
         EvtSetReceiveFilter: Some(evt_set_receive_filter),
         ..netadaptercx_sys::NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES::default()
@@ -1076,13 +1129,6 @@ extern "C" fn evt_device_release_hardware(
         ADAPTER = core::ptr::null_mut();
         adapter
     };
-    let (read_queue, write_queue) = unsafe { (READ_QUEUE, WRITE_QUEUE) };
-    let control_device = unsafe {
-        let device = CONTROL_DEVICE;
-        CONTROL_DEVICE = core::ptr::null_mut();
-        device
-    };
-
     if !adapter.is_null() {
         let stop: unsafe extern "system" fn(
             netadaptercx_sys::PNET_DRIVER_GLOBALS,
@@ -1095,26 +1141,10 @@ extern "C" fn evt_device_release_hardware(
         unsafe { stop(netadaptercx_sys::NetDriverGlobals, adapter) };
     }
 
-    purge_queue(read_queue);
-    purge_queue(write_queue);
     clear_frame_queue();
     PENDING_READS.store(0, Ordering::Release);
     PENDING_WRITES.store(0, Ordering::Release);
-
-    if !control_device.is_null() {
-        // SAFETY: The control device was created by this driver and is
-        // deleted exactly once after its global handle is cleared.
-        unsafe {
-            call_unsafe_wdf_function_binding!(WdfObjectDelete, control_device.cast());
-        }
-    }
     unsafe {
-        READ_QUEUE = core::ptr::null_mut();
-        WRITE_QUEUE = core::ptr::null_mut();
-        FRAME_LOCK = core::ptr::null_mut();
-        READ_WORK_ITEM = core::ptr::null_mut();
-        WRITE_WORK_ITEM = core::ptr::null_mut();
-        FRAME_QUEUE = None;
         TX_QUEUE = core::ptr::null_mut();
         RX_QUEUE = core::ptr::null_mut();
         TX_RINGS = core::ptr::null();
@@ -1131,6 +1161,7 @@ extern "C" fn evt_device_release_hardware(
     TX_QUEUE_STARTED.store(false, Ordering::Release);
     RX_QUEUE_STARTED.store(false, Ordering::Release);
     RX_NOTIFICATION_ENABLED.store(false, Ordering::Release);
+    PNP_DEVICE_ADDED.store(false, Ordering::Release);
 
     STATUS_SUCCESS
 }
@@ -1145,7 +1176,31 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
         )
     };
     if control_init.is_null() {
+        debug_status(b"WdfControlDeviceInitAllocate", STATUS_INSUFFICIENT_RESOURCES);
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    debug_marker(b"WdfControlDeviceInitAllocate");
+
+    let mut file_config = WDF_FILEOBJECT_CONFIG {
+        Size: core::mem::size_of::<WDF_FILEOBJECT_CONFIG>() as ULONG,
+        EvtDeviceFileCreate: Some(evt_file_create),
+        EvtFileClose: Some(evt_file_close),
+        EvtFileCleanup: Some(evt_file_cleanup),
+        FileObjectClass:
+            wdk_sys::_WDF_FILEOBJECT_CLASS::WdfFileObjectWdfCannotUseFsContexts,
+        AutoForwardCleanupClose: wdk_sys::_WDF_TRI_STATE::WdfUseDefault,
+        ..WDF_FILEOBJECT_CONFIG::default()
+    };
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceInitSetFileObjectConfig,
+            control_init,
+            &mut file_config,
+            WDF_NO_OBJECT_ATTRIBUTES,
+        );
+    }
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfDeviceInitSetExclusive, control_init, 1);
     }
 
     let device_name = unicode_string(&CONTROL_DEVICE_NAME);
@@ -1156,15 +1211,12 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
             &device_name as *const UNICODE_STRING,
         )
     };
+    debug_status(b"WdfDeviceInitAssignName", status);
     if status != STATUS_SUCCESS {
         unsafe {
             call_unsafe_wdf_function_binding!(WdfDeviceInitFree, control_init);
         }
         return status;
-    }
-
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfDeviceInitSetExclusive, control_init, 1);
     }
 
     let mut device: WDFDEVICE = core::ptr::null_mut();
@@ -1176,6 +1228,7 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
             &mut device,
         )
     };
+    debug_status(b"WdfControlDeviceCreate", status);
     if status != STATUS_SUCCESS {
         return status;
     }
@@ -1218,6 +1271,10 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
     let mut work_item_attributes = WDF_OBJECT_ATTRIBUTES {
         Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
         ParentObject: device.cast(),
+        ExecutionLevel:
+            wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
         ..WDF_OBJECT_ATTRIBUTES::default()
     };
     let mut read_work_config = WDF_WORKITEM_CONFIG {

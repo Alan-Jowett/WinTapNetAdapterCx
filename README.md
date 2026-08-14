@@ -23,8 +23,8 @@ The approved `REQ-008`/`REQ-009` privileged integration change and the
 `CHG-001` through `CHG-014` maintenance patch set are applied, and
 the approved `CHG-015` through `CHG-020` plus `CHG-022` alignment corrections
 are applied. `CHG-021` was superseded by the consolidated D0 change.
-Hosted validation covers repository artifacts, WDK tool provisioning, CMake
-configure/build/package, and package shape for x64 and ARM64. The privileged
+Hosted validation covers repository artifacts, Rust WDK tool provisioning,
+CMake configure/build/package, and package shape for x64 and ARM64. The privileged
 runtime harness requires an installed test-signed driver and an elevated
 administrator session; hosted CI does not claim packet-path, power, removal,
 or Driver Verifier coverage. See [`specs/current-status.md`](specs/current-status.md)
@@ -38,7 +38,7 @@ opt-in Ethernet/ICMP round trip:
 ```powershell
 .\tests\run-wintap-harness.ps1 -Integration `
   -InstallDriver -RequireTestSigning `
-  -PackageDirectory .\out\driver\x64\Release `
+  -PackageDirectory .\out\rust-target\x86_64-pc-windows-msvc\release\wintap_netadaptercx_driver_package `
   -DiagnosticsPath .\artifacts\wintap-harness
 ```
 
@@ -56,7 +56,7 @@ than reporting a capability-only pass.
 
 - Windows 10 and later
 - Windows Driver Kit (WDK) with NetAdapterCx support
-- Visual Studio with the Windows driver development workload
+- Rust `1.85.0`, `cargo-wdk`, LLVM/libclang, and NuGet
 
 The project targets Windows 10 version 2004 and later on x64 and ARM64. Build
 dependencies use the pinned WDK/SDK NuGet version `10.0.28000.2526`.

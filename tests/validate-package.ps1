@@ -5,7 +5,7 @@ param(
 
     [string]$Configuration = "Release",
 
-    [string]$PackageRoot = ".\out\driver",
+    [string]$PackageRoot = ".\out\rust-target",
 
     [string]$PackageDirectory
 )
@@ -17,12 +17,8 @@ $artifactRoot = if ($PackageDirectory) {
 } else {
     Join-Path $PackageRoot "$Architecture\$Configuration"
 }
-$driver = Join-Path $artifactRoot "WinTapNetAdapterCx.sys"
-$inf = if ($PackageDirectory) {
-    Join-Path $artifactRoot "WinTapNetAdapterCx.inf"
-} else {
-    Join-Path (Resolve-Path ".\driver").Path "WinTapNetAdapterCx.inf"
-}
+$driver = Join-Path $artifactRoot "wintap_netadaptercx_driver.sys"
+$inf = Join-Path $artifactRoot "wintap_netadaptercx_driver.inf"
 
 if (-not (Test-Path -LiteralPath $driver -PathType Leaf)) {
     throw "Driver artifact was not produced: $driver"
@@ -38,11 +34,9 @@ foreach ($required in @("CatalogFile", "WinTap_CopyFiles", "WinTap_Service", "NT
     }
 }
 
-$catalog = Join-Path $artifactRoot "WinTapNetAdapterCx.cat"
-if (Test-Path -LiteralPath $catalog -PathType Leaf) {
-    Write-Host "Catalog artifact present: $catalog"
-} else {
-    Write-Warning "Catalog artifact is not produced because EnableInf2cat is disabled; signing/install validation is deferred."
+$catalog = Join-Path $artifactRoot "wintap_netadaptercx_driver.cat"
+if (-not (Test-Path -LiteralPath $catalog -PathType Leaf)) {
+    throw "Catalog artifact was not produced: $catalog"
 }
 
 Write-Host "Package artifacts validated for $Architecture/$Configuration."

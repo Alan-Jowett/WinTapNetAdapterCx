@@ -45,6 +45,10 @@ stack as an Ethernet-capable interface.
 **Invariant impact:** Adapter creation and teardown must leave no registered
 device, queue, packet, or user handle after failure or removal.
 
+The adapter shall advertise directed and broadcast receive filters only. It
+shall not advertise multicast filtering unless it also implements and declares
+a nonzero multicast-address capacity.
+
 ### REQ-002 — TAP-style frame exchange
 
 **Before:** No user-mode packet interface is defined.  
@@ -127,7 +131,7 @@ Windows networking stack in both directions.
 **After:** A privileged integration test shall load the test-signed driver,
 identify the resulting TAP Ethernet interface, assign `192.0.2.1/30`
 without creating an unintended default route, and open
-`\\.\WinTapNetAdapterCx` with an overlapped Win32 device handle. It shall
+`\\.\WinTapRust` with an overlapped Win32 device handle. It shall
 cause the Windows networking stack to generate an ICMP Echo Request to
 `192.0.2.2`. It shall service the required Ethernet ARP exchange through the
 TAP handle so the stack can resolve the peer, then read and validate the
@@ -197,6 +201,44 @@ structure layout, packet ownership, queue cancellation, synchronization,
 nonpaged allocation, exactly-once completion, and teardown safety. Unsupported
 Rust, WDK, SDK, binding, or architecture combinations must fail explicitly.
 
+### REQ-011 — Rust-only production tree
+
+**Before:** The branch contains both a C/C++ driver project and an optional
+Rust driver path.
+**After:** The branch shall contain only the Rust production driver, its
+generated bindings, and its Rust package flow. C/C++ driver source, Visual
+Studio driver project, C driver INF, C package fallback, and C-specific CI or
+harness selection shall be removed.
+
+**Trace:** User request: "remove the c/c++ impelmentation in this branch as
+well."
+**Invariant impact:** Every build, package, install, and validation entry point
+selects the Rust implementation; no artifact can accidentally deploy the
+obsolete C service.
+
+### REQ-012 — Rust package identity
+
+**Before:** The Rust package partially shares the C driver naming scheme.
+**After:** The package shall use `ROOT\WinTapRust`, service `WinTapRust`, and
+`wintap_netadaptercx_driver.inf`/`wintap_netadaptercx_driver.cat`. It shall not reuse C
+hardware, service, INF, or catalog identities.
+
+**Trace:** User direction that this branch work on the Rust driver.
+**Invariant impact:** Installation and removal unambiguously target the Rust
+driver and cannot select a stale C package.
+
+### REQ-013 — Receive-filter verifier compatibility
+
+**Before:** The Rust driver advertises multicast receive filtering while its
+multicast address capacity is zero.
+**After:** The Rust driver shall advertise directed and broadcast filtering
+only, leaving multicast unsupported.
+
+**Trace:** User request: "disable multi-cast support, it's not needed for
+tap"; observed NetAdapterCx verifier bugcheck `0x19E/0xB`.
+**Invariant impact:** NetAdapterCx receive-filter validation accepts the
+capability structure without a multicast capacity declaration.
+
 ## Scope boundaries
 
 - **In scope:** A NetAdapterCx software Ethernet adapter and a TAP-style
@@ -209,6 +251,8 @@ Rust, WDK, SDK, binding, or architecture combinations must fail explicitly.
 - **In scope:** Rust kernel-mode driver behavior, generated NetAdapterCx FFI,
   safe wrapper boundaries, Rust-specific panic and build configuration, and
   ABI/layout validation.
+- **In scope:** Removing the C/C++ implementation and publishing an
+  unambiguous Rust-only driver package.
 - **Out of scope unless explicitly added:** IP/TUN mode (decision: excluded
   from the initial milestone), protocol-specific
   user-mode libraries, packet capture beyond the virtual adapter contract,
