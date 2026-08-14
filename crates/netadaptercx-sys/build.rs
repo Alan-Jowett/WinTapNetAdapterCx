@@ -8,11 +8,8 @@ const WDK_NUGET_VERSION: &str = "10.0.28000.2526";
 const NETADAPTERCX_VERSION: &str = "2.5";
 
 fn main() {
+    let _wdk_root = wintap_wdk_bootstrap::configure();
     println!("cargo:rerun-if-changed=wrapper.h");
-    println!("cargo:rerun-if-env-changed=WINTAP_WDK_ROOT");
-    println!("cargo:rerun-if-env-changed=WINTAP_WDK_PACKAGE_ROOT");
-    println!("cargo:rerun-if-env-changed=NUGET_PACKAGES");
-    println!("cargo:rerun-if-env-changed=WINTAP_WDK_VERSION");
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| String::from("x86_64"));
     let target_define = match arch.as_str() {
@@ -132,15 +129,6 @@ struct Roots {
 }
 
 fn locate_roots(version: &str, arch: &str) -> Roots {
-    if let Ok(root) = env::var("WINTAP_WDK_ROOT") {
-        let root = PathBuf::from(root);
-        return Roots {
-            wdk: root.clone(),
-            sdk: root.clone(),
-            sdk_arch: root,
-        };
-    }
-
     let package_root = package_root();
     let arch_package = match arch {
         "x86_64" => "x64",
@@ -162,25 +150,13 @@ fn locate_roots(version: &str, arch: &str) -> Roots {
 }
 
 fn package_root() -> PathBuf {
-    if let Ok(root) = env::var("WINTAP_WDK_PACKAGE_ROOT") {
-        return PathBuf::from(root);
-    }
-    if let Ok(root) = env::var("NUGET_PACKAGES") {
-        return PathBuf::from(root);
-    }
-    if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
-        let repo_root = Path::new(&manifest_dir)
-            .ancestors()
-            .nth(2)
-            .expect("crate is under repo/crates/name");
-        let out_packages = repo_root.join("out").join("packages");
-        if out_packages.exists() {
-            return out_packages;
-        }
-    }
-    let profile = env::var("USERPROFILE")
-        .expect("USERPROFILE is required when WINTAP_WDK_PACKAGE_ROOT is unset");
-    PathBuf::from(profile).join(".nuget").join("packages")
+    let manifest_dir =
+        env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is required for package lookup");
+    let repo_root = Path::new(&manifest_dir)
+        .ancestors()
+        .nth(2)
+        .expect("crate is under repo/crates/name");
+    repo_root.join("out").join("packages")
 }
 
 fn find_package(root: &Path, id: &str, version: &str) -> Option<PathBuf> {

@@ -17,6 +17,7 @@ path = "src/lib.rs"
 
 [build-dependencies]
 wdk-build.workspace = true
+wintap-wdk-bootstrap.workspace = true
 
 [dependencies]
 netadaptercx-sys.workspace = true

@@ -12,4 +12,6 @@ LLVM/libclang, and generated NetAdapterCx bindings are available and validated.
   it cannot be mistaken for the complete TAP datapath port.
 
 Build prerequisites: Rust `1.85.0`, `cargo-wdk`, LLVM/libclang usable by
-`bindgen`, and restored WDK/SDK packages for the selected architecture.
+`bindgen`, and `nuget.exe`. On the first `cargo build`, the workspace restores
+the pinned WDK/SDK NuGet packages for the selected architecture into
+`out\packages`; it does not use a machine-installed SDK or WDK.

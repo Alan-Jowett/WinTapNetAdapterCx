@@ -22,7 +22,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to restore $wdkPackage $Version."
 }
 
-& $nuget.Source install $sdkPackage -Version $Version -OutputDirectory $OutputDirectory
+& $nuget.Source install $sdkPackage -Version $Version -OutputDirectory $OutputDirectory -NonInteractive
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to restore $sdkPackage $Version."
 }

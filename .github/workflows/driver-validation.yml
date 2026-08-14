@@ -42,6 +42,20 @@ jobs:
             }
           }
 
+  cargo-build:
+    name: NuGet-only Cargo build
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Rust workspace from an empty package cache
+        shell: pwsh
+        run: |
+          Remove-Item .\out\packages -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item Env:WDKContentRoot -ErrorAction SilentlyContinue
+          cargo build
+
   build:
     name: Build ${{ matrix.architecture }}
     runs-on: windows-latest
