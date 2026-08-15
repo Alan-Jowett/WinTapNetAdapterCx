@@ -41,7 +41,11 @@ if ($harness -notmatch 'CreateFile' -or
 $source = Get-Content -Raw crates\wintap-netadaptercx-driver\src\lib.rs
 if ($source -notmatch 'export_name = "DriverEntry"' -or
     $source -notmatch 'evt_driver_device_add' -or
-    $source -match 'NetPacketFilterFlagMulticast') {
+    $source -notmatch 'NetPacketFilterFlagMulticast' -or
+    $source -notmatch 'NetPacketFilterFlagAllMulticast' -or
+    $source -notmatch 'NetPacketFilterFlagPromiscuous' -or
+    $source -notmatch 'MaximumMulticastAddresses:\s*MAXIMUM_MULTICAST_ADDRESSES' -or
+    $source -notmatch 'evt_set_receive_filter') {
     throw "The Rust driver identity or receive-filter contract is incomplete."
 }
 

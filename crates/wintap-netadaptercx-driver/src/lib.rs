@@ -78,6 +78,8 @@ const PENDING_WRITE_LIMIT: usize = 64;
 const FRAME_QUEUE_LIMIT: usize = 256;
 const FRAME_MINIMUM: usize = 14;
 const FRAME_MAXIMUM: usize = 1514;
+const MAXIMUM_MULTICAST_ADDRESSES: usize = 64;
+const ETHERNET_ADDRESS_LENGTH: usize = 6;
 const CONTROL_DEVICE_NAME: [u16; 19] = [
     b'\\' as u16,
     b'D' as u16,
@@ -149,6 +151,11 @@ static mut READ_QUEUE: WDFQUEUE = core::ptr::null_mut();
 static mut WRITE_QUEUE: WDFQUEUE = core::ptr::null_mut();
 static mut FRAME_LOCK: WDFSPINLOCK = core::ptr::null_mut();
 static mut FRAME_QUEUE: Option<FrameQueue> = None;
+static mut ACTIVE_PACKET_FILTERS: netadaptercx_sys::_NET_PACKET_FILTER_FLAGS = 0;
+static mut ACTIVE_MULTICAST_ADDRESS_COUNT: usize = 0;
+static mut ACTIVE_MULTICAST_ADDRESSES: [[u8; ETHERNET_ADDRESS_LENGTH];
+    MAXIMUM_MULTICAST_ADDRESSES] =
+    [[0; ETHERNET_ADDRESS_LENGTH]; MAXIMUM_MULTICAST_ADDRESSES];
 static mut READ_WORK_ITEM: WDFWORKITEM = core::ptr::null_mut();
 static mut WRITE_WORK_ITEM: WDFWORKITEM = core::ptr::null_mut();
 static mut TX_QUEUE: netadaptercx_sys::NETPACKETQUEUE = core::ptr::null_mut();
@@ -1005,8 +1012,97 @@ extern "C" fn evt_packet_queue_cancel(queue: netadaptercx_sys::NETPACKETQUEUE) {
 
 extern "C" fn evt_set_receive_filter(
     _adapter: netadaptercx_sys::NETADAPTER,
-    _receive_filter: netadaptercx_sys::NETRECEIVEFILTER,
+    receive_filter: netadaptercx_sys::NETRECEIVEFILTER,
 ) {
+    let get_packet_filter: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETRECEIVEFILTER,
+    ) -> netadaptercx_sys::_NET_PACKET_FILTER_FLAGS = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetReceiveFilterGetPacketFilterTableIndex as usize,
+        )
+    };
+    let get_multicast_address_count: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETRECEIVEFILTER,
+    ) -> usize = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetReceiveFilterGetMulticastAddressCountTableIndex
+                as usize,
+        )
+    };
+    let get_multicast_address_list: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        netadaptercx_sys::NETRECEIVEFILTER,
+    ) -> *const netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS = unsafe {
+        net_function(
+            netadaptercx_sys::_NETFUNCENUM_NetReceiveFilterGetMulticastAddressListTableIndex
+                as usize,
+        )
+    };
+
+    let packet_filters =
+        unsafe { get_packet_filter(netadaptercx_sys::NetDriverGlobals, receive_filter) };
+    let requested_count = unsafe {
+        get_multicast_address_count(netadaptercx_sys::NetDriverGlobals, receive_filter)
+    };
+    let address_count = requested_count.min(MAXIMUM_MULTICAST_ADDRESSES);
+    if requested_count != address_count {
+        debug_status(b"ReceiveFilter multicast count", STATUS_INVALID_BUFFER_SIZE);
+    }
+
+    let mut addresses = [[0; ETHERNET_ADDRESS_LENGTH]; MAXIMUM_MULTICAST_ADDRESSES];
+    if address_count != 0 {
+        let address_list = unsafe {
+            get_multicast_address_list(netadaptercx_sys::NetDriverGlobals, receive_filter)
+        };
+        if address_list.is_null() {
+            debug_status(b"ReceiveFilter multicast list", STATUS_INVALID_BUFFER_SIZE);
+            update_receive_filter_state(packet_filters, &addresses[..0]);
+            return;
+        }
+        for (index, address) in addresses.iter_mut().take(address_count).enumerate() {
+            // NetAdapterCx owns the list for this callback; take a local,
+            // fixed-size Ethernet snapshot before publishing state.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (*address_list.add(index)).Address.as_ptr(),
+                    address.as_mut_ptr(),
+                    ETHERNET_ADDRESS_LENGTH,
+                );
+            }
+        }
+    }
+
+    update_receive_filter_state(packet_filters, &addresses[..address_count]);
+}
+
+fn update_receive_filter_state(
+    packet_filters: netadaptercx_sys::_NET_PACKET_FILTER_FLAGS,
+    multicast_addresses: &[[u8; ETHERNET_ADDRESS_LENGTH]],
+) {
+    let lock = unsafe { FRAME_LOCK };
+    if lock.is_null() {
+        debug_status(b"ReceiveFilter state lock", STATUS_DEVICE_NOT_READY);
+        return;
+    }
+
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
+        ACTIVE_PACKET_FILTERS = packet_filters;
+        ACTIVE_MULTICAST_ADDRESS_COUNT = multicast_addresses.len();
+        for (index, address) in multicast_addresses.iter().enumerate() {
+            ACTIVE_MULTICAST_ADDRESSES[index] = *address;
+        }
+        for index in multicast_addresses.len()..MAXIMUM_MULTICAST_ADDRESSES {
+            ACTIVE_MULTICAST_ADDRESSES[index] = [0; ETHERNET_ADDRESS_LENGTH];
+        }
+        call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+    }
+}
+
+fn clear_receive_filter_state() {
+    update_receive_filter_state(0, &[]);
 }
 
 unsafe extern "C" fn evt_device_d0_entry(
@@ -1085,7 +1181,11 @@ extern "C" fn evt_device_prepare_hardware(
             netadaptercx_sys::NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES,
         >() as ULONG,
         SupportedPacketFilters: netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagDirected
-            | netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagBroadcast,
+            | netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagBroadcast
+            | netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagMulticast
+            | netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagAllMulticast
+            | netadaptercx_sys::_NET_PACKET_FILTER_FLAGS_NetPacketFilterFlagPromiscuous,
+        MaximumMulticastAddresses: MAXIMUM_MULTICAST_ADDRESSES as u64,
         EvtSetReceiveFilter: Some(evt_set_receive_filter),
         ..netadaptercx_sys::NET_ADAPTER_RECEIVE_FILTER_CAPABILITIES::default()
     };
@@ -1142,6 +1242,7 @@ extern "C" fn evt_device_release_hardware(
     }
 
     clear_frame_queue();
+    clear_receive_filter_state();
     PENDING_READS.store(0, Ordering::Release);
     PENDING_WRITES.store(0, Ordering::Release);
     unsafe {

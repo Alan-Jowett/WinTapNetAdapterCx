@@ -40,7 +40,10 @@ pub unsafe fn fragment_virtual_address(
     if base.is_null() {
         return None;
     }
-    Some(unsafe { base.add(index as usize) })
+    // NetExtensionGetData uses Reserved[1] as the extension's byte stride.
+    let stride = extension.Reserved[1] as usize;
+    let offset = (index as usize).checked_mul(stride)?;
+    Some(unsafe { base.cast::<u8>().add(offset).cast() })
 }
 
 pub unsafe fn element_at(
@@ -95,5 +98,25 @@ mod tests {
         assert_eq!(increment_index(&ring, 4), None);
         ring.NumberOfElements = 3;
         assert_eq!(increment_index(&ring, 0), None);
+    }
+
+    #[test]
+    fn uses_the_extension_byte_stride() {
+        let mut storage = [0_u64; 6];
+        let extension = NET_EXTENSION {
+            Reserved: [
+                storage.as_mut_ptr().cast(),
+                16_usize as *mut c_void,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            ],
+            __bindgen_anon_1: netadaptercx_sys::_NET_EXTENSION__bindgen_ty_1 { Enabled: 1 },
+        };
+
+        let address = unsafe { fragment_virtual_address(&extension, 2) }.unwrap();
+        assert_eq!(
+            address.cast::<u8>(),
+            unsafe { storage.as_mut_ptr().cast::<u8>().add(32) }
+        );
     }
 }

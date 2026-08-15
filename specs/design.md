@@ -108,9 +108,22 @@ The implementation shall record the exact WDK/SDK and NetAdapterCx API
 contracts used. Any callback whose IRQL or pageability depends on framework
 state shall be annotated and placed accordingly.
 
-The receive-filter capability structure shall advertise directed and broadcast
-filters only. Its multicast-address capacity shall remain zero because the TAP
-adapter does not implement multicast filtering.
+The receive-filter capability structure shall advertise directed, broadcast,
+multicast, all-multicast, and promiscuous filters with a multicast-address
+capacity of 64. This is required because NetAdapterCx fails an upper layer's
+packet-filter OID when the requested filters are not advertised; TCP/IP did
+not create an IP interface after multicast-only or all-multicast builds were
+deployed. The `EvtSetReceiveFilter` callback shall atomically replace the
+active packet-filter flags and multicast-address list with the
+framework-provided configuration. The list shall never exceed the declared
+capacity.
+
+The TAP data path has no hardware receive filter and shall continue to deliver
+user-injected frames without software filtering. The cached filter state
+satisfies the NetAdapterCx/upper-layer control-plane contract and makes the
+accepted configuration available for diagnostics; it does not change
+TAP-style frame delivery. The callback state shall be nonpaged, bounded, and
+synchronized safely for its callback IRQL and any diagnostic readers.
 
 The Rust implementation shall use the generated NetAdapterCx declarations for
 all framework calls. It shall not duplicate C declarations manually or invent

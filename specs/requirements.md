@@ -45,9 +45,11 @@ stack as an Ethernet-capable interface.
 **Invariant impact:** Adapter creation and teardown must leave no registered
 device, queue, packet, or user handle after failure or removal.
 
-The adapter shall advertise directed and broadcast receive filters only. It
-shall not advertise multicast filtering unless it also implements and declares
-a nonzero multicast-address capacity.
+The adapter shall advertise directed, broadcast, multicast, all-multicast, and
+promiscuous receive filters. It shall declare a finite multicast-address
+capacity of at least 64 addresses and apply the framework-provided
+receive-filter configuration before accepting receive traffic. This capability
+set is required for TCP/IP to bind successfully through NetAdapterCx.
 
 ### REQ-002 — TAP-style frame exchange
 
@@ -229,15 +231,23 @@ driver and cannot select a stale C package.
 
 ### REQ-013 — Receive-filter verifier compatibility
 
-**Before:** The Rust driver advertises multicast receive filtering while its
-multicast address capacity is zero.
-**After:** The Rust driver shall advertise directed and broadcast filtering
-only, leaving multicast unsupported.
+**Before:** The Rust driver omits multicast receive filtering, causing
+NetAdapterCx to reject TCP/IP's `OID_GEN_CURRENT_PACKET_FILTER` request and
+preventing TCP/IP from binding to the adapter.
+**After:** The Rust driver shall advertise directed, broadcast, multicast,
+all-multicast, and promiscuous receive filtering; declare a multicast-address
+capacity of at least 64; and apply every framework-provided receive-filter
+configuration.
 
-**Trace:** User request: "disable multi-cast support, it's not needed for
-tap"; observed NetAdapterCx verifier bugcheck `0x19E/0xB`.
-**Invariant impact:** NetAdapterCx receive-filter validation accepts the
-capability structure without a multicast capacity declaration.
+**Trace:** User approval: "Restore multicast filtering"; NetAdapterCx
+`NET_PACKET_FILTER_FLAGS` documentation states that omitting a filter expected
+by an upper layer makes `OID_GEN_CURRENT_PACKET_FILTER` fail and prevents that
+layer from binding; observed absence of TCP/IP binding in the VM after both
+multicast-only and all-multicast builds were deployed. User subsequently
+selected promiscuous support.
+**Invariant impact:** The capability structure declares a nonzero capacity
+whenever multicast is advertised. Filter updates remain bounded and replace
+the previously active filter state atomically.
 
 ## Scope boundaries
 
