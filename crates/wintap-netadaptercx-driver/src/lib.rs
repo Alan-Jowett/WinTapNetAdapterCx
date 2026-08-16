@@ -73,8 +73,8 @@ const STATUS_DEVICE_NOT_READY: NTSTATUS = 0xC000_00A3_u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as i32;
 const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206_u32 as i32;
 const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as i32;
-const PENDING_READ_LIMIT: usize = 64;
-const PENDING_WRITE_LIMIT: usize = 64;
+const PENDING_READ_LIMIT: usize = 256;
+const PENDING_WRITE_LIMIT: usize = 256;
 const FRAME_QUEUE_LIMIT: usize = 256;
 const FRAME_MINIMUM: usize = 14;
 const FRAME_MAXIMUM: usize = 1514;
@@ -1241,6 +1241,8 @@ extern "C" fn evt_device_release_hardware(
         unsafe { stop(netadaptercx_sys::NetDriverGlobals, adapter) };
     }
 
+    purge_queue(unsafe { READ_QUEUE });
+    purge_queue(unsafe { WRITE_QUEUE });
     clear_frame_queue();
     clear_receive_filter_state();
     PENDING_READS.store(0, Ordering::Release);

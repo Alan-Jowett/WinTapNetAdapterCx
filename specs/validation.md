@@ -131,6 +131,11 @@ four architecture-specific WDK/SDK NuGet packages listed in `specs/design.md`
 remain pinned to version `10.0.28000.2526`. The harness is implemented in
 PowerShell using P/Invoke to Win32 overlapped I/O.
 
+The kernel crate requires `panic = "abort"`. Stable Cargo therefore cannot
+execute its unit tests; a compatible nightly toolchain with
+`-Zpanic-abort-tests` is required. This tooling limitation does not satisfy
+TC-031 or convert unexecuted unit tests into a passing result.
+
 ## Required hosted and privileged execution
 
 Hosted CI shall continue to validate artifact presence, PowerShell syntax, WDK
