@@ -22,6 +22,7 @@
 | VAL-011 | REQ-011 | Verify the repository, CMake targets, workflow, harness, and package validation contain no C/C++ driver source, project, INF, fallback, or selector. |
 | VAL-012 | REQ-012 | Build each package and verify `wintap_netadaptercx_driver.inf`, `wintap_netadaptercx_driver.cat`, service `WinTapRust`, and hardware ID `ROOT\WinTapRust`. |
 | VAL-013 | REQ-013 | Load the test-signed Rust package with NetAdapterCx verifier enabled; verify directed, broadcast, multicast, all-multicast, and promiscuous capability initialization with a nonzero multicast capacity does not trigger `0x19E/0xB`, and TCP/IP binds successfully. |
+| VAL-014 | REQ-014 | Verify the harness captures native overlapped-I/O errors within its C# wrappers and reports pending and cancelled requests accurately. |
 
 | Test | Coverage |
 |---|---|
@@ -46,6 +47,7 @@
 | TC-039 | Set directed, broadcast, multicast, all-multicast, and promiscuous receive-filter configurations through the Windows stack; verify the driver accepts each supported configuration and stores no more than 64 multicast addresses without corrupting active filter state. |
 | TC-037 | Build Rust x64 and ARM64 packages through CMake and verify each contains the Rust driver binary, `wintap_netadaptercx_driver.inf`, and `wintap_netadaptercx_driver.cat`. |
 | TC-038 | Install `ROOT\WinTapRust` after removing any stale C package; verify service `WinTapRust` starts and no C device or service is selected. |
+| TC-040 | Issue an empty-queue overlapped read and verify `ReadFile` returns false with error 997; cancel it and verify `GetOverlappedResult` returns false with error 995. Repeat this error-observation path before ARP/ICMP assertions. |
 
 ## Functional tests
 
@@ -135,6 +137,10 @@ The kernel crate requires `panic = "abort"`. Stable Cargo therefore cannot
 execute its unit tests; a compatible nightly toolchain with
 `-Zpanic-abort-tests` is required. This tooling limitation does not satisfy
 TC-031 or convert unexecuted unit tests into a passing result.
+
+The harness captures native I/O errors within its C# P/Invoke wrappers. The
+PowerShell layer consumes those explicit values and does not independently
+query last-error state after a managed-boundary transition.
 
 ## Required hosted and privileged execution
 

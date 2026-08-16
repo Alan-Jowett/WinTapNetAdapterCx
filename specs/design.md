@@ -293,6 +293,10 @@ reschedules required passive drain/completion work.
 - Cleanup must be idempotent and safe when start or owner acquisition fails
   partway through.
 - No broad catch-all or silent success fallback is permitted.
+- The PowerShell harness shall receive the native error for `ReadFile`,
+  `WriteFile`, `GetOverlappedResult`, and `CancelIoEx` through an explicit
+  C# wrapper output captured in the same managed call. It shall not query
+  last-error state independently after crossing the C#/PowerShell boundary.
 
 ## ICMP/TAP integration-test design
 

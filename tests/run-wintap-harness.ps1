@@ -69,16 +69,43 @@ public static class WinTapNative {
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr handle);
+
+    public static bool ReadFileWithError(
+        IntPtr handle, IntPtr buffer, uint length, out uint transferred,
+        IntPtr overlapped, out uint error) {
+        bool result = ReadFile(handle, buffer, length, out transferred, overlapped);
+        error = result ? 0u : unchecked((uint)Marshal.GetLastWin32Error());
+        return result;
+    }
+
+    public static bool WriteFileWithError(
+        IntPtr handle, IntPtr buffer, uint length, out uint transferred,
+        IntPtr overlapped, out uint error) {
+        bool result = WriteFile(handle, buffer, length, out transferred, overlapped);
+        error = result ? 0u : unchecked((uint)Marshal.GetLastWin32Error());
+        return result;
+    }
+
+    public static bool GetOverlappedResultWithError(
+        IntPtr handle, IntPtr overlapped, out uint transferred, bool wait,
+        out uint error) {
+        bool result = GetOverlappedResult(handle, overlapped, out transferred, wait);
+        error = result ? 0u : unchecked((uint)Marshal.GetLastWin32Error());
+        return result;
+    }
+
+    public static bool CancelIoExWithError(
+        IntPtr handle, IntPtr overlapped, out uint error) {
+        bool result = CancelIoEx(handle, overlapped);
+        error = result ? 0u : unchecked((uint)Marshal.GetLastWin32Error());
+        return result;
+    }
 }
 "@
 
 function Get-Win32Error {
     [ComponentModel.Win32Exception]::new(
         [Runtime.InteropServices.Marshal]::GetLastWin32Error()).Message
-}
-
-function Get-Win32ErrorCode {
-    [Runtime.InteropServices.Marshal]::GetLastWin32Error()
 }
 
 function Assert-True([bool]$Condition, [string]$Message) {
@@ -168,41 +195,47 @@ function Invoke-OverlappedIo(
         }
 
         [uint32]$transferred = 0
+        [uint32]$nativeError = 0
         $result = if ($Write) {
-            [WinTapNative]::WriteFile(
+            [WinTapNative]::WriteFileWithError(
                 $Handle, $bufferMemory, [uint32]$Buffer.Length,
-                [ref]$transferred, $overlapped)
+                [ref]$transferred, $overlapped, [ref]$nativeError)
         } else {
-            [WinTapNative]::ReadFile(
+            [WinTapNative]::ReadFileWithError(
                 $Handle, $bufferMemory, [uint32]$Buffer.Length,
-                [ref]$transferred, $overlapped)
+                [ref]$transferred, $overlapped, [ref]$nativeError)
         }
 
         if (-not $result) {
-            $errorCode = Get-Win32ErrorCode
-            if ($errorCode -ne [WinTapNative]::ErrorIoPending) {
-                throw "$(if ($Write) { 'Write' } else { 'Read' }) failed: $errorCode"
+            if ($nativeError -ne [WinTapNative]::ErrorIoPending) {
+                throw "$(if ($Write) { 'Write' } else { 'Read' }) failed: $nativeError"
             }
             $wait = [WinTapNative]::WaitForSingleObject(
                 $event, [uint32]$TimeoutMilliseconds)
             if ($wait -eq [WinTapNative]::WaitTimeout) {
-                [WinTapNative]::CancelIoEx($Handle, $overlapped) | Out-Null
+                [uint32]$cancelError = 0
+                [WinTapNative]::CancelIoExWithError(
+                    $Handle, $overlapped, [ref]$cancelError) | Out-Null
                 $cancelWait = [WinTapNative]::WaitForSingleObject($event, 5000)
                 Assert-True ($cancelWait -eq [WinTapNative]::WaitObject0) `
                     "Timed-out I/O did not cancel before its buffer was released."
-                $cancelResult = [WinTapNative]::GetOverlappedResult(
-                    $Handle, $overlapped, [ref]$transferred, $false)
+                [uint32]$completionError = 0
+                $cancelResult = [WinTapNative]::GetOverlappedResultWithError(
+                    $Handle, $overlapped, [ref]$transferred, $false,
+                    [ref]$completionError)
                 Assert-True (-not $cancelResult -and
-                    (Get-Win32ErrorCode) -eq [WinTapNative]::ErrorOperationAborted) `
+                    $completionError -eq [WinTapNative]::ErrorOperationAborted) `
                     "Timed-out I/O returned an unexpected cancellation status."
                 return $null
             }
             Assert-True ($wait -eq [WinTapNative]::WaitObject0) `
                 "WaitForSingleObject failed: $wait"
-            $result = [WinTapNative]::GetOverlappedResult(
-                $Handle, $overlapped, [ref]$transferred, $false)
+            [uint32]$completionError = 0
+            $result = [WinTapNative]::GetOverlappedResultWithError(
+                $Handle, $overlapped, [ref]$transferred, $false,
+                [ref]$completionError)
             if (-not $result) {
-                throw "$(if ($Write) { 'Write' } else { 'Read' }) completion failed: $(Get-Win32Error)"
+                throw "$(if ($Write) { 'Write' } else { 'Read' }) completion failed: $completionError"
             }
         }
 
@@ -251,25 +284,29 @@ function Invoke-CancelledRead([IntPtr]$Handle) {
             [Runtime.InteropServices.Marshal]::WriteIntPtr(
                 $overlapped[$i], 24, $events[$i])
             [uint32]$transferred = 0
-            $result = [WinTapNative]::ReadFile(
+            [uint32]$nativeError = 0
+            $result = [WinTapNative]::ReadFileWithError(
                 $Handle, $buffers[$i], 1514, [ref]$transferred,
-                $overlapped[$i])
+                $overlapped[$i], [ref]$nativeError)
             if (-not $result) {
-                Assert-True ((Get-Win32ErrorCode) -eq [WinTapNative]::ErrorIoPending) `
+                Assert-True ($nativeError -eq [WinTapNative]::ErrorIoPending) `
                     "Extended read $i failed unexpectedly."
                 $pending[$i] = $true
             }
         }
-        [WinTapNative]::CancelIoEx($Handle, [IntPtr]::Zero) | Out-Null
+        [uint32]$cancelError = 0
+        [WinTapNative]::CancelIoExWithError(
+            $Handle, [IntPtr]::Zero, [ref]$cancelError) | Out-Null
         for ($i = 0; $i -lt 2; ++$i) {
             if ($pending[$i]) {
                 [WinTapNative]::WaitForSingleObject($events[$i], 5000) | Out-Null
                 [uint32]$transferred = 0
-                Assert-True (-not [WinTapNative]::GetOverlappedResult(
-                    $Handle, $overlapped[$i], [ref]$transferred, $false)) `
+                [uint32]$completionError = 0
+                Assert-True (-not [WinTapNative]::GetOverlappedResultWithError(
+                    $Handle, $overlapped[$i], [ref]$transferred, $false,
+                    [ref]$completionError)) `
                     "Extended read $i was not cancelled."
-                Assert-True ((Get-Win32ErrorCode) -eq `
-                    [WinTapNative]::ErrorOperationAborted) `
+                Assert-True ($completionError -eq [WinTapNative]::ErrorOperationAborted) `
                     "Extended read $i returned an unexpected cancellation status."
             }
         }
@@ -732,7 +769,9 @@ function Invoke-IntegrationHarness {
         if ($ping) {
             $ping.Dispose()
         }
-        [WinTapNative]::CancelIoEx($handle, [IntPtr]::Zero) | Out-Null
+        [uint32]$cancelError = 0
+        [WinTapNative]::CancelIoExWithError(
+            $handle, [IntPtr]::Zero, [ref]$cancelError) | Out-Null
         [WinTapNative]::CloseHandle($handle) | Out-Null
     }
 }
@@ -797,7 +836,7 @@ try {
         Invoke-OverlappedIo $handle $invalid $true 5000 | Out-Null
         throw "Undersized frame was unexpectedly accepted."
     } catch {
-        Assert-True ($_.Exception.Message -match "87|203|parameter") `
+        Assert-True ($_.Exception.Message -match "87|parameter") `
             "Undersized frame returned unexpected status: $($_.Exception.Message)"
     }
 
@@ -809,18 +848,23 @@ try {
     try {
         [Runtime.InteropServices.Marshal]::WriteIntPtr($readOverlapped, 24, $readEvent)
         [uint32]$readTransferred = 0
-        $readResult = [WinTapNative]::ReadFile(
+        [uint32]$readError = 0
+        $readResult = [WinTapNative]::ReadFileWithError(
             $handle, $readMemory, $readBuffer.Length, [ref]$readTransferred,
-            $readOverlapped)
+            $readOverlapped, [ref]$readError)
         Assert-True (-not $readResult -and
-            (Get-Win32ErrorCode) -eq [WinTapNative]::ErrorIoPending) `
+            $readError -eq [WinTapNative]::ErrorIoPending) `
             "Read did not pend as expected."
-        [WinTapNative]::CancelIoEx($handle, $readOverlapped) | Out-Null
+        [uint32]$cancelError = 0
+        [WinTapNative]::CancelIoExWithError(
+            $handle, $readOverlapped, [ref]$cancelError) | Out-Null
         [WinTapNative]::WaitForSingleObject($readEvent, 5000) | Out-Null
-        Assert-True (-not [WinTapNative]::GetOverlappedResult(
-            $handle, $readOverlapped, [ref]$readTransferred, $false)) `
+        [uint32]$completionError = 0
+        Assert-True (-not [WinTapNative]::GetOverlappedResultWithError(
+            $handle, $readOverlapped, [ref]$readTransferred, $false,
+            [ref]$completionError)) `
             "Cancelled read unexpectedly completed successfully."
-        Assert-True ((Get-Win32ErrorCode) -eq [WinTapNative]::ErrorOperationAborted) `
+        Assert-True ($completionError -eq [WinTapNative]::ErrorOperationAborted) `
             "Unexpected cancellation status."
     } finally {
         [WinTapNative]::CloseHandle($readEvent) | Out-Null

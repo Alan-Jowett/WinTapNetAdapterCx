@@ -249,6 +249,27 @@ selected promiscuous support.
 whenever multicast is advertised. Filter updates remain bounded and replace
 the previously active filter state atomically.
 
+### REQ-014 — Native I/O error preservation
+
+**Before:** The PowerShell harness queries `Marshal.GetLastWin32Error()` after
+returning from `ReadFile`, `WriteFile`, cancellation, and completion P/Invokes.
+That later query can observe an unrelated error; a valid pending read was
+reported as Win32 error 203.
+**After:** The C# P/Invoke boundary shall capture the native error within the
+same managed call as each relevant Win32 invocation and return it explicitly
+to PowerShell. A queued overlapped read shall report `ERROR_IO_PENDING` (997),
+and a cancelled request shall report `ERROR_OPERATION_ABORTED` (995) from its
+completion result. Other I/O failures shall report their captured native
+error.
+
+**Trace:** WinDbg showed the control read reach KMDF, return `STATUS_PENDING`,
+and remain queued; an isolated C# probe observed `ReadFile=false` with error
+997 and cancellation with error 997. The existing PowerShell harness instead
+reported 203.
+**Invariant impact:** This changes only user-mode test error observation. It
+does not alter driver I/O, packet ownership, queue semantics, IRQL, or adapter
+lifecycle.
+
 ## Scope boundaries
 
 - **In scope:** A NetAdapterCx software Ethernet adapter and a TAP-style
