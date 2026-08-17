@@ -58,6 +58,7 @@ add_custom_target(wintap_rust_driver ALL
     VERBATIM)
 
 add_custom_target(wintap_package
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf "${WINTAP_PACKAGE_DIR}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${WINTAP_PACKAGE_DIR}"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${WINTAP_RUST_PACKAGE_DIR}"

@@ -4,19 +4,15 @@
 param(
     [string]$VmName = 'test',
     [string]$UserName = 'administrator',
-    [string]$CredentialFile = (Join-Path $PSScriptRoot '..\creds.txt'),
+    [System.Management.Automation.PSCredential]$Credential,
     [string]$ConfigureKdNetHostIp,
     [int]$ConfigureKdNetPort = 50000,
     [switch]$RebootAfterConfiguration
 )
 
-$password = (Get-Content -LiteralPath $CredentialFile -Raw -ErrorAction Stop).Trim()
-if ([string]::IsNullOrWhiteSpace($password)) {
-    throw "Credential file '$CredentialFile' is empty."
+if (-not $Credential) {
+    $Credential = Get-Credential -UserName $UserName -Message "Enter credentials for $VmName"
 }
-
-$securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
-$credential = [System.Management.Automation.PSCredential]::new($UserName, $securePassword)
 
 if ($ConfigureKdNetHostIp) {
     Invoke-Command -VMName $VmName -Credential $credential -ScriptBlock {

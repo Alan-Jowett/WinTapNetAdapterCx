@@ -13,6 +13,7 @@ if (-not $nuget) {
 }
 
 $wdkPackage = "Microsoft.Windows.WDK.$Architecture"
+$sdkBasePackage = "Microsoft.Windows.SDK.CPP"
 $sdkPackage = "Microsoft.Windows.SDK.CPP.$Architecture"
 
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
@@ -22,9 +23,14 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to restore $wdkPackage $Version."
 }
 
+& $nuget.Source install $sdkBasePackage -Version $Version -OutputDirectory $OutputDirectory -NonInteractive
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to restore $sdkBasePackage $Version."
+}
+
 & $nuget.Source install $sdkPackage -Version $Version -OutputDirectory $OutputDirectory -NonInteractive
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to restore $sdkPackage $Version."
 }
 
-Write-Host "Restored $wdkPackage and $sdkPackage version $Version to $OutputDirectory."
+Write-Host "Restored $wdkPackage, $sdkBasePackage, and $sdkPackage version $Version to $OutputDirectory."

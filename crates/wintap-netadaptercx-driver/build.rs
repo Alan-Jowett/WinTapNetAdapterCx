@@ -17,6 +17,12 @@ fn main() -> Result<(), wdk_build::ConfigError> {
         .join("kmdf")
         .join("adapter")
         .join("2.5");
+    if !netadapter_lib.is_dir() {
+        panic!(
+            "missing NetAdapterCx stub library directory {}; restore the pinned WDK package",
+            netadapter_lib.display()
+        );
+    }
     println!(
         "cargo:rustc-link-search=native={}",
         netadapter_lib.display()

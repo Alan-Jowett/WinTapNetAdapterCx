@@ -15,7 +15,13 @@ $ErrorActionPreference = "Stop"
 $artifactRoot = if ($PackageDirectory) {
     (Resolve-Path -LiteralPath $PackageDirectory).Path
 } else {
-    Join-Path $PackageRoot "$Architecture\$Configuration"
+    $target = if ($Architecture -eq "x64") {
+        "x86_64-pc-windows-msvc"
+    } else {
+        "aarch64-pc-windows-msvc"
+    }
+    $profile = if ($Configuration -eq "Debug") { "debug" } else { "release" }
+    Join-Path $PackageRoot "$target\$profile\wintap_netadaptercx_driver_package"
 }
 $driver = Join-Path $artifactRoot "wintap_netadaptercx_driver.sys"
 $inf = Join-Path $artifactRoot "wintap_netadaptercx_driver.inf"
