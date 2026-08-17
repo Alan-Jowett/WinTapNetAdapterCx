@@ -10,10 +10,10 @@
 | ID | Requirement | Validation |
 | --- | --- | --- |
 | VAL-001 | REQ-001 | Build and install the NetAdapterCx driver; verify one virtual Ethernet adapter appears with the expected capabilities and identity. |
-| VAL-002 | REQ-002 | Write valid Ethernet frames through the device handle and verify delivery to the Windows networking stack; transmit frames through the stack and verify complete reads in user mode. |
+| VAL-002 | REQ-002 | Write valid Ethernet frames through the device handle and verify delivery to the Windows networking stack; verify invalid nonzero lengths complete with error 87 without enqueuing a frame and zero-byte writes complete as Win32 no-ops; transmit frames through the stack and verify complete reads in user mode. |
 | VAL-003 | REQ-003 | Exercise start, pause, restart, stop, surprise removal, owner close, process termination, and cancellation; verify no hangs, double completions, or leaked objects. |
 | VAL-004 | REQ-004 | Build and execute the supported x64 and ARM64 packages on Windows 10 version 2004+ and reject unsupported platform combinations explicitly. |
-| VAL-005 | REQ-005 | Verify non-administrator open/control attempts fail; verify malformed lengths and invalid I/O requests cannot corrupt memory or disclose data. |
+| VAL-005 | REQ-005 | Verify non-administrator open/control attempts fail; verify malformed nonzero lengths complete with error 87 and invalid I/O requests cannot corrupt memory or disclose data. |
 | VAL-006 | REQ-006 | Run the complete build, install, packet-path, concurrency, cancellation, power, malformed-input, and cleanup suite with Driver Verifier-compatible settings. |
 | VAL-007 | REQ-007 | Configure and build from a clean environment with CMake and the Visual Studio generator for x64 and ARM64; verify NuGet WDK/SDK dependencies resolve reproducibly and missing prerequisites fail at configuration. |
 | VAL-008 | REQ-008 | Run the complete privileged ICMP Echo Request/Echo Reply round trip through the Ethernet/TAP handle using `192.0.2.1/30` and `192.0.2.2`; verify packet fields, checksums, stack completion, timeout behavior, and cleanup. |
@@ -48,6 +48,7 @@
 | TC-037 | Build Rust x64 and ARM64 packages through CMake and verify each contains the Rust driver binary, `wintap_netadaptercx_driver.inf`, and `wintap_netadaptercx_driver.cat`. |
 | TC-038 | Install `ROOT\WinTapRust` after removing any stale C package; verify service `WinTapRust` starts and no C device or service is selected. |
 | TC-040 | Issue an empty-queue overlapped read and verify `ReadFile` returns false with error 997; cancel it and verify `GetOverlappedResult` returns false with error 995. Repeat this error-observation path before ARP/ICMP assertions. |
+| TC-041 | Verify a 0-byte overlapped write completes as a Win32 no-op. Issue 1-byte, 13-byte, and 1515-byte overlapped writes; verify each completes with error 87, transfers no bytes, leaves no queued frame or retained pending request, and is followed by a successful valid-frame write. |
 
 ## Functional tests
 
@@ -67,8 +68,10 @@
    process termination.
 6. **Backpressure:** fill each bounded frame queue, verify new operations wait,
    cancel correctly, and resume when capacity is released.
-7. **Boundary validation:** test zero-length, undersized, oversized, malformed,
-   and partially invalid requests; verify explicit failure and no state damage.
+7. **Boundary validation:** verify a zero-byte write completes as a Win32
+   no-op; test undersized, oversized, malformed, and partially invalid
+   requests; verify invalid nonzero write lengths complete with error 87,
+   transfer no bytes, and cause no state damage.
 
 ## Lifecycle and concurrency tests
 
@@ -162,6 +165,9 @@ they must not classify an unexecuted packet-path test as passed. VAL-009 is
 complete only after both the hosted-runner result and the manual-VM result are
 recorded; the hosted job alone cannot claim VM coverage.
 
-TC-015, TC-016, TC-017, TC-018, TC-019, TC-020, and TC-022 are implementation
-and specification trace points for the approved maintenance corrections.
+TC-040 is deferred: continuous transmit traffic from the live adapter prevents
+the harness from establishing its required empty-queue cancellation fixture.
+It does not pass until cancellation is validated with adapter traffic quiesced
+at its source. TC-015, TC-016, TC-017, TC-018, TC-019, TC-020, and TC-022 are
+implementation and specification trace points for the approved maintenance corrections.
 TC-023 through TC-028 provide trace points for REQ-008 and REQ-009.

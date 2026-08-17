@@ -71,6 +71,7 @@ const STATUS_CANCELLED: NTSTATUS = 0xC000_0120_u32 as i32;
 const STATUS_DEVICE_BUSY: NTSTATUS = 0xC000_00E8_u32 as i32;
 const STATUS_DEVICE_NOT_READY: NTSTATUS = 0xC000_00A3_u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as i32;
+const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000_000D_u32 as i32;
 const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206_u32 as i32;
 const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as i32;
 const PENDING_READ_LIMIT: usize = 256;
@@ -1350,7 +1351,7 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
 
     let mut default_queue_config = WDF_IO_QUEUE_CONFIG {
         Size: core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
-        DispatchType: WdfIoQueueDispatchParallel,
+        DispatchType: wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchSequential,
         AllowZeroLengthRequests: 1,
         DefaultQueue: 1,
         EvtIoRead: Some(evt_io_read),
@@ -1510,7 +1511,15 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
     }
 }
 
-extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize) {
+extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize) {
+    if length == 0 {
+        complete_request(request, STATUS_SUCCESS);
+        return;
+    }
+    if !(FRAME_MINIMUM..=FRAME_MAXIMUM).contains(&length) {
+        complete_request(request, STATUS_INVALID_PARAMETER);
+        return;
+    }
     if !try_admit(&PENDING_WRITES, PENDING_WRITE_LIMIT) {
         complete_request(request, STATUS_DEVICE_BUSY);
         return;

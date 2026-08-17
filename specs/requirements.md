@@ -65,6 +65,11 @@ support overlapped I/O and cancellation.
 with bounded buffering, backpressure when full, and deterministic completion or
 cancellation.
 
+Nonzero writes shorter than 14 bytes or longer than 1514 bytes shall complete
+promptly without enqueuing a frame, report `ERROR_INVALID_PARAMETER` (87), and
+leave subsequent valid read/write I/O operational. A zero-byte `WriteFile` is a
+native Win32 no-op that completes before dispatching to the driver.
+
 ### REQ-003 — Windows driver lifecycle
 
 **Before:** No lifecycle behavior is specified.  
@@ -99,6 +104,9 @@ hostile frames and I/O requests are bounded and rejected.
 **Trace:** UI-001; `README.md` Windows security-practices goal.  
 **Invariant impact:** User-mode access must not permit unauthorized control,
 kernel memory disclosure, buffer overrun, or cross-device frame access.
+
+Malformed Ethernet-frame lengths shall be rejected according to the REQ-002
+completion contract.
 
 ### REQ-006 — Verification
 

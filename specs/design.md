@@ -139,13 +139,17 @@ and stopped or deleted only through the verified NetAdapterCx/WDF lifecycle.
    and enqueueing finish.
 2. The driver validates frame length and required Ethernet constraints before
    accepting the frame.
-3. Once queued, ownership transfers to a nonpaged frame object owned by the
+3. A nonzero write shorter than 14 bytes or longer than 1514 bytes completes
+   with `STATUS_INVALID_PARAMETER` before it enters a manual queue, consumes
+   pending I/O capacity, or creates a frame object. A zero-byte `WriteFile`
+   completes as a Win32 no-op before the request reaches this callback.
+4. Once queued, ownership transfers to a nonpaged frame object owned by the
    adapter receive-injection path.
-4. The user request completes only after the driver has copied or otherwise
+5. The user request completes only after the driver has copied or otherwise
    safely captured the frame; it shall not retain a user buffer.
-5. The frame is submitted to the Windows networking stack using the verified
+6. The frame is submitted to the Windows networking stack using the verified
    NetAdapterCx receive/injection contract.
-6. Completion, rejection, cancellation, adapter stop, or owner teardown
+7. Completion, rejection, cancellation, adapter stop, or owner teardown
    releases the frame exactly once.
 
 ### Windows networking stack to user read
@@ -287,6 +291,10 @@ reschedules required passive drain/completion work.
 
 - Invalid frame lengths, unsupported flags, closed queues, unavailable owner
   state, and cancelled requests shall return explicit, documented errors.
+  Nonzero control writes outside the 14-to-1514-byte frame range shall
+  complete with `STATUS_INVALID_PARAMETER`, which the Win32 caller observes as
+  `ERROR_INVALID_PARAMETER` (87). Zero-byte `WriteFile` calls are native
+  Win32 no-ops and do not dispatch to the driver.
 - Allocation failure shall fail the affected operation and preserve all other
   queue invariants.
 - Every failure path shall release resources in reverse acquisition order.
