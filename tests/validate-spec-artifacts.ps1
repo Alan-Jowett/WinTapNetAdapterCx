@@ -8,13 +8,12 @@ $required = @(
     "specs\current-status.md",
     "CMakeLists.txt",
     "CMakePresets.json",
-    "driver\WinTapNetAdapterCx.vcxproj",
-    "driver\WinTapNetAdapterCx.inf",
-    "driver\wintap.cpp",
-    "driver\wintap.h",
+    "crates\wintap-netadaptercx-driver\wintap_netadaptercx_driver.inx",
+    "crates\wintap-netadaptercx-driver\src\lib.rs",
     "tests\run-wintap-harness.ps1",
     "tests\validate-package.ps1",
-    "scripts\prepare-wdk-tools.ps1"
+    "scripts\prepare-wdk-tools.ps1",
+    "scripts\build-rust-driver.ps1"
 )
 
 foreach ($path in $required) {
@@ -24,15 +23,10 @@ foreach ($path in $required) {
 }
 
 $cmake = Get-Content -Raw CMakeLists.txt
-if ($cmake -notmatch 'Visual Studio' -or
-    $cmake -notmatch 'MSBUILD_EXECUTABLE' -or
-    $cmake -notmatch 'STAMPINF_EXECUTABLE') {
-    throw "CMake does not enforce the required Visual Studio/MSBuild/StampInf workflow."
-}
-
-$inf = Get-Content -Raw driver\WinTapNetAdapterCx.inf
-if ($inf -notmatch 'NTamd64' -or $inf -notmatch 'NTarm64') {
-    throw "INF does not declare both supported architectures."
+if ($cmake -notmatch 'build-rust-driver.ps1' -or
+    $cmake -notmatch 'CARGO_WDK_EXECUTABLE' -or
+    $cmake -notmatch 'restore-dependencies.ps1') {
+    throw "CMake does not enforce the required Rust/cargo-wdk workflow."
 }
 
 $harness = Get-Content -Raw tests\run-wintap-harness.ps1
@@ -44,19 +38,22 @@ if ($harness -notmatch 'CreateFile' -or
     throw "The overlapped administrator harness is incomplete."
 }
 
-$source = Get-Content -Raw driver\wintap.cpp
-if ($source -notmatch 'WintapValidateFragment' -or
-    $source -notmatch 'g_ControlContextLock' -or
-    $source -notmatch 'WintapWaitForWriteDrain' -or
-    $source -notmatch 'EvtDeviceD0Exit') {
-    throw "The driver lifetime, power, and fragment validation hardening is incomplete."
+$source = Get-Content -Raw crates\wintap-netadaptercx-driver\src\lib.rs
+if ($source -notmatch 'export_name = "DriverEntry"' -or
+    $source -notmatch 'evt_driver_device_add' -or
+    $source -notmatch 'NetPacketFilterFlagMulticast' -or
+    $source -notmatch 'NetPacketFilterFlagAllMulticast' -or
+    $source -notmatch 'NetPacketFilterFlagPromiscuous' -or
+    $source -notmatch 'MaximumMulticastAddresses:\s*MAXIMUM_MULTICAST_ADDRESSES' -or
+    $source -notmatch 'evt_set_receive_filter') {
+    throw "The Rust driver identity or receive-filter contract is incomplete."
 }
 
 $workflow = Get-Content -Raw .github\workflows\driver-validation.yml
-if ($workflow -notmatch 'prepare-wdk-tools.ps1' -or
-    $workflow -notmatch 'cmake -S' -or
+if ($workflow -notmatch 'cargo-wdk' -or
+    $workflow -notmatch 'wintap_package' -or
     $workflow -notmatch 'validate-package.ps1') {
-    throw "The workflow does not cover WDK tool provisioning, CMake, and package validation."
+    throw "The workflow does not cover Rust driver packaging and package validation."
 }
 
 Write-Host "Specification and implementation artifacts are present."

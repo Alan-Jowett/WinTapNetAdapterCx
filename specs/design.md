@@ -14,6 +14,8 @@
 - Queues are bounded and use cancellation-aware backpressure.
 - Every asynchronous operation has one terminal completion and one owner at
   every transition.
+- Protocol tests exercise the existing Ethernet/TAP boundary and do not add
+  an IP/TUN mode or test-only driver path.
 
 ## Build and dependency design
 
@@ -39,6 +41,45 @@ The initial NuGet package IDs are `Microsoft.Windows.WDK.x64`,
 `Microsoft.Windows.WDK.ARM64`, `Microsoft.Windows.SDK.CPP.x64`, and
 `Microsoft.Windows.SDK.CPP.ARM64`, all pinned to version `10.0.28000.2526`.
 They are required implementation dependencies, not implicit machine paths.
+
+### Rust driver and binding design
+
+The production driver shall be a Rust kernel-mode crate built with the
+`windows-drivers-rs` WDF ecosystem. The repository shall add a
+`netadaptercx-sys`-style raw FFI crate generated from the pinned WDK
+NetAdapterCx headers using the existing `wdk-build`/bindgen workflow.
+
+Generated bindings shall be treated as an ABI boundary. Higher-level Rust
+modules may wrap the raw bindings, but every wrapper shall document required
+IRQL and pageability, framework-versus-driver ownership, callback lifetime,
+status and failure behavior, and nonpaged allocation requirements.
+
+The Rust target shall use `panic = "abort"` and shall not permit unwinding
+across WDF, NetAdapterCx, or C ABI callbacks. Unsafe code shall be isolated
+around FFI, raw packet-ring access, pointer validation, and kernel memory
+operations. Rust references and ownership types shall never outlive the
+framework object they represent.
+
+Binding generation shall be reproducible from checked-in configuration and
+pinned headers. Generated source may be checked in only if regeneration is
+validated as equivalent; otherwise the build shall generate it deterministically
+and fail when required inputs are missing.
+
+### Rust-only package design
+
+`cargo wdk build` is the sole driver build and package operation. CMake shall
+remain a thin Rust-only wrapper that restores the pinned NuGet packages,
+places the pinned `stampinf` x64 and `inf2cat` x86 tool directories on `PATH`,
+and invokes `cargo wdk build` for the selected target architecture. Debug uses
+the cargo-wdk default profile; Release passes `--profile release`.
+
+The package template is `wintap_netadaptercx_driver.inx`; cargo-wdk generates
+`wintap_netadaptercx_driver.inf` and `wintap_netadaptercx_driver.cat` beside
+the Rust driver binary. The
+hardware ID is `ROOT\WinTapRust` and the service is `WinTapRust`. No C/C++
+driver project, INF, source, service, hardware ID, package fallback, or
+selection switch remains in this branch. The Rust control device is exposed as
+`\\.\WinTapRust`.
 
 ## Component boundaries
 
@@ -67,6 +108,29 @@ The implementation shall record the exact WDK/SDK and NetAdapterCx API
 contracts used. Any callback whose IRQL or pageability depends on framework
 state shall be annotated and placed accordingly.
 
+The receive-filter capability structure shall advertise directed, broadcast,
+multicast, all-multicast, and promiscuous filters with a multicast-address
+capacity of 64. This is required because NetAdapterCx fails an upper layer's
+packet-filter OID when the requested filters are not advertised; TCP/IP did
+not create an IP interface after multicast-only or all-multicast builds were
+deployed. The `EvtSetReceiveFilter` callback shall atomically replace the
+active packet-filter flags and multicast-address list with the
+framework-provided configuration. The list shall never exceed the declared
+capacity.
+
+The TAP data path has no hardware receive filter and shall continue to deliver
+user-injected frames without software filtering. The cached filter state
+satisfies the NetAdapterCx/upper-layer control-plane contract and makes the
+accepted configuration available for diagnostics; it does not change
+TAP-style frame delivery. The callback state shall be nonpaged, bounded, and
+synchronized safely for its callback IRQL and any diagnostic readers.
+
+The Rust implementation shall use the generated NetAdapterCx declarations for
+all framework calls. It shall not duplicate C declarations manually or invent
+Rust-specific lifecycle callbacks. The adapter shall be created during device
+addition, configured and started at the framework-required preparation stage,
+and stopped or deleted only through the verified NetAdapterCx/WDF lifecycle.
+
 ## Packet ownership and direction
 
 ### User write to Windows networking stack
@@ -75,13 +139,17 @@ state shall be annotated and placed accordingly.
    and enqueueing finish.
 2. The driver validates frame length and required Ethernet constraints before
    accepting the frame.
-3. Once queued, ownership transfers to a nonpaged frame object owned by the
+3. A nonzero write shorter than 14 bytes or longer than 1514 bytes completes
+   with `STATUS_INVALID_PARAMETER` before it enters a manual queue, consumes
+   pending I/O capacity, or creates a frame object. A zero-byte `WriteFile`
+   completes as a Win32 no-op before the request reaches this callback.
+4. Once queued, ownership transfers to a nonpaged frame object owned by the
    adapter receive-injection path.
-4. The user request completes only after the driver has copied or otherwise
+5. The user request completes only after the driver has copied or otherwise
    safely captured the frame; it shall not retain a user buffer.
-5. The frame is submitted to the Windows networking stack using the verified
+6. The frame is submitted to the Windows networking stack using the verified
    NetAdapterCx receive/injection contract.
-6. Completion, rejection, cancellation, adapter stop, or owner teardown
+7. Completion, rejection, cancellation, adapter stop, or owner teardown
    releases the frame exactly once.
 
 ### Windows networking stack to user read
@@ -223,12 +291,104 @@ reschedules required passive drain/completion work.
 
 - Invalid frame lengths, unsupported flags, closed queues, unavailable owner
   state, and cancelled requests shall return explicit, documented errors.
+  Nonzero control writes outside the 14-to-1514-byte frame range shall
+  complete with `STATUS_INVALID_PARAMETER`, which the Win32 caller observes as
+  `ERROR_INVALID_PARAMETER` (87). Zero-byte `WriteFile` calls are native
+  Win32 no-ops and do not dispatch to the driver.
 - Allocation failure shall fail the affected operation and preserve all other
   queue invariants.
 - Every failure path shall release resources in reverse acquisition order.
 - Cleanup must be idempotent and safe when start or owner acquisition fails
   partway through.
 - No broad catch-all or silent success fallback is permitted.
+- The PowerShell harness shall receive the native error for `ReadFile`,
+  `WriteFile`, `GetOverlappedResult`, and `CancelIoEx` through an explicit
+  C# wrapper output captured in the same managed call. It shall not query
+  last-error state independently after crossing the C#/PowerShell boundary.
+
+## ICMP/TAP integration-test design
+
+The REQ-008 test is an external user-mode acceptance workflow. It shall use
+the existing named device and overlapped read/write contract; the driver shall
+not contain test-only ARP or ICMP handling.
+
+### Provisioning and isolation
+
+1. Install and start the test-signed package, then uniquely identify the
+   virtual Ethernet interface using stable adapter identity rather than an
+   interface index alone.
+2. Record the interface address, routes, administrative state, and driver
+   state needed for restoration.
+3. Assign `192.0.2.1/30` only to the test interface. Do not add a default
+   route; reject address collisions or ambiguous adapter matches.
+4. Open `\\.\WinTapRust` exclusively with overlapped I/O before the
+   protocol exchange.
+
+### Request/reply packet flow
+
+The test shall cause the Windows networking stack to issue an Echo Request to
+`192.0.2.2`, then use the TAP handle as the observation and injection
+boundary. Because the test network has no external peer, the workflow shall
+first handle address resolution:
+
+1. A pending overlapped read receives the Ethernet ARP request generated for
+   `192.0.2.2`.
+2. The test validates the ARP request fields and writes the corresponding
+   Ethernet ARP reply for the test interface and peer address.
+3. The Windows stack then emits the ICMP Echo Request, which the workflow
+   reads and validates.
+
+4. The test validates Ethernet endpoints and EtherType, IPv4 version/header
+   length/total length/addresses/TTL/protocol, and ICMP type/code,
+   identifier/sequence, payload, and checksum.
+5. The reply swaps IPv4 addresses and Ethernet endpoints, changes ICMP type
+   to Echo Reply, preserves identifier, sequence, and payload, and
+   recomputes IPv4 and ICMP checksums.
+6. The reply is submitted with an overlapped write and completes with the
+   complete frame length.
+7. The test verifies that the Windows stack reports the matching successful
+   Echo Reply within a bounded timeout.
+
+The parser rejects truncated headers, inconsistent lengths, invalid ARP
+fields, fragments, unexpected protocols, invalid checksums, and packets that
+do not match the request identity. Unrelated well-formed frames may be
+ignored only while the bounded timeout remains enforceable; unrelated
+malformed frames fail the test.
+
+### Cleanup and failure handling
+
+Cleanup runs from a guaranteed finalization path and is idempotent. It
+cancel/completes pending operations before closing the handle, removes only
+the test address and any test-created route, restores the interface and
+driver state, removes the test package where permitted, and retains command
+output, packet bytes, driver status, and event logs on failure.
+
+Provisioning, packet-validation, timeout, or cleanup errors are test
+failures. Cleanup failures are reported in addition to the primary failure
+and cannot be converted into success.
+
+## Execution-environment design
+
+The hosted and VM paths share one test entry point, packet parser, packet
+builder, timeout policy, and acceptance assertions. Only provisioning inputs
+such as package location, architecture, signing mode, and cleanup policy may
+vary.
+
+### GitHub-hosted Windows runner
+
+The workflow shall provision the WDK/SDK and test package, enable the required
+test-signing/install state, install and start the driver, configure the
+isolated address, run REQ-008, upload diagnostics, and restore the runner.
+The job must use the privileges required by the driver and network commands.
+If the runner rejects any required operation, the job fails with the
+operation and platform error.
+
+### Manual Hyper-V VM
+
+Documentation shall define a clean VM setup, supported Windows build,
+architecture, administrator/test-signing prerequisites, package install,
+test invocation, diagnostic collection, and cleanup. The VM test uses the
+same assertions as hosted CI and does not rely on an external network peer.
 
 ## Unresolved implementation details
 
@@ -241,3 +401,7 @@ reschedules required passive drain/completion work.
 - **[ASSUMPTION]** A copy at the user/kernel boundary is acceptable for the
   initial implementation; zero-copy is not required by the approved
   requirements.
+- **[UNKNOWN]** The exact GitHub-hosted runner policy for test-signed driver
+  installation and virtual-interface configuration must be confirmed during
+  implementation validation; rejection is a required failure outcome under
+  REQ-009.

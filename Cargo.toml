@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/netadaptercx-sys",
+    "crates/wdk-sys",
+    "crates/wintap-wdk-bootstrap",
+    "crates/wintap-netadaptercx-driver",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+netadaptercx-sys = { path = "crates/netadaptercx-sys" }
+wdk = "0.4.1"
+wdk-alloc = "0.4.1"
+wdk-build = "0.5.1"
+wdk-panic = "0.4.1"
+wdk-sys = "0.5.1"
+wintap-wdk-bootstrap = { path = "crates/wintap-wdk-bootstrap" }
+
+[patch.crates-io]
+wdk-sys = { path = "crates/wdk-sys" }
+
+[profile.dev]
+lto = true
+panic = "abort"
+
+[profile.release]
+lto = true
+panic = "abort"
