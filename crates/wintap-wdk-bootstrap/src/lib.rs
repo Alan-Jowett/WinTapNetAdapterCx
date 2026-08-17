@@ -73,6 +73,11 @@ fn package_architecture() -> &'static str {
 }
 
 fn is_complete_wdk_root(root: &Path, architecture: &str) -> bool {
+    let library_architecture = match architecture {
+        "x64" => "x64",
+        "ARM64" => "arm64",
+        _ => unreachable!("package_architecture only returns supported architectures"),
+    };
     [
         root.join("Include")
             .join(SDK_VERSION)
@@ -86,7 +91,7 @@ fn is_complete_wdk_root(root: &Path, architecture: &str) -> bool {
         root.join("Lib")
             .join(SDK_VERSION)
             .join("km")
-            .join(architecture),
+            .join(library_architecture),
     ]
     .iter()
     .all(|path| path.exists())
