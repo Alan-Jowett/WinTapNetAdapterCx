@@ -142,4 +142,18 @@ mod tests {
         assert_eq!(queue.state(), QueueState::Closed);
         assert!(queue.is_empty());
     }
+
+    #[test]
+    fn reopen_discards_stale_frames_and_accepts_new_frames() {
+        let mut queue = FrameQueue::new(2);
+        queue.enqueue(frame()).unwrap();
+        queue.close();
+
+        queue.reopen();
+
+        assert_eq!(queue.state(), QueueState::Open);
+        assert!(queue.is_empty());
+        queue.enqueue(frame()).unwrap();
+        assert_eq!(queue.len(), 1);
+    }
 }

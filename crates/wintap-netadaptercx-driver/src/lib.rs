@@ -494,11 +494,17 @@ extern "C" fn evt_driver_device_add(
 
     let mut pnp_init = device_init;
     let mut _pnp_device: WDFDEVICE = core::ptr::null_mut();
+    let mut device_attributes = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        EvtCleanupCallback: Some(evt_instance_context_destroy),
+        ContextTypeInfo: &raw const DEVICE_CONTEXT_TYPE_INFO,
+        ..WDF_OBJECT_ATTRIBUTES::default()
+    };
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreate,
             &mut pnp_init,
-            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut device_attributes,
             &mut _pnp_device,
         )
     };
@@ -509,6 +515,24 @@ extern "C" fn evt_driver_device_add(
         unsafe { drop(Box::from_raw(state)); }
         return status;
     }
+    let device_context = unsafe {
+        object_context::<DeviceContext>(
+            _pnp_device.cast(),
+            &raw const DEVICE_CONTEXT_TYPE_INFO,
+        )
+    };
+    if device_context.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, _pnp_device.cast());
+            INSTANCE_STATES[instance_id - 1].store(core::ptr::null_mut(), Ordering::Release);
+            release_instance_id(instance_id);
+            drop(Box::from_raw(state));
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    unsafe {
+        (*device_context).instance = state;
+    }
     unsafe {
         (*state).pnp_device = _pnp_device;
     }
@@ -516,9 +540,6 @@ extern "C" fn evt_driver_device_add(
     let status = create_control_device(driver, unsafe { &mut *state });
     debug_status(b"CreateControlDevice", status);
     if status != STATUS_SUCCESS {
-        INSTANCE_STATES[instance_id - 1].store(core::ptr::null_mut(), Ordering::Release);
-        release_instance_id(instance_id);
-        unsafe { drop(Box::from_raw(state)); }
         return status;
     }
 
@@ -1547,6 +1568,11 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
     };
     debug_status(b"WdfControlDeviceCreate", status);
     if status != STATUS_SUCCESS {
+        if !control_init.is_null() {
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfDeviceInitFree, control_init);
+            }
+        }
         return status;
     }
     let mut frame_lock: WDFSPINLOCK = core::ptr::null_mut();
@@ -1558,6 +1584,9 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
 
@@ -1581,6 +1610,9 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
 
@@ -1608,6 +1640,9 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
     state.read_work_item = read_work_item;
@@ -1627,6 +1662,9 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
     state.write_work_item = write_work_item;
@@ -1649,6 +1687,9 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
 
@@ -1670,6 +1711,9 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
 
@@ -1683,6 +1727,9 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
 
@@ -1709,6 +1756,17 @@ unsafe extern "C" fn evt_instance_context_destroy(object: WDFOBJECT) {
     if !context.is_null() && unsafe { !(*context).instance.is_null() } {
         let state = unsafe { (*context).instance };
         unsafe { (*context).instance = core::ptr::null_mut(); }
+        if !unsafe { (*state).adapter.is_null() } {
+            unsafe { unregister_instance((*state).adapter); }
+        }
+        INSTANCE_STATES[unsafe { (*state).instance_id } - 1]
+            .compare_exchange(
+                state,
+                core::ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok();
         unsafe { release_instance_id((*state).instance_id); }
         unsafe { drop(Box::from_raw(state)); }
     }
