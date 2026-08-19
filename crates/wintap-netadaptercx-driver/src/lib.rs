@@ -1425,10 +1425,18 @@ unsafe extern "C" fn evt_device_d0_exit(
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
+        let (read_queue, write_queue) = {
+            let state = &mut *state_guard;
+            state.lifecycle.store(INSTANCE_SUSPENDED, Ordering::Release);
+            (state.read_queue, state.write_queue)
+        };
+        drop(state_guard);
+        purge_queue(read_queue);
+        purge_queue(write_queue);
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return STATUS_DEVICE_NOT_READY;
+        };
         let state = &mut *state_guard;
-        state.lifecycle.store(INSTANCE_SUSPENDED, Ordering::Release);
-        purge_queue(state.read_queue);
-        purge_queue(state.write_queue);
         clear_frame_queue(state);
         state.pending_reads.store(0, Ordering::Release);
         state.pending_writes.store(0, Ordering::Release);
@@ -1561,8 +1569,11 @@ extern "C" fn evt_device_release_hardware(
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    let state = &mut *state_guard;
-    let adapter = state.adapter;
+    let (adapter, read_queue, write_queue) = {
+        let state = &mut *state_guard;
+        (state.adapter, state.read_queue, state.write_queue)
+    };
+    drop(state_guard);
     if !adapter.is_null() {
         let stop: unsafe extern "system" fn(
             netadaptercx_sys::PNET_DRIVER_GLOBALS,
@@ -1575,8 +1586,12 @@ extern "C" fn evt_device_release_hardware(
         unsafe { stop(netadaptercx_sys::NetDriverGlobals, adapter) };
     }
 
-    purge_queue(state.read_queue);
-    purge_queue(state.write_queue);
+    purge_queue(read_queue);
+    purge_queue(write_queue);
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    let state = &mut *state_guard;
     clear_frame_queue(state);
     clear_receive_filter_state(state);
     state.pending_reads.store(0, Ordering::Release);
@@ -1926,11 +1941,20 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
+        let (was_suspended, read_queue, write_queue) = {
+            let state = &mut *state_guard;
+            let was_suspended =
+                state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
+            state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
+            (was_suspended, state.read_queue, state.write_queue)
+        };
+        drop(state_guard);
+        purge_queue(read_queue);
+        purge_queue(write_queue);
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
         let state = &mut *state_guard;
-        let was_suspended = state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
-        state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
-        purge_queue(state.read_queue);
-        purge_queue(state.write_queue);
         clear_frame_queue(state);
         state.pending_reads.store(0, Ordering::Release);
         state.pending_writes.store(0, Ordering::Release);
