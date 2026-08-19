@@ -14,6 +14,7 @@ use frame_queue::{Frame, FrameQueue, QueueError};
 use ring::{advance_index, fragment_at, fragment_virtual_address, increment_index, packet_at};
 
 use core::ffi::c_void;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
@@ -125,6 +126,7 @@ struct InstanceState {
     read_queue: WDFQUEUE,
     write_queue: WDFQUEUE,
     frame_lock: WDFSPINLOCK,
+    state_lock: WDFSPINLOCK,
     frame_queue: Option<FrameQueue>,
     active_packet_filters: netadaptercx_sys::_NET_PACKET_FILTER_FLAGS,
     active_multicast_address_count: usize,
@@ -156,6 +158,7 @@ impl InstanceState {
             read_queue: core::ptr::null_mut(),
             write_queue: core::ptr::null_mut(),
             frame_lock: core::ptr::null_mut(),
+            state_lock: core::ptr::null_mut(),
             frame_queue: None,
             active_packet_filters: 0,
             active_multicast_address_count: 0,
@@ -175,6 +178,49 @@ impl InstanceState {
             pending_reads: AtomicUsize::new(0),
             pending_writes: AtomicUsize::new(0),
             lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
+        }
+    }
+}
+
+struct InstanceStateGuard {
+    state: *mut InstanceState,
+    lock: WDFSPINLOCK,
+}
+
+impl InstanceStateGuard {
+    unsafe fn new(state: *mut InstanceState) -> Option<Self> {
+        if state.is_null() {
+            return None;
+        }
+        let lock = unsafe { (*state).state_lock };
+        if lock.is_null() {
+            return None;
+        }
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
+        }
+        Some(Self { state, lock })
+    }
+}
+
+impl Deref for InstanceStateGuard {
+    type Target = InstanceState;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.state }
+    }
+}
+
+impl DerefMut for InstanceStateGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.state }
+    }
+}
+
+impl Drop for InstanceStateGuard {
+    fn drop(&mut self) {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, self.lock);
         }
     }
 }
@@ -812,7 +858,10 @@ fn create_packet_queue(
             Some(state) => state,
             None => return STATUS_DEVICE_NOT_READY,
         };
-        let state = unsafe { &mut *state };
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        let state = &mut *state_guard;
         let queue_context = unsafe {
             object_context::<QueueContext>(
                 packet_queue.cast(),
@@ -879,7 +928,10 @@ fn create_packet_queue(
 
 extern "C" fn evt_packet_queue_start(queue: netadaptercx_sys::NETPACKETQUEUE) {
     if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
-        let state = unsafe { &mut *state };
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let state = &mut *state_guard;
         if queue == state.tx_queue {
             state.tx_queue_started.store(true, Ordering::Release);
         } else if queue == state.rx_queue {
@@ -890,7 +942,10 @@ extern "C" fn evt_packet_queue_start(queue: netadaptercx_sys::NETPACKETQUEUE) {
 
 extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
     if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
-        let state = unsafe { &mut *state };
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let state = &mut *state_guard;
         if queue == state.tx_queue {
             state.tx_queue_started.store(false, Ordering::Release);
         } else if queue == state.rx_queue {
@@ -903,7 +958,10 @@ extern "C" fn evt_packet_queue_advance(queue: netadaptercx_sys::NETPACKETQUEUE) 
     let Some(state) = (unsafe { instance_from_packet_queue(queue) }) else {
         return;
     };
-    let state = unsafe { &mut *state };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return;
+    };
+    let state = &mut *state_guard;
     let rx_rings = state.rx_rings;
     let rx_extension = state.rx_fragment_extension;
     if queue == state.rx_queue && !rx_rings.is_null() {
@@ -1182,7 +1240,10 @@ extern "C" fn evt_packet_queue_set_notification_enabled(
     enabled: wdk_sys::BOOLEAN,
 ) {
     if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
-        let state = unsafe { &mut *state };
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let state = &mut *state_guard;
         if queue == state.rx_queue {
             state.rx_notification_enabled.store(enabled != 0, Ordering::Release);
             if enabled != 0 {
@@ -1200,7 +1261,10 @@ extern "C" fn evt_packet_queue_cancel(queue: netadaptercx_sys::NETPACKETQUEUE) {
     let Some(state) = (unsafe { instance_from_packet_queue(queue) }) else {
         return;
     };
-    let state = unsafe { &mut *state };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return;
+    };
+    let state = &mut *state_guard;
     let (rings, is_receive) = if queue == state.tx_queue {
         (state.tx_rings, false)
     } else if queue == state.rx_queue {
@@ -1279,7 +1343,10 @@ extern "C" fn evt_set_receive_filter(
         if address_list.is_null() {
             debug_status(b"ReceiveFilter multicast list", STATUS_INVALID_BUFFER_SIZE);
             if let Some(state) = unsafe { instance_from_adapter(adapter) } {
-                let state = unsafe { &mut *state };
+                let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+                    return;
+                };
+                let state = &mut *state_guard;
                 update_receive_filter_state(state, packet_filters, &addresses[..0]);
             }
             return;
@@ -1298,7 +1365,10 @@ extern "C" fn evt_set_receive_filter(
     }
 
     if let Some(state) = unsafe { instance_from_adapter(adapter) } {
-        let state = unsafe { &mut *state };
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let state = &mut *state_guard;
         update_receive_filter_state(state, packet_filters, &addresses[..address_count]);
     }
 }
@@ -1337,7 +1407,10 @@ unsafe extern "C" fn evt_device_d0_entry(
     _previous_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
     if let Some(state) = unsafe { instance_from_pnp_device(device) } {
-        let state = unsafe { &mut *state };
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        let state = &mut *state_guard;
         reopen_frame_queue(state);
         state.lifecycle.store(INSTANCE_OPEN, Ordering::Release);
     }
@@ -1349,7 +1422,10 @@ unsafe extern "C" fn evt_device_d0_exit(
     _target_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
     if let Some(state) = unsafe { instance_from_pnp_device(device) } {
-        let state = unsafe { &mut *state };
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        let state = &mut *state_guard;
         state.lifecycle.store(INSTANCE_SUSPENDED, Ordering::Release);
         purge_queue(state.read_queue);
         purge_queue(state.write_queue);
@@ -1368,7 +1444,10 @@ extern "C" fn evt_device_prepare_hardware(
     let Some(state) = (unsafe { instance_from_pnp_device(device) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    let state = unsafe { &mut *state };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    let state = &mut *state_guard;
     state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
     let adapter = state.adapter;
     if adapter.is_null() {
@@ -1479,7 +1558,10 @@ extern "C" fn evt_device_release_hardware(
     let Some(state) = (unsafe { instance_from_pnp_device(device) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    let state = unsafe { &mut *state };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    let state = &mut *state_guard;
     let adapter = state.adapter;
     if !adapter.is_null() {
         let stop: unsafe extern "system" fn(
@@ -1570,11 +1652,16 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
     }
 
     let mut device: WDFDEVICE = core::ptr::null_mut();
+    let mut control_attributes = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ParentObject: state.pnp_device.cast(),
+        ..WDF_OBJECT_ATTRIBUTES::default()
+    };
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreate,
             &mut control_init,
-            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut control_attributes,
             &mut device,
         )
     };
@@ -1593,6 +1680,20 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
             WdfSpinLockCreate,
             WDF_NO_OBJECT_ATTRIBUTES,
             &mut frame_lock,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return status;
+    }
+    let mut state_lock: WDFSPINLOCK = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfSpinLockCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut state_lock,
         )
     };
     if status != STATUS_SUCCESS {
@@ -1751,6 +1852,7 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         state.read_queue = read_queue;
         state.write_queue = write_queue;
         state.frame_lock = frame_lock;
+        state.state_lock = state_lock;
         state.frame_queue = Some(FrameQueue::new(FRAME_QUEUE_LIMIT));
         state.read_work_item = read_work_item;
         state.write_work_item = write_work_item;
@@ -1821,7 +1923,10 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         call_unsafe_wdf_function_binding!(WdfFileObjectGetDevice, file_object)
     };
     if let Some(state) = unsafe { instance_from_device(device) } {
-        let state = unsafe { &mut *state };
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let state = &mut *state_guard;
         let was_suspended = state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
         state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
         purge_queue(state.read_queue);
@@ -1841,7 +1946,10 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
-    let state = unsafe { &mut *state };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return;
+    };
+    let state = &mut *state_guard;
     if state.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
@@ -1863,7 +1971,10 @@ extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize)
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
-    let state = unsafe { &mut *state };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return;
+    };
+    let state = &mut *state_guard;
     if state.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
@@ -1893,7 +2004,11 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
         complete_request(request, STATUS_CANCELLED);
         return;
     };
-    let state = unsafe { &mut *state };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        complete_request(request, STATUS_CANCELLED);
+        return;
+    };
+    let state = &mut *state_guard;
     let read_queue = state.read_queue;
     let write_queue = state.write_queue;
     if queue == read_queue {
@@ -1982,7 +2097,10 @@ extern "C" fn evt_write_drain_work_item(work_item: WDFWORKITEM) {
     let Some(state) = (unsafe { instance_from_work_item(work_item) }) else {
         return;
     };
-    let state = unsafe { &mut *state };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return;
+    };
+    let state = &mut *state_guard;
     loop {
         let mut request = core::ptr::null_mut();
         let status = unsafe {
@@ -2036,7 +2154,10 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
     let Some(state) = (unsafe { instance_from_work_item(work_item) }) else {
         return;
     };
-    let state = unsafe { &mut *state };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return;
+    };
+    let state = &mut *state_guard;
     loop {
         let mut request = core::ptr::null_mut();
         let status = unsafe {
