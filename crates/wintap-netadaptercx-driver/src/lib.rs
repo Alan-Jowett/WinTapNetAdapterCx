@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+use alloc::alloc::alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -13,6 +14,7 @@ mod ring;
 use frame_queue::{Frame, FrameQueue, QueueError};
 use ring::{advance_index, fragment_at, fragment_virtual_address, increment_index, packet_at};
 
+use core::alloc::Layout;
 use core::ffi::c_void;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -142,7 +144,7 @@ struct InstanceState {
     rx_fragment_extension: netadaptercx_sys::NET_EXTENSION,
     tx_queue_started: AtomicBool,
     rx_queue_started: AtomicBool,
-    rx_notification_enabled: AtomicBool,
+    rx_notification_armed: AtomicBool,
     pending_reads: AtomicUsize,
     pending_writes: AtomicUsize,
     lifecycle: core::sync::atomic::AtomicU8,
@@ -174,12 +176,27 @@ impl InstanceState {
             rx_fragment_extension: netadaptercx_sys::NET_EXTENSION::default(),
             tx_queue_started: AtomicBool::new(false),
             rx_queue_started: AtomicBool::new(false),
-            rx_notification_enabled: AtomicBool::new(false),
+            rx_notification_armed: AtomicBool::new(false),
             pending_reads: AtomicUsize::new(0),
             pending_writes: AtomicUsize::new(0),
             lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
         }
     }
+}
+
+fn allocate_instance_state(instance_id: usize) -> *mut InstanceState {
+    let layout = Layout::new::<InstanceState>();
+    let state = unsafe {
+        // SAFETY: The layout exactly describes the InstanceState allocation.
+        alloc(layout).cast::<InstanceState>()
+    };
+    if !state.is_null() {
+        unsafe {
+            // SAFETY: The allocation is uniquely owned and properly aligned for InstanceState.
+            state.write(InstanceState::new(instance_id));
+        }
+    }
+    state
 }
 
 struct InstanceStateGuard {
@@ -487,7 +504,15 @@ extern "C" fn evt_driver_device_add(
         debug_status(b"EvtDriverDeviceAdd instance limit", STATUS_DEVICE_BUSY);
         return STATUS_DEVICE_BUSY;
     };
-    let state = Box::into_raw(Box::new(InstanceState::new(instance_id)));
+    let state = allocate_instance_state(instance_id);
+    if state.is_null() {
+        release_instance_id(instance_id);
+        debug_status(
+            b"EvtDriverDeviceAdd state allocation",
+            STATUS_INSUFFICIENT_RESOURCES,
+        );
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     INSTANCE_STATES[instance_id - 1].store(state, Ordering::Release);
 
     debug_marker(b"EvtDriverDeviceAdd enter");
@@ -664,7 +689,7 @@ unsafe fn create_adapter(device: WDFDEVICE, state: &mut InstanceState) -> NTSTAT
     ) -> NTSTATUS =
         unsafe { net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterCreateTableIndex as usize) };
     let mut adapter = core::ptr::null_mut();
-    // SAFETY: The adapter-init object is consumed by NetAdapterCreate.
+    // SAFETY: The adapter-init object is valid for one NetAdapterCreate call.
     let status = unsafe {
         create(
             netadaptercx_sys::NetDriverGlobals,
@@ -674,23 +699,24 @@ unsafe fn create_adapter(device: WDFDEVICE, state: &mut InstanceState) -> NTSTAT
         )
     };
     debug_status(b"NetAdapterCreate", status);
-    if status == STATUS_SUCCESS {
-        configure_adapter_link_state(adapter, state.instance_id);
-        state.adapter = adapter;
-        if !register_instance(state) {
-            return STATUS_DEVICE_BUSY;
-        }
-    } else {
-        let free: unsafe extern "system" fn(
-            netadaptercx_sys::PNET_DRIVER_GLOBALS,
-            *mut netadaptercx_sys::NETADAPTER_INIT,
-        ) = unsafe {
-            net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterInitFreeTableIndex as usize)
-        };
-        // SAFETY: AdapterCreate did not consume the failed init object.
-        unsafe { free(netadaptercx_sys::NetDriverGlobals, adapter_init) };
+    let free: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        *mut netadaptercx_sys::NETADAPTER_INIT,
+    ) = unsafe {
+        net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterInitFreeTableIndex as usize)
+    };
+    // SAFETY: NetAdapterInitFree releases every successful allocation after its
+    // NetAdapterCreate attempt, including a successful creation.
+    unsafe { free(netadaptercx_sys::NetDriverGlobals, adapter_init) };
+    if status != STATUS_SUCCESS {
+        return status;
     }
-    status
+
+    state.adapter = adapter;
+    if !register_instance(state) {
+        return STATUS_DEVICE_BUSY;
+    }
+    STATUS_SUCCESS
 }
 
 fn configure_adapter_link_state(
@@ -1081,7 +1107,7 @@ fn inject_receive_frames(
         injected += 1;
     }
 
-    if injected != 0 && state.rx_notification_enabled.load(Ordering::Acquire) {
+    if injected != 0 && state.rx_notification_armed.swap(false, Ordering::AcqRel) {
         let notify: unsafe extern "system" fn(
             netadaptercx_sys::PNET_DRIVER_GLOBALS,
             netadaptercx_sys::NETPACKETQUEUE,
@@ -1171,33 +1197,37 @@ fn capture_transmit_packets(
             break;
         }
 
-        let mut bytes = Vec::with_capacity(total_length);
-        fragment_index = fragment_begin;
-        for _ in 0..fragment_count {
-            let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
-                Some(fragment) => unsafe { &*fragment },
-                None => return,
-            };
-            let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
-                Some(address) => unsafe { &*address },
-                None => return,
-            };
-            let start = unsafe {
-                (address.VirtualAddress as *const u8).add(fragment.Offset() as usize)
-            };
-            let length = fragment.ValidLength() as usize;
-            let data = unsafe { core::slice::from_raw_parts(start, length) };
-            bytes.extend_from_slice(data);
-            fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
-                Some(index) => index,
-                None => return,
-            };
-        }
-
-        if let Ok(frame) = Frame::from_bytes(&bytes) {
-            if enqueue_existing_frame(state, frame).is_ok() {
-                captured = true;
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(total_length).is_ok() {
+            fragment_index = fragment_begin;
+            for _ in 0..fragment_count {
+                let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
+                    Some(fragment) => unsafe { &*fragment },
+                    None => return,
+                };
+                let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
+                    Some(address) => unsafe { &*address },
+                    None => return,
+                };
+                let start = unsafe {
+                    (address.VirtualAddress as *const u8).add(fragment.Offset() as usize)
+                };
+                let length = fragment.ValidLength() as usize;
+                let data = unsafe { core::slice::from_raw_parts(start, length) };
+                bytes.extend_from_slice(data);
+                fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
+                    Some(index) => index,
+                    None => return,
+                };
             }
+
+            if let Ok(frame) = Frame::from_vec(bytes) {
+                if enqueue_existing_frame(state, frame).is_ok() {
+                    captured = true;
+                }
+            }
+        } else {
+            debug_status(b"Tx capture allocation", STATUS_INSUFFICIENT_RESOURCES);
         }
 
         let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
@@ -1252,7 +1282,7 @@ extern "C" fn evt_packet_queue_set_notification_enabled(
         };
         let state = &mut *state_guard;
         if queue == state.rx_queue {
-            state.rx_notification_enabled.store(enabled != 0, Ordering::Release);
+            state.rx_notification_armed.store(enabled != 0, Ordering::Release);
             if enabled != 0 {
                 let rx_rings = state.rx_rings;
                 let rx_extension = state.rx_fragment_extension;
@@ -1297,7 +1327,7 @@ extern "C" fn evt_packet_queue_cancel(queue: netadaptercx_sys::NETPACKETQUEUE) {
     }
 
     if is_receive {
-        state.rx_notification_enabled.store(false, Ordering::Release);
+        state.rx_notification_armed.store(false, Ordering::Release);
     }
 }
 
@@ -1462,15 +1492,17 @@ extern "C" fn evt_device_prepare_hardware(
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    let adapter = {
+    let (adapter, instance_id) = {
         let state = &mut *state_guard;
         state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
-        state.adapter
+        (state.adapter, state.instance_id)
     };
     drop(state_guard);
     if adapter.is_null() {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    configure_adapter_link_state(adapter, instance_id);
 
     // Match NET_ADAPTER_TX_CAPABILITIES_INIT: this is a system-managed,
     // non-DMA path with no fragment-count limit.
@@ -1614,7 +1646,7 @@ extern "C" fn evt_device_release_hardware(
     state.rx_fragment_extension = netadaptercx_sys::NET_EXTENSION::default();
     state.tx_queue_started.store(false, Ordering::Release);
     state.rx_queue_started.store(false, Ordering::Release);
-    state.rx_notification_enabled.store(false, Ordering::Release);
+    state.rx_notification_armed.store(false, Ordering::Release);
     unregister_instance(adapter);
     state.adapter = core::ptr::null_mut();
     state.lifecycle.store(INSTANCE_CLOSED, Ordering::Release);
@@ -1694,11 +1726,30 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         }
         return status;
     }
+    let frame_queue = match FrameQueue::try_new(FRAME_QUEUE_LIMIT) {
+        Ok(frame_queue) => frame_queue,
+        Err(_) => {
+            debug_status(b"FrameQueueCreate", STATUS_INSUFFICIENT_RESOURCES);
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+            }
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    };
+    let mut lock_attributes = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ParentObject: device.cast(),
+        ExecutionLevel:
+            wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ..WDF_OBJECT_ATTRIBUTES::default()
+    };
     let mut frame_lock: WDFSPINLOCK = core::ptr::null_mut();
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfSpinLockCreate,
-            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut lock_attributes,
             &mut frame_lock,
         )
     };
@@ -1712,7 +1763,7 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfSpinLockCreate,
-            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut lock_attributes,
             &mut state_lock,
         )
     };
@@ -1873,7 +1924,7 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         state.write_queue = write_queue;
         state.frame_lock = frame_lock;
         state.state_lock = state_lock;
-        state.frame_queue = Some(FrameQueue::new(FRAME_QUEUE_LIMIT));
+        state.frame_queue = Some(frame_queue);
         state.read_work_item = read_work_item;
         state.write_work_item = write_work_item;
     }
@@ -1984,6 +2035,7 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
         return;
     };
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
     let state = &mut *state_guard;
@@ -2009,6 +2061,7 @@ extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize)
         return;
     };
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
     let state = &mut *state_guard;
@@ -2182,6 +2235,9 @@ extern "C" fn evt_write_drain_work_item(work_item: WDFWORKITEM) {
             Err(QueueError::Closed) => complete_request(request, STATUS_DEVICE_NOT_READY),
             Err(QueueError::InvalidFrameLength) => {
                 complete_request(request, STATUS_INVALID_BUFFER_SIZE)
+            }
+            Err(QueueError::InsufficientResources) => {
+                complete_request(request, STATUS_INSUFFICIENT_RESOURCES)
             }
         }
     }
