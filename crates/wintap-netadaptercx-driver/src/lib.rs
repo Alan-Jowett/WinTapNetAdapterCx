@@ -543,6 +543,11 @@ extern "C" fn evt_driver_device_add(
     let mut device_attributes = WDF_OBJECT_ATTRIBUTES {
         Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
         EvtCleanupCallback: Some(evt_instance_context_destroy),
+        // Mirror WDF_OBJECT_ATTRIBUTES_INIT; Rust's Default leaves these invalid.
+        ExecutionLevel:
+            wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
         ContextTypeInfo: &raw const DEVICE_CONTEXT_TYPE_INFO,
         ..WDF_OBJECT_ATTRIBUTES::default()
     };
@@ -858,10 +863,6 @@ fn create_packet_queue(
             Some(state) => state,
             None => return STATUS_DEVICE_NOT_READY,
         };
-        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-            return STATUS_DEVICE_NOT_READY;
-        };
-        let state = &mut *state_guard;
         let queue_context = unsafe {
             object_context::<QueueContext>(
                 packet_queue.cast(),
@@ -913,6 +914,12 @@ fn create_packet_queue(
                 &mut extension,
             );
         }
+        // Queue-ring discovery is a PASSIVE_LEVEL NetAdapterCx operation.
+        // InstanceStateGuard owns a WDF spin lock and therefore cannot cover it.
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        let state = &mut *state_guard;
         if is_transmit {
             state.tx_queue = packet_queue;
             state.tx_rings = rings;
@@ -1455,9 +1462,12 @@ extern "C" fn evt_device_prepare_hardware(
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    let state = &mut *state_guard;
-    state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
-    let adapter = state.adapter;
+    let adapter = {
+        let state = &mut *state_guard;
+        state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
+        state.adapter
+    };
+    drop(state_guard);
     if adapter.is_null() {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1667,16 +1677,11 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
     }
 
     let mut device: WDFDEVICE = core::ptr::null_mut();
-    let mut control_attributes = WDF_OBJECT_ATTRIBUTES {
-        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
-        ParentObject: state.pnp_device.cast(),
-        ..WDF_OBJECT_ATTRIBUTES::default()
-    };
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreate,
             &mut control_init,
-            &mut control_attributes,
+            WDF_NO_OBJECT_ATTRIBUTES,
             &mut device,
         )
     };
@@ -1885,6 +1890,14 @@ unsafe extern "C" fn evt_instance_context_destroy(object: WDFOBJECT) {
     if !context.is_null() && unsafe { !(*context).instance.is_null() } {
         let state = unsafe { (*context).instance };
         unsafe { (*context).instance = core::ptr::null_mut(); }
+        let control_device = unsafe { (*state).control_device };
+        unsafe { (*state).control_device = core::ptr::null_mut(); }
+        if !control_device.is_null() {
+            // Control devices cannot use a PnP device as their WDF parent.
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, control_device.cast());
+            }
+        }
         if !unsafe { (*state).adapter.is_null() } {
             unsafe { unregister_instance((*state).adapter); }
         }
