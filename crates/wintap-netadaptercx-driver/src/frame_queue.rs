@@ -81,6 +81,11 @@ impl FrameQueue {
         self.state = QueueState::Closed;
     }
 
+    pub fn reopen(&mut self) {
+        self.frames.clear();
+        self.state = QueueState::Open;
+    }
+
     pub fn len(&self) -> usize {
         self.frames.len()
     }
