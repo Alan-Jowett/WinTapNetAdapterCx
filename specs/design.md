@@ -75,25 +75,31 @@ the cargo-wdk default profile; Release passes `--profile release`.
 
 The package template is `wintap_netadaptercx_driver.inx`; cargo-wdk generates
 `wintap_netadaptercx_driver.inf` and `wintap_netadaptercx_driver.cat` beside
-the Rust driver binary. The
-hardware ID is `ROOT\WinTapRust` and the service is `WinTapRust`. No C/C++
-driver project, INF, source, service, hardware ID, package fallback, or
-selection switch remains in this branch. The Rust control device is exposed as
-`\\.\WinTapRust`.
+the Rust driver binary. The supported root-enumerated hardware IDs are
+`ROOT\WinTapRust` and `ROOT\WinTapRust2`, and the service is `WinTapRust`. No
+C/C++ driver project, INF, source, service, hardware ID, package fallback, or
+selection switch remains in this branch. The first and second Rust control
+devices are exposed as `\\.\WinTapRust` and `\\.\WinTapRust2`.
 
 ## Component boundaries
 
 ### Control/device boundary
 
-The driver shall expose a named control/device interface through which an
-administrator opens the adapter and performs the documented read/write
-operations.
+The driver shall expose a named control/device interface for each supported
+adapter instance through which an administrator opens that adapter and performs
+the documented read/write operations.
 
 - The device security descriptor shall restrict open and control access to
   elevated administrators.
 - Device naming and symbolic-link details shall be defined by the INF and
   driver design together; no undocumented path may be relied upon.
-- A second open shall fail deterministically while an owner is active.
+- A second open of the same control device shall fail deterministically while
+  an owner is active.
+- The two supported instances retain independently exclusive control devices;
+  a process may hold one exclusive handle to each instance concurrently.
+- The routed dual-adapter harness shall validate the first and second
+  instance-specific MAC/control-device mapping and fail rather than infer that
+  mapping from PnP enumeration order.
 - Closing the owner handle, process termination, or cancellation shall begin
   owner teardown and complete all outstanding requests.
 
@@ -367,28 +373,118 @@ Provisioning, packet-validation, timeout, or cleanup errors are test
 failures. Cleanup failures are reported in addition to the primary failure
 and cannot be converted into success.
 
+## Routed dual-adapter relay-test design
+
+REQ-015 is an external user-mode acceptance workflow. It does not add a
+driver-internal peer link or alter TAP frame semantics. The dedicated
+`tests\run-wintap-dual-adapter-harness.ps1` script owns the test topology and
+uses the two existing control-device contracts independently.
+
+### Clean-environment preflight and provisioning
+
+1. Require elevation and test-signing policy before modifying device or network
+   state.
+2. Enumerate PnP devices matching `ROOT\WinTapRust` and
+   `ROOT\WinTapRust2`. If either exists, fail without disabling, removing, or
+   reconfiguring it.
+3. Snapshot matching driver-store package identities before installation.
+   Resolve the host-appropriate `devcon.exe` from the pinned WDK package
+   (`microsoft.windows.wdk.<architecture>\10.0.28000.2526`); fail if it is not
+   available.
+4. Use the Microsoft-documented `devcon install <INF> <HardwareId>` operation
+   to create `ROOT\WinTapRust` followed by `ROOT\WinTapRust2`. Record the
+   exact PnP instance IDs, package installation result, and command output.
+5. Wait for exactly two enabled WinTap adapters, validate their hardware IDs,
+   service, and permanent/current MAC addresses
+   `02-57-54-41-50-01` and `02-57-54-41-50-02`. Map those MAC identities to
+   `\\.\WinTapRust` and `\\.\WinTapRust2`, respectively. Any missing,
+   duplicate, unexpected, or ambiguous identity is a failure.
+
+The script may remove a driver-store package only when comparison with the
+pre-install snapshot proves that the current run added it. A pre-existing
+package is retained even when no matching device existed at preflight.
+
+### Isolated routed topology
+
+The default topology uses documentation-only addresses that do not overlap
+REQ-008:
+
+| Endpoint | IPv4 | IPv6 | Control endpoint |
+| --- | --- | --- | --- |
+| A | `198.51.100.1/30` | `2001:db8:515:1::1/64` | `\\.\WinTapRust` |
+| B | `198.51.100.2/30` | `2001:db8:515:1::2/64` | `\\.\WinTapRust2` |
+
+The script assigns the addresses only after verifying no system-wide
+collision. It must not add a default route. It creates active-store static
+neighbor entries mapping B's IPv4/IPv6 addresses to B's MAC on A, and A's
+addresses to A's MAC on B.
+
+Following the DuoNIC model, the script installs exact on-link host routes:
+
+| Destination | Egress interface | Next hop |
+| --- | --- | --- |
+| A's IPv4 `/32` and IPv6 `/128` | B | `0.0.0.0` / `::` |
+| B's IPv4 `/32` and IPv6 `/128` | A | `0.0.0.0` / `::` |
+
+The script uses active-store route and neighbor configuration so it is not
+persistent across reboot. It verifies the exact routes win over the connected
+prefix routes and records the route table before and after configuration.
+Narrow inbound firewall rules use a unique run identifier and permit only the
+two test endpoints/prefixes; no global firewall profile or unrelated rule is
+changed.
+
+### Bidirectional relay and protocol assertions
+
+The harness opens both control endpoints with overlapped I/O and maintains
+independent outstanding reads. A completed Ethernet frame from A is validated
+for the supported frame bounds before it is written to B; a completed frame
+from B is handled symmetrically. The source read buffer remains live until the
+destination write reaches a terminal completion. On timeout, cancellation, or
+failure, all outstanding operations are cancelled and completed before their
+buffers or handles are released.
+
+The relay forwards required ARP/Neighbor Discovery and protocol traffic
+without modifying Ethernet bytes. It rejects malformed or out-of-contract
+frames rather than forwarding them. The IPv4 client sends an unbound ICMP Echo
+to B and the IPv6 client sends an unbound ICMPv6 Echo to B. Captured traffic
+must prove each request originated on A, crossed A-to-B, and each reply crossed
+B-to-A. Assertions validate Ethernet addresses, IP version, addresses, header
+length and total length where applicable, ICMP/ICMPv6 type, code, identifier,
+sequence, payload, IPv4 checksum, and ICMP or ICMPv6 checksum including the
+IPv6 pseudo-header.
+
+### Cleanup and diagnostics
+
+Finalization preserves the first failure and reports cleanup failures
+separately. It cancels/completes all I/O, closes both handles, removes only
+recorded test-created firewall rules, routes, neighbor entries, and addresses,
+then removes the two recorded PnP device instances. If and only if this run
+added the driver-store package, it removes the recorded published INF after
+both devices are gone. It captures adapter, address, route, neighbor,
+firewall, PnP, service, driver-event, command, and packet diagnostics on every
+failure path.
+
 ## Execution-environment design
 
-The hosted and VM paths share one test entry point, packet parser, packet
-builder, timeout policy, and acceptance assertions. Only provisioning inputs
-such as package location, architecture, signing mode, and cleanup policy may
-vary.
+The hosted and VM paths share the REQ-008 and REQ-015 entry points, packet
+parsers, packet builders, timeout policy, and acceptance assertions. Only
+provisioning inputs such as package location, architecture, signing mode, and
+cleanup policy may vary.
 
 ### GitHub-hosted Windows runner
 
-The workflow shall provision the WDK/SDK and test package, enable the required
-test-signing/install state, install and start the driver, configure the
-isolated address, run REQ-008, upload diagnostics, and restore the runner.
-The job must use the privileges required by the driver and network commands.
-If the runner rejects any required operation, the job fails with the
-operation and platform error.
+The workflow shall provision the WDK/SDK and test package, resolve the pinned
+WDK DevCon tool, verify the required test-signing/install state, run REQ-008
+and REQ-015, upload diagnostics, and restore the runner. The job must use the
+privileges required by the driver and network commands. If the runner rejects
+any required operation, the job fails with the operation and platform error.
 
 ### Manual Hyper-V VM
 
 Documentation shall define a clean VM setup, supported Windows build,
 architecture, administrator/test-signing prerequisites, package install,
-test invocation, diagnostic collection, and cleanup. The VM test uses the
-same assertions as hosted CI and does not rely on an external network peer.
+test invocation, diagnostic collection, and cleanup. The VM tests use the
+same assertions as hosted CI and do not rely on an external network peer.
 
 ## Unresolved implementation details
 
@@ -401,7 +497,8 @@ same assertions as hosted CI and does not rely on an external network peer.
 - **[ASSUMPTION]** A copy at the user/kernel boundary is acceptable for the
   initial implementation; zero-copy is not required by the approved
   requirements.
-- **[UNKNOWN]** The exact GitHub-hosted runner policy for test-signed driver
-  installation and virtual-interface configuration must be confirmed during
-  implementation validation; rejection is a required failure outcome under
-  REQ-009.
+- **[KNOWN]** The repository maintainer confirms that the `windows-latest`
+  and `windows-2022` GitHub-hosted runners used by CI are already test-signed
+  for driver installation and virtual-interface configuration. A regression
+  that rejects a required operation remains a required failure outcome under
+  REQ-009 for both REQ-008 and REQ-015.

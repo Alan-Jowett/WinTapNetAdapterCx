@@ -11,6 +11,7 @@ $required = @(
     "crates\wintap-netadaptercx-driver\wintap_netadaptercx_driver.inx",
     "crates\wintap-netadaptercx-driver\src\lib.rs",
     "tests\run-wintap-harness.ps1",
+    "tests\run-wintap-dual-adapter-harness.ps1",
     "tests\validate-package.ps1",
     "scripts\prepare-wdk-tools.ps1",
     "scripts\build-rust-driver.ps1"
@@ -38,6 +39,19 @@ if ($harness -notmatch 'CreateFile' -or
     throw "The overlapped administrator harness is incomplete."
 }
 
+$dualHarness = Get-Content -Raw tests\run-wintap-dual-adapter-harness.ps1
+if ($dualHarness -notmatch 'devcon.exe' -or
+    $dualHarness -notmatch 'ROOT\\WinTapRust2' -or
+    $dualHarness -notmatch 'New-NetNeighbor' -or
+    $dualHarness -notmatch 'New-NetRoute' -or
+    $dualHarness -notmatch 'ICMPv6' -or
+    $dualHarness -notmatch 'CancelIoEx' -or
+    $dualHarness -notmatch 'Assert-ArpFrame' -or
+    $dualHarness -notmatch 'Assert-IPv6Icmpv6Structure' -or
+    $dualHarness -notmatch '(?s)if \(\$script:PnpRemovalConfirmed\) \{.*?/delete-driver') {
+    throw "The routed dual-adapter harness is incomplete."
+}
+
 $source = Get-Content -Raw crates\wintap-netadaptercx-driver\src\lib.rs
 if ($source -notmatch 'export_name = "DriverEntry"' -or
     $source -notmatch 'evt_driver_device_add' -or
@@ -52,7 +66,9 @@ if ($source -notmatch 'export_name = "DriverEntry"' -or
 $workflow = Get-Content -Raw .github\workflows\driver-validation.yml
 if ($workflow -notmatch 'cargo-wdk' -or
     $workflow -notmatch 'wintap_package' -or
-    $workflow -notmatch 'validate-package.ps1') {
+    $workflow -notmatch 'validate-package.ps1' -or
+    $workflow -notmatch 'run-wintap-harness.ps1' -or
+    $workflow -notmatch 'run-wintap-dual-adapter-harness.ps1') {
     throw "The workflow does not cover Rust driver packaging and package validation."
 }
 

@@ -2,7 +2,7 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 2 — Specification Changes  
-**Status:** Requirements approved; design and validation propagation in progress  
+**Status:** Baseline requirements approved; CHG-031 pending specification audit and user approval
 **Evidence scope:** `README.md`, repository layout, and user-provided project purpose
 
 ## Change manifest
@@ -16,6 +16,10 @@
   Ethernet/TAP boundary.
 - Require the same full test on a GitHub-hosted Windows runner and manually in
   a Hyper-V-capable development VM.
+- Add a routed, dual-adapter IPv4/IPv6 relay acceptance test modeled on the
+  DuoNIC topology.
+- Reconcile the Rust package identity with its existing two root-enumerated
+  hardware IDs.
 - Replace the C driver implementation with Rust, reusing the
   `windows-drivers-rs` WDF ecosystem and adding generated NetAdapterCx FFI
   bindings.
@@ -30,6 +34,21 @@
 - **UI-002 (KNOWN):** The project should expose a practical user-mode path for
   exchanging Ethernet frames with the Windows networking stack.
 - **UI-003 (KNOWN):** The repository is licensed under MIT.
+- **UI-015 (KNOWN):** The user requested a WinTapNetAdapterCx test script
+  modeled on DuoNIC's two-NIC routing setup.
+- **UI-016 (KNOWN):** The test must force traffic through the NIC datapath by
+  routing rules rather than local loopback delivery.
+- **UI-017 (KNOWN):** The user selected a full two-adapter relay test with
+  IPv4 and IPv6 coverage.
+- **UI-018 (KNOWN):** The user selected GitHub-hosted Windows CI and a manual
+  Hyper-V/WinDbg VM as required execution environments.
+- **UI-019 (KNOWN):** The user selected a dedicated
+  `tests\run-wintap-dual-adapter-harness.ps1` entry point.
+- **UI-020 (KNOWN):** The user selected always provisioning and removing the
+  two test adapters, while failing without modification when matching adapters
+  already exist.
+- **UI-021 (KNOWN):** The user selected removal of a driver-store package only
+  when the current test run added it.
 
 ## Baseline requirements
 
@@ -115,6 +134,10 @@ completion contract.
 packet-path, concurrency, cancellation, power-management, malformed-input, and
 cleanup verification before implementation is approved.
 
+Verification shall include the routed dual-adapter provisioning, route
+precedence, bidirectional relay, IPv4/IPv6 protocol exchange, partial-failure,
+and cleanup behavior required by REQ-015.
+
 **Trace:** UI-001, UI-002; lifecycle and safety implications of REQ-001 through
 REQ-005.  
 **Invariant impact:** Each ownership, synchronization, and failure-path
@@ -164,22 +187,24 @@ leaves no test-created network or driver state after cleanup.
 
 **Before:** Hosted CI validates build and package artifacts only; privileged
 packet-path validation is manual/self-hosted.
-**After:** The complete REQ-008 flow shall run without changing its assertions
-in both a GitHub-hosted Windows CI/CD runner and a manually operated Windows
-VM on a Hyper-V-capable development machine. The hosted workflow shall
-provision the test-signed package, install/load the driver, configure the
-interface, execute the packet exchange, collect diagnostics, and clean up.
-The VM path shall use the same test entry point and assertions.
+**After:** The complete REQ-008 and REQ-015 flows shall run without changing
+their respective assertions in both a GitHub-hosted Windows CI/CD runner and a
+manually operated Windows VM on a Hyper-V-capable development machine. The
+hosted workflow shall provision the test-signed package, install/load the
+driver, configure each required interface, execute the packet exchanges,
+collect diagnostics, and clean up. The VM path shall use the same entry point
+and assertions for each flow.
 
 The test shall fail if required privileged operations are unavailable. It
 shall not silently downgrade to a capability check or skip packet-path
 assertions. Provisioning, signing, and cleanup may be parameterized by
-environment, but the ICMP/TAP assertions shall remain identical.
+environment, but the REQ-008 and REQ-015 protocol, route, relay, and cleanup
+assertions shall remain identical.
 
-**Trace:** Additional user requirement; extends REQ-004, REQ-006, and
-REQ-007.
+**Trace:** Additional user requirement; UI-018; extends REQ-004, REQ-006,
+REQ-007, and REQ-015.
 **Invariant impact:** Provisioning and cleanup must be deterministic,
-idempotent, isolated to the test interface, and diagnostic-preserving. A
+idempotent, isolated to the test interfaces, and diagnostic-preserving. A
 hosted-platform policy that blocks required execution is a validation failure,
 not a pass.
 
@@ -229,13 +254,15 @@ obsolete C service.
 ### REQ-012 — Rust package identity
 
 **Before:** The Rust package partially shares the C driver naming scheme.
-**After:** The package shall use `ROOT\WinTapRust`, service `WinTapRust`, and
-`wintap_netadaptercx_driver.inf`/`wintap_netadaptercx_driver.cat`. It shall not reuse C
-hardware, service, INF, or catalog identities.
+**After:** The package shall use `ROOT\WinTapRust` and `ROOT\WinTapRust2` as
+its supported root-enumerated test-adapter identities, service `WinTapRust`,
+and `wintap_netadaptercx_driver.inf`/`wintap_netadaptercx_driver.cat`. It
+shall not reuse C hardware, service, INF, or catalog identities.
 
 **Trace:** User direction that this branch work on the Rust driver.
 **Invariant impact:** Installation and removal unambiguously target the Rust
-driver and cannot select a stale C package.
+driver and cannot select a stale C package. The two adapter identities share
+one service but retain separately exclusive control endpoints.
 
 ### REQ-013 — Receive-filter verifier compatibility
 
@@ -278,6 +305,51 @@ reported 203.
 does not alter driver I/O, packet ownership, queue semantics, IRQL, or adapter
 lifecycle.
 
+### REQ-015 — Routed dual-adapter IPv4/IPv6 TAP relay test
+
+**Before:** No acceptance test proves that traffic addressed to another local
+WinTap interface leaves one WinTap adapter, crosses the TAP boundary, enters a
+second adapter, and returns over the reverse direction rather than being
+delivered through loopback.
+
+**After:** The repository shall provide
+`tests\run-wintap-dual-adapter-harness.ps1`, a privileged test that:
+
+1. Requires a clean environment with no pre-existing `ROOT\WinTapRust` or
+   `ROOT\WinTapRust2` adapter, failing before it modifies state otherwise.
+2. Provisions exactly those two root-enumerated adapters, verifies their
+   stable identity, expected instance-specific MAC/control-endpoint mapping,
+   and separate exclusive TAP handles.
+3. Configures isolated documentation-only IPv4 and IPv6 peer addresses,
+   static peer-neighbor mappings, reciprocal on-link `/32` and `/128` host
+   routes, and only narrowly scoped firewall rules needed for the actual
+   inbound test path.
+4. Starts IPv4 ICMP Echo and IPv6 ICMPv6 Echo clients without explicit
+   source-address binding, verifies route selection sends each request through
+   the opposite WinTap adapter rather than loopback, and relays complete
+   validated Ethernet frames bidirectionally between the two TAP handles.
+5. Validates bounded successful round trips, packet identity, protocol
+   headers, Ethernet endpoints, payloads, and applicable checksums; malformed,
+   truncated, mismatched, cancelled, and timed-out traffic fails
+   deterministically.
+6. Retains diagnostics and removes all state created by the run. It removes
+   both test-created devices and removes a driver-store package only when that
+   same run added it.
+
+The test shall not add a default route, bridge, NAT, external peer, production
+routing policy, or source-address binding. It shall not modify a pre-existing
+adapter or package.
+
+**Trace:** UI-015 through UI-021; DuoNIC setup behavior examined through the
+Bluebird source index; extends REQ-001, REQ-002, REQ-003, REQ-005, REQ-006,
+REQ-009, and REQ-012.
+
+**Invariant impact:** Each control handle remains independently exclusive.
+Every relayed frame has one completed source read, one completed peer write,
+and no retained user buffer after completion or cancellation. Cleanup is
+idempotent, affects only recorded test-created objects, preserves the primary
+failure, and reports cleanup failure separately. REQ-008 remains unchanged.
+
 ## Scope boundaries
 
 - **In scope:** A NetAdapterCx software Ethernet adapter and a TAP-style
@@ -287,6 +359,9 @@ lifecycle.
   verification specifications.
 - **In scope:** The complete privileged ICMP Echo Request/Echo Reply test and
   its GitHub-hosted runner and Hyper-V VM execution environments.
+- **In scope:** A dedicated dual-adapter IPv4/IPv6 TAP relay harness, its
+  DevCon-based test provisioning, route/neighbor/firewall setup, diagnostics,
+  cleanup, and hosted/VM execution.
 - **In scope:** Rust kernel-mode driver behavior, generated NetAdapterCx FFI,
   safe wrapper boundaries, Rust-specific panic and build configuration, and
   ABI/layout validation.
@@ -295,7 +370,8 @@ lifecycle.
 - **Out of scope unless explicitly added:** IP/TUN mode (decision: excluded
   from the initial milestone), protocol-specific
   user-mode libraries, packet capture beyond the virtual adapter contract,
-  bridging/NAT/routing policy, and production signing/distribution services.
+  driver-internal peer linking, bridging/NAT/routing policy, and production
+  signing/distribution services.
 
 ## Open questions requiring user decisions
 
@@ -321,8 +397,18 @@ lifecycle.
     `192.0.2.2`.
 12. **Resolved:** Full privileged execution is required on both a
     GitHub-hosted Windows runner and a Hyper-V-capable development VM.
+13. **Resolved:** REQ-015 uses a full two-adapter user-mode relay rather than
+    a setup-only script or a one-adapter extension.
+14. **Resolved:** REQ-015 covers both IPv4 and IPv6.
+15. **Resolved:** REQ-015 uses a dedicated
+    `tests\run-wintap-dual-adapter-harness.ps1` entry point.
+16. **Resolved:** REQ-015 always provisions and removes its two adapters and
+    fails without modification when matching adapters already exist.
+17. **Resolved:** REQ-015 runs in hosted CI and a manual Hyper-V/WinDbg VM.
+18. **Resolved:** REQ-015 removes a driver-store package only if that test run
+    added it.
 
 ## Discovery gate
 
-Requirements discovery is complete. Phase 3 remains blocked until the
+CHG-031 requirements discovery is complete. Phase 3 remains blocked until the
 requirements, design, and validation patches are approved together.

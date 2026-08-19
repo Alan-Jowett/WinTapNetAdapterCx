@@ -34,7 +34,16 @@ if (-not (Test-Path -LiteralPath $inf -PathType Leaf)) {
 }
 
 $infText = Get-Content -Raw -LiteralPath $inf
-foreach ($required in @("CatalogFile", "WinTap_CopyFiles", "WinTap_Service", "NTamd64", "NTarm64")) {
+foreach ($required in @(
+    "CatalogFile",
+    "WinTap_CopyFiles",
+    "WinTap_Service",
+    "WinTapRust",
+    "ROOT\WinTapRust",
+    "ROOT\WinTapRust2",
+    "NTamd64",
+    "NTarm64"
+)) {
     if ($infText -notmatch [regex]::Escape($required)) {
         throw "INF is missing the required package declaration: $required"
     }
