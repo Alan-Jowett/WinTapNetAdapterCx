@@ -281,24 +281,24 @@ unsafe fn object_context<T>(
     }
 }
 
-unsafe fn instance_from_device(device: WDFDEVICE) -> Option<&'static mut InstanceState> {
+unsafe fn instance_from_device(device: WDFDEVICE) -> Option<*mut InstanceState> {
     for entry in &INSTANCE_STATES {
         let state = entry.load(Ordering::Acquire);
         if !state.is_null()
             && (unsafe { (*state).pnp_device == device }
                 || unsafe { (*state).control_device == device })
         {
-            return Some(unsafe { &mut *state });
+            return Some(state);
         }
     }
     None
 }
 
-unsafe fn instance_from_pnp_device(device: WDFDEVICE) -> Option<&'static mut InstanceState> {
+unsafe fn instance_from_pnp_device(device: WDFDEVICE) -> Option<*mut InstanceState> {
     for entry in &INSTANCE_STATES {
         let state = entry.load(Ordering::Acquire);
         if !state.is_null() && unsafe { (*state).pnp_device == device } {
-            return Some(unsafe { &mut *state });
+            return Some(state);
         }
     }
     None
@@ -306,13 +306,13 @@ unsafe fn instance_from_pnp_device(device: WDFDEVICE) -> Option<&'static mut Ins
 
 unsafe fn instance_from_adapter(
     adapter: netadaptercx_sys::NETADAPTER,
-) -> Option<&'static mut InstanceState> {
+) -> Option<*mut InstanceState> {
     let adapter = adapter.cast::<c_void>();
     for entry in &INSTANCE_REGISTRY {
         if entry.adapter.load(Ordering::Acquire) == adapter {
             let state = entry.state.load(Ordering::Acquire);
             if !state.is_null() {
-                return Some(unsafe { &mut *state });
+                return Some(state);
             }
         }
     }
@@ -349,21 +349,21 @@ fn unregister_instance(adapter: netadaptercx_sys::NETADAPTER) {
     }
 }
 
-unsafe fn instance_from_io_queue(queue: WDFQUEUE) -> Option<&'static mut InstanceState> {
+unsafe fn instance_from_io_queue(queue: WDFQUEUE) -> Option<*mut InstanceState> {
     let device = unsafe {
         call_unsafe_wdf_function_binding!(WdfIoQueueGetDevice, queue)
     };
     unsafe { instance_from_device(device) }
 }
 
-unsafe fn instance_from_work_item(work_item: WDFWORKITEM) -> Option<&'static mut InstanceState> {
+unsafe fn instance_from_work_item(work_item: WDFWORKITEM) -> Option<*mut InstanceState> {
     for entry in &INSTANCE_STATES {
         let state = entry.load(Ordering::Acquire);
         if !state.is_null()
             && (unsafe { (*state).read_work_item == work_item }
                 || unsafe { (*state).write_work_item == work_item })
         {
-            return Some(unsafe { &mut *state });
+            return Some(state);
         }
     }
     None
@@ -371,7 +371,7 @@ unsafe fn instance_from_work_item(work_item: WDFWORKITEM) -> Option<&'static mut
 
 unsafe fn instance_from_packet_queue(
     queue: netadaptercx_sys::NETPACKETQUEUE,
-) -> Option<&'static mut InstanceState> {
+) -> Option<*mut InstanceState> {
     let context = unsafe {
         object_context::<QueueContext>(
             queue.cast(),
@@ -381,7 +381,7 @@ unsafe fn instance_from_packet_queue(
     if context.is_null() || unsafe { (*context).instance.is_null() } {
         None
     } else {
-        Some(unsafe { &mut *(*context).instance })
+        Some(unsafe { (*context).instance })
     }
 }
 
@@ -812,6 +812,7 @@ fn create_packet_queue(
             Some(state) => state,
             None => return STATUS_DEVICE_NOT_READY,
         };
+        let state = unsafe { &mut *state };
         let queue_context = unsafe {
             object_context::<QueueContext>(
                 packet_queue.cast(),
@@ -878,6 +879,7 @@ fn create_packet_queue(
 
 extern "C" fn evt_packet_queue_start(queue: netadaptercx_sys::NETPACKETQUEUE) {
     if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
+        let state = unsafe { &mut *state };
         if queue == state.tx_queue {
             state.tx_queue_started.store(true, Ordering::Release);
         } else if queue == state.rx_queue {
@@ -888,6 +890,7 @@ extern "C" fn evt_packet_queue_start(queue: netadaptercx_sys::NETPACKETQUEUE) {
 
 extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
     if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
+        let state = unsafe { &mut *state };
         if queue == state.tx_queue {
             state.tx_queue_started.store(false, Ordering::Release);
         } else if queue == state.rx_queue {
@@ -900,6 +903,7 @@ extern "C" fn evt_packet_queue_advance(queue: netadaptercx_sys::NETPACKETQUEUE) 
     let Some(state) = (unsafe { instance_from_packet_queue(queue) }) else {
         return;
     };
+    let state = unsafe { &mut *state };
     let rx_rings = state.rx_rings;
     let rx_extension = state.rx_fragment_extension;
     if queue == state.rx_queue && !rx_rings.is_null() {
@@ -1178,6 +1182,7 @@ extern "C" fn evt_packet_queue_set_notification_enabled(
     enabled: wdk_sys::BOOLEAN,
 ) {
     if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
+        let state = unsafe { &mut *state };
         if queue == state.rx_queue {
             state.rx_notification_enabled.store(enabled != 0, Ordering::Release);
             if enabled != 0 {
@@ -1195,6 +1200,7 @@ extern "C" fn evt_packet_queue_cancel(queue: netadaptercx_sys::NETPACKETQUEUE) {
     let Some(state) = (unsafe { instance_from_packet_queue(queue) }) else {
         return;
     };
+    let state = unsafe { &mut *state };
     let (rings, is_receive) = if queue == state.tx_queue {
         (state.tx_rings, false)
     } else if queue == state.rx_queue {
@@ -1273,6 +1279,7 @@ extern "C" fn evt_set_receive_filter(
         if address_list.is_null() {
             debug_status(b"ReceiveFilter multicast list", STATUS_INVALID_BUFFER_SIZE);
             if let Some(state) = unsafe { instance_from_adapter(adapter) } {
+                let state = unsafe { &mut *state };
                 update_receive_filter_state(state, packet_filters, &addresses[..0]);
             }
             return;
@@ -1291,6 +1298,7 @@ extern "C" fn evt_set_receive_filter(
     }
 
     if let Some(state) = unsafe { instance_from_adapter(adapter) } {
+        let state = unsafe { &mut *state };
         update_receive_filter_state(state, packet_filters, &addresses[..address_count]);
     }
 }
@@ -1329,6 +1337,7 @@ unsafe extern "C" fn evt_device_d0_entry(
     _previous_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
     if let Some(state) = unsafe { instance_from_pnp_device(device) } {
+        let state = unsafe { &mut *state };
         reopen_frame_queue(state);
         state.lifecycle.store(INSTANCE_OPEN, Ordering::Release);
     }
@@ -1340,6 +1349,7 @@ unsafe extern "C" fn evt_device_d0_exit(
     _target_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
     if let Some(state) = unsafe { instance_from_pnp_device(device) } {
+        let state = unsafe { &mut *state };
         state.lifecycle.store(INSTANCE_SUSPENDED, Ordering::Release);
         purge_queue(state.read_queue);
         purge_queue(state.write_queue);
@@ -1358,6 +1368,7 @@ extern "C" fn evt_device_prepare_hardware(
     let Some(state) = (unsafe { instance_from_pnp_device(device) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
+    let state = unsafe { &mut *state };
     state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
     let adapter = state.adapter;
     if adapter.is_null() {
@@ -1468,6 +1479,7 @@ extern "C" fn evt_device_release_hardware(
     let Some(state) = (unsafe { instance_from_pnp_device(device) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
+    let state = unsafe { &mut *state };
     let adapter = state.adapter;
     if !adapter.is_null() {
         let stop: unsafe extern "system" fn(
@@ -1809,6 +1821,7 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         call_unsafe_wdf_function_binding!(WdfFileObjectGetDevice, file_object)
     };
     if let Some(state) = unsafe { instance_from_device(device) } {
+        let state = unsafe { &mut *state };
         let was_suspended = state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
         state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
         purge_queue(state.read_queue);
@@ -1828,6 +1841,7 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
+    let state = unsafe { &mut *state };
     if state.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
@@ -1849,6 +1863,7 @@ extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize)
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
+    let state = unsafe { &mut *state };
     if state.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
@@ -1878,6 +1893,7 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
         complete_request(request, STATUS_CANCELLED);
         return;
     };
+    let state = unsafe { &mut *state };
     let read_queue = state.read_queue;
     let write_queue = state.write_queue;
     if queue == read_queue {
@@ -1966,6 +1982,7 @@ extern "C" fn evt_write_drain_work_item(work_item: WDFWORKITEM) {
     let Some(state) = (unsafe { instance_from_work_item(work_item) }) else {
         return;
     };
+    let state = unsafe { &mut *state };
     loop {
         let mut request = core::ptr::null_mut();
         let status = unsafe {
@@ -2019,6 +2036,7 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
     let Some(state) = (unsafe { instance_from_work_item(work_item) }) else {
         return;
     };
+    let state = unsafe { &mut *state };
     loop {
         let mut request = core::ptr::null_mut();
         let status = unsafe {
