@@ -2057,7 +2057,6 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
                     return;
                 } else {
                     release_request(&state.pending_reads);
-                    complete_request(request, STATUS_DEVICE_NOT_READY);
                 }
                 return;
             }
