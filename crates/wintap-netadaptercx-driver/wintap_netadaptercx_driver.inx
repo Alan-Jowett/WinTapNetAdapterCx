@@ -12,9 +12,11 @@ PnpLockdown = 1
 
 [Standard.NTamd64.10.0...19041]
 %WinTapDeviceDesc% = WinTap_Install, Root\WinTapRust
+%WinTapDeviceDesc% = WinTap_Install, Root\WinTapRust2
 
 [Standard.NTarm64.10.0...19041]
 %WinTapDeviceDesc% = WinTap_Install, Root\WinTapRust
+%WinTapDeviceDesc% = WinTap_Install, Root\WinTapRust2
 
 [WinTap_Install]
 Characteristics = 0x1

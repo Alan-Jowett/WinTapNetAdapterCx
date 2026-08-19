@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+use alloc::alloc::alloc;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 #[cfg(not(test))]
@@ -12,17 +14,19 @@ mod ring;
 use frame_queue::{Frame, FrameQueue, QueueError};
 use ring::{advance_index, fragment_at, fragment_virtual_address, increment_index, packet_at};
 
+use core::alloc::Layout;
 use core::ffi::c_void;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
-use wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchParallel;
 use wdk_sys::{
     DRIVER_OBJECT, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, UNICODE_STRING,
-    WDF_DRIVER_CONFIG, WDF_FILEOBJECT_CONFIG, WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE,
+    WDF_DRIVER_CONFIG, WDF_FILEOBJECT_CONFIG, WDF_IO_QUEUE_CONFIG,
     WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
     WDF_WORKITEM_CONFIG, WDFCMRESLIST, WDFDEVICE, WDFDEVICE_INIT, WDFDRIVER, WDFFILEOBJECT,
-    WDFQUEUE, WDFREQUEST, WDFSPINLOCK, WDFWORKITEM, call_unsafe_wdf_function_binding,
+    WDFOBJECT, WDFQUEUE, WDFREQUEST, WDFSPINLOCK, WDFWORKITEM,
+    call_unsafe_wdf_function_binding,
 };
 
 unsafe extern "C" {
@@ -74,6 +78,10 @@ const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as i32;
 const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000_000D_u32 as i32;
 const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206_u32 as i32;
 const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as i32;
+const INSTANCE_OPEN: u8 = 0;
+const INSTANCE_SUSPENDED: u8 = 1;
+const INSTANCE_CLOSING: u8 = 2;
+const INSTANCE_CLOSED: u8 = 3;
 const PENDING_READ_LIMIT: usize = 256;
 const PENDING_WRITE_LIMIT: usize = 256;
 const FRAME_QUEUE_LIMIT: usize = 256;
@@ -81,52 +89,6 @@ const FRAME_MINIMUM: usize = 14;
 const FRAME_MAXIMUM: usize = 1514;
 const MAXIMUM_MULTICAST_ADDRESSES: usize = 64;
 const ETHERNET_ADDRESS_LENGTH: usize = 6;
-const CONTROL_DEVICE_NAME: [u16; 19] = [
-    b'\\' as u16,
-    b'D' as u16,
-    b'e' as u16,
-    b'v' as u16,
-    b'i' as u16,
-    b'c' as u16,
-    b'e' as u16,
-    b'\\' as u16,
-    b'W' as u16,
-    b'i' as u16,
-    b'n' as u16,
-    b'T' as u16,
-    b'a' as u16,
-    b'p' as u16,
-    b'R' as u16,
-    b'u' as u16,
-    b's' as u16,
-    b't' as u16,
-    0,
-];
-const CONTROL_SYMBOLIC_LINK: [u16; 23] = [
-    b'\\' as u16,
-    b'D' as u16,
-    b'o' as u16,
-    b's' as u16,
-    b'D' as u16,
-    b'e' as u16,
-    b'v' as u16,
-    b'i' as u16,
-    b'c' as u16,
-    b'e' as u16,
-    b's' as u16,
-    b'\\' as u16,
-    b'W' as u16,
-    b'i' as u16,
-    b'n' as u16,
-    b'T' as u16,
-    b'a' as u16,
-    b'p' as u16,
-    b'R' as u16,
-    b'u' as u16,
-    b's' as u16,
-    b't' as u16,
-    0,
-];
 const CONTROL_SDDL: [u16; 16] = [
     b'D' as u16,
     b':' as u16,
@@ -146,50 +108,139 @@ const CONTROL_SDDL: [u16; 16] = [
     0,
 ];
 
-static mut ADAPTER: netadaptercx_sys::NETADAPTER = core::ptr::null_mut();
-static mut CONTROL_DEVICE: WDFDEVICE = core::ptr::null_mut();
-static mut READ_QUEUE: WDFQUEUE = core::ptr::null_mut();
-static mut WRITE_QUEUE: WDFQUEUE = core::ptr::null_mut();
-static mut FRAME_LOCK: WDFSPINLOCK = core::ptr::null_mut();
-static mut FRAME_QUEUE: Option<FrameQueue> = None;
-static mut ACTIVE_PACKET_FILTERS: netadaptercx_sys::_NET_PACKET_FILTER_FLAGS = 0;
-static mut ACTIVE_MULTICAST_ADDRESS_COUNT: usize = 0;
-static mut ACTIVE_MULTICAST_ADDRESSES: [[u8; ETHERNET_ADDRESS_LENGTH];
-    MAXIMUM_MULTICAST_ADDRESSES] =
-    [[0; ETHERNET_ADDRESS_LENGTH]; MAXIMUM_MULTICAST_ADDRESSES];
-static mut READ_WORK_ITEM: WDFWORKITEM = core::ptr::null_mut();
-static mut WRITE_WORK_ITEM: WDFWORKITEM = core::ptr::null_mut();
-static mut TX_QUEUE: netadaptercx_sys::NETPACKETQUEUE = core::ptr::null_mut();
-static mut RX_QUEUE: netadaptercx_sys::NETPACKETQUEUE = core::ptr::null_mut();
-static mut TX_RINGS: *const netadaptercx_sys::NET_RING_COLLECTION = core::ptr::null();
-static mut RX_RINGS: *const netadaptercx_sys::NET_RING_COLLECTION = core::ptr::null();
-static mut TX_FRAGMENT_EXTENSION: netadaptercx_sys::NET_EXTENSION =
-    netadaptercx_sys::NET_EXTENSION {
-        Reserved: [core::ptr::null_mut(); 4],
-        __bindgen_anon_1: netadaptercx_sys::_NET_EXTENSION__bindgen_ty_1 {
-            Enabled: 0,
-        },
-    };
-static mut RX_FRAGMENT_EXTENSION: netadaptercx_sys::NET_EXTENSION =
-    netadaptercx_sys::NET_EXTENSION {
-        Reserved: [core::ptr::null_mut(); 4],
-        __bindgen_anon_1: netadaptercx_sys::_NET_EXTENSION__bindgen_ty_1 {
-            Enabled: 0,
-        },
-    };
-static PNP_DEVICE_ADDED: AtomicBool = AtomicBool::new(false);
+static INSTANCE_IDS: [AtomicBool; 2] =
+    [const { AtomicBool::new(false) }; 2];
+static INSTANCE_STATES: [core::sync::atomic::AtomicPtr<InstanceState>; 2] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; 2];
 static FRAGMENT_VIRTUAL_ADDRESS_NAME: [u16; 27] = [
     109, 115, 95, 102, 114, 97, 103, 109, 101, 110, 116, 95, 118, 105, 114, 116, 117, 97, 108,
     97, 100, 100, 114, 101, 115, 115, 0,
 ];
-static TX_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
-static RX_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
-static RX_NOTIFICATION_ENABLED: AtomicBool = AtomicBool::new(false);
-static PENDING_READS: AtomicUsize = AtomicUsize::new(0);
-static PENDING_WRITES: AtomicUsize = AtomicUsize::new(0);
-
 static QUEUE_CONTEXT_NAME: &[u8] = b"WINTAP_QUEUE_CONTEXT\0";
 static DEVICE_CONTEXT_NAME: &[u8] = b"WINTAP_DEVICE_CONTEXT\0";
+
+#[repr(C)]
+struct InstanceState {
+    instance_id: usize,
+    pnp_device: WDFDEVICE,
+    adapter: netadaptercx_sys::NETADAPTER,
+    control_device: WDFDEVICE,
+    read_queue: WDFQUEUE,
+    write_queue: WDFQUEUE,
+    frame_lock: WDFSPINLOCK,
+    state_lock: WDFSPINLOCK,
+    frame_queue: Option<FrameQueue>,
+    active_packet_filters: netadaptercx_sys::_NET_PACKET_FILTER_FLAGS,
+    active_multicast_address_count: usize,
+    active_multicast_addresses: [[u8; ETHERNET_ADDRESS_LENGTH];
+        MAXIMUM_MULTICAST_ADDRESSES],
+    read_work_item: WDFWORKITEM,
+    write_work_item: WDFWORKITEM,
+    tx_queue: netadaptercx_sys::NETPACKETQUEUE,
+    rx_queue: netadaptercx_sys::NETPACKETQUEUE,
+    tx_rings: *const netadaptercx_sys::NET_RING_COLLECTION,
+    rx_rings: *const netadaptercx_sys::NET_RING_COLLECTION,
+    tx_fragment_extension: netadaptercx_sys::NET_EXTENSION,
+    rx_fragment_extension: netadaptercx_sys::NET_EXTENSION,
+    tx_queue_started: AtomicBool,
+    rx_queue_started: AtomicBool,
+    rx_notification_armed: AtomicBool,
+    pending_reads: AtomicUsize,
+    pending_writes: AtomicUsize,
+    lifecycle: core::sync::atomic::AtomicU8,
+}
+
+impl InstanceState {
+    fn new(instance_id: usize) -> Self {
+        Self {
+            instance_id,
+            pnp_device: core::ptr::null_mut(),
+            adapter: core::ptr::null_mut(),
+            control_device: core::ptr::null_mut(),
+            read_queue: core::ptr::null_mut(),
+            write_queue: core::ptr::null_mut(),
+            frame_lock: core::ptr::null_mut(),
+            state_lock: core::ptr::null_mut(),
+            frame_queue: None,
+            active_packet_filters: 0,
+            active_multicast_address_count: 0,
+            active_multicast_addresses: [[0; ETHERNET_ADDRESS_LENGTH];
+                MAXIMUM_MULTICAST_ADDRESSES],
+            read_work_item: core::ptr::null_mut(),
+            write_work_item: core::ptr::null_mut(),
+            tx_queue: core::ptr::null_mut(),
+            rx_queue: core::ptr::null_mut(),
+            tx_rings: core::ptr::null(),
+            rx_rings: core::ptr::null(),
+            tx_fragment_extension: netadaptercx_sys::NET_EXTENSION::default(),
+            rx_fragment_extension: netadaptercx_sys::NET_EXTENSION::default(),
+            tx_queue_started: AtomicBool::new(false),
+            rx_queue_started: AtomicBool::new(false),
+            rx_notification_armed: AtomicBool::new(false),
+            pending_reads: AtomicUsize::new(0),
+            pending_writes: AtomicUsize::new(0),
+            lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
+        }
+    }
+}
+
+fn allocate_instance_state(instance_id: usize) -> *mut InstanceState {
+    let layout = Layout::new::<InstanceState>();
+    let state = unsafe {
+        // SAFETY: The layout exactly describes the InstanceState allocation.
+        alloc(layout).cast::<InstanceState>()
+    };
+    if !state.is_null() {
+        unsafe {
+            // SAFETY: The allocation is uniquely owned and properly aligned for InstanceState.
+            state.write(InstanceState::new(instance_id));
+        }
+    }
+    state
+}
+
+struct InstanceStateGuard {
+    state: *mut InstanceState,
+    lock: WDFSPINLOCK,
+}
+
+impl InstanceStateGuard {
+    unsafe fn new(state: *mut InstanceState) -> Option<Self> {
+        if state.is_null() {
+            return None;
+        }
+        let lock = unsafe { (*state).state_lock };
+        if lock.is_null() {
+            return None;
+        }
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
+        }
+        Some(Self { state, lock })
+    }
+}
+
+impl Deref for InstanceStateGuard {
+    type Target = InstanceState;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.state }
+    }
+}
+
+impl DerefMut for InstanceStateGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.state }
+    }
+}
+
+impl Drop for InstanceStateGuard {
+    fn drop(&mut self) {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, self.lock);
+        }
+    }
+}
 
 static mut QUEUE_CONTEXT_TYPE_INFO: wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO =
     wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO {
@@ -213,19 +264,189 @@ static mut DEVICE_CONTEXT_TYPE_INFO: wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO =
 struct QueueContext {
     is_transmit: bool,
     started: bool,
-    _padding: [u8; 6],
+    _padding: [u8; 5],
+    instance: *mut InstanceState,
     rings: netadaptercx_sys::NET_RING_COLLECTION,
 }
 
 #[repr(C)]
 struct DeviceContext {
-    _reserved: u8,
+    instance: *mut InstanceState,
+}
+
+struct InstanceRegistry {
+    adapter: core::sync::atomic::AtomicPtr<c_void>,
+    state: core::sync::atomic::AtomicPtr<InstanceState>,
+}
+
+impl InstanceRegistry {
+    const fn new() -> Self {
+        Self {
+            adapter: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            state: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+}
+
+static INSTANCE_REGISTRY: [InstanceRegistry; 2] =
+    [const { InstanceRegistry::new() }; 2];
+
+fn reserve_instance_id() -> Option<usize> {
+    for (index, in_use) in INSTANCE_IDS.iter().enumerate() {
+        if in_use
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
+fn release_instance_id(instance_id: usize) {
+    if let Some(in_use) = INSTANCE_IDS.get(instance_id.saturating_sub(1)) {
+        in_use.store(false, Ordering::Release);
+    }
 }
 
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_STATE>();
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES>();
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_RX_CAPABILITIES>();
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_PACKET_QUEUE_CONFIG>();
+const _: () = {
+    assert!(
+        core::mem::offset_of!(netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES, MappingRequirement)
+            == 4
+    );
+    assert!(
+        core::mem::offset_of!(
+            netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES,
+            FragmentBufferAlignment
+        ) == 24
+    );
+    assert!(
+        core::mem::offset_of!(netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES, DmaCapabilities)
+            == 48
+    );
+};
+
+unsafe fn object_context<T>(
+    object: WDFOBJECT,
+    type_info: *const wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO,
+) -> *mut T {
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfObjectGetTypedContextWorker,
+            object,
+            type_info
+        )
+        .cast()
+    }
+}
+
+unsafe fn instance_from_device(device: WDFDEVICE) -> Option<*mut InstanceState> {
+    for entry in &INSTANCE_STATES {
+        let state = entry.load(Ordering::Acquire);
+        if !state.is_null()
+            && (unsafe { (*state).pnp_device == device }
+                || unsafe { (*state).control_device == device })
+        {
+            return Some(state);
+        }
+    }
+    None
+}
+
+unsafe fn instance_from_pnp_device(device: WDFDEVICE) -> Option<*mut InstanceState> {
+    for entry in &INSTANCE_STATES {
+        let state = entry.load(Ordering::Acquire);
+        if !state.is_null() && unsafe { (*state).pnp_device == device } {
+            return Some(state);
+        }
+    }
+    None
+}
+
+unsafe fn instance_from_adapter(
+    adapter: netadaptercx_sys::NETADAPTER,
+) -> Option<*mut InstanceState> {
+    let adapter = adapter.cast::<c_void>();
+    for entry in &INSTANCE_REGISTRY {
+        if entry.adapter.load(Ordering::Acquire) == adapter {
+            let state = entry.state.load(Ordering::Acquire);
+            if !state.is_null() {
+                return Some(state);
+            }
+        }
+    }
+    None
+}
+
+fn register_instance(state: &mut InstanceState) -> bool {
+    let adapter = state.adapter.cast::<c_void>();
+    for entry in &INSTANCE_REGISTRY {
+        if entry
+            .adapter
+            .compare_exchange(
+                core::ptr::null_mut(),
+                adapter,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            entry.state.store(state, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
+fn unregister_instance(adapter: netadaptercx_sys::NETADAPTER) {
+    let adapter = adapter.cast::<c_void>();
+    for entry in &INSTANCE_REGISTRY {
+        if entry.adapter.load(Ordering::Acquire) == adapter {
+            entry.state.store(core::ptr::null_mut(), Ordering::Release);
+            entry.adapter.store(core::ptr::null_mut(), Ordering::Release);
+        }
+    }
+}
+
+unsafe fn instance_from_io_queue(queue: WDFQUEUE) -> Option<*mut InstanceState> {
+    let device = unsafe {
+        call_unsafe_wdf_function_binding!(WdfIoQueueGetDevice, queue)
+    };
+    unsafe { instance_from_device(device) }
+}
+
+unsafe fn instance_from_work_item(work_item: WDFWORKITEM) -> Option<*mut InstanceState> {
+    for entry in &INSTANCE_STATES {
+        let state = entry.load(Ordering::Acquire);
+        if !state.is_null()
+            && (unsafe { (*state).read_work_item == work_item }
+                || unsafe { (*state).write_work_item == work_item })
+        {
+            return Some(state);
+        }
+    }
+    None
+}
+
+unsafe fn instance_from_packet_queue(
+    queue: netadaptercx_sys::NETPACKETQUEUE,
+) -> Option<*mut InstanceState> {
+    let context = unsafe {
+        object_context::<QueueContext>(
+            queue.cast(),
+            &raw const QUEUE_CONTEXT_TYPE_INFO,
+        )
+    };
+    if context.is_null() || unsafe { (*context).instance.is_null() } {
+        None
+    } else {
+        Some(unsafe { (*context).instance })
+    }
+}
 
 /// Required WDF driver entry point.
 ///
@@ -266,9 +487,7 @@ pub unsafe extern "system" fn driver_entry(
     if status != STATUS_SUCCESS {
         status
     } else {
-        let status = create_control_device(wdf_driver);
-        debug_status(b"CreateControlDevice", status);
-        status
+        STATUS_SUCCESS
     }
 }
 
@@ -278,13 +497,23 @@ pub unsafe extern "system" fn driver_entry(
 /// implementation slice; the device is deliberately not exposed as a
 /// functional data path until those callbacks are complete.
 extern "C" fn evt_driver_device_add(
-    _driver: WDFDRIVER,
+    driver: WDFDRIVER,
     device_init: *mut WDFDEVICE_INIT,
 ) -> NTSTATUS {
-    if PNP_DEVICE_ADDED.swap(true, Ordering::AcqRel) {
-        debug_status(b"EvtDriverDeviceAdd duplicate", STATUS_DEVICE_BUSY);
+    let Some(instance_id) = reserve_instance_id() else {
+        debug_status(b"EvtDriverDeviceAdd instance limit", STATUS_DEVICE_BUSY);
         return STATUS_DEVICE_BUSY;
+    };
+    let state = allocate_instance_state(instance_id);
+    if state.is_null() {
+        release_instance_id(instance_id);
+        debug_status(
+            b"EvtDriverDeviceAdd state allocation",
+            STATUS_INSUFFICIENT_RESOURCES,
+        );
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
+    INSTANCE_STATES[instance_id - 1].store(state, Ordering::Release);
 
     debug_marker(b"EvtDriverDeviceAdd enter");
     let status = unsafe {
@@ -294,7 +523,9 @@ extern "C" fn evt_driver_device_add(
     };
     debug_status(b"NetDeviceInitConfig", status);
     if status != STATUS_SUCCESS {
-        PNP_DEVICE_ADDED.store(false, Ordering::Release);
+        INSTANCE_STATES[instance_id - 1].store(core::ptr::null_mut(), Ordering::Release);
+        release_instance_id(instance_id);
+        unsafe { drop(Box::from_raw(state)); }
         return status;
     }
 
@@ -334,27 +565,64 @@ extern "C" fn evt_driver_device_add(
 
     let mut pnp_init = device_init;
     let mut _pnp_device: WDFDEVICE = core::ptr::null_mut();
+    let mut device_attributes = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        EvtCleanupCallback: Some(evt_instance_context_destroy),
+        // Mirror WDF_OBJECT_ATTRIBUTES_INIT; Rust's Default leaves these invalid.
+        ExecutionLevel:
+            wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ContextTypeInfo: &raw const DEVICE_CONTEXT_TYPE_INFO,
+        ..WDF_OBJECT_ATTRIBUTES::default()
+    };
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreate,
             &mut pnp_init,
-            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut device_attributes,
             &mut _pnp_device,
         )
     };
     debug_status(b"WdfDeviceCreate", status);
     if status != STATUS_SUCCESS {
-        PNP_DEVICE_ADDED.store(false, Ordering::Release);
+        INSTANCE_STATES[instance_id - 1].store(core::ptr::null_mut(), Ordering::Release);
+        release_instance_id(instance_id);
+        unsafe { drop(Box::from_raw(state)); }
+        return status;
+    }
+    let device_context = unsafe {
+        object_context::<DeviceContext>(
+            _pnp_device.cast(),
+            &raw const DEVICE_CONTEXT_TYPE_INFO,
+        )
+    };
+    if device_context.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, _pnp_device.cast());
+            INSTANCE_STATES[instance_id - 1].store(core::ptr::null_mut(), Ordering::Release);
+            release_instance_id(instance_id);
+            drop(Box::from_raw(state));
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    unsafe {
+        (*device_context).instance = state;
+    }
+    unsafe {
+        (*state).pnp_device = _pnp_device;
+    }
+
+    let status = create_control_device(driver, unsafe { &mut *state });
+    debug_status(b"CreateControlDevice", status);
+    if status != STATUS_SUCCESS {
         return status;
     }
 
     // SAFETY: The WDF device has been created and this callback runs at
     // PASSIVE_LEVEL during device addition.
-    let status = unsafe { create_adapter(_pnp_device) };
+    let status = unsafe { create_adapter(_pnp_device, &mut *state) };
     debug_status(b"CreateAdapter", status);
-    if status != STATUS_SUCCESS {
-        PNP_DEVICE_ADDED.store(false, Ordering::Release);
-    }
     status
 }
 
@@ -378,7 +646,7 @@ unsafe fn net_call_device_init_config(device_init: *mut WDFDEVICE_INIT) -> NTSTA
     unsafe { function(netadaptercx_sys::NetDriverGlobals, device_init) }
 }
 
-unsafe fn create_adapter(device: WDFDEVICE) -> NTSTATUS {
+unsafe fn create_adapter(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
     let allocate: unsafe extern "system" fn(
         netadaptercx_sys::PNET_DRIVER_GLOBALS,
         WDFDEVICE,
@@ -421,7 +689,7 @@ unsafe fn create_adapter(device: WDFDEVICE) -> NTSTATUS {
     ) -> NTSTATUS =
         unsafe { net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterCreateTableIndex as usize) };
     let mut adapter = core::ptr::null_mut();
-    // SAFETY: The adapter-init object is consumed by NetAdapterCreate.
+    // SAFETY: The adapter-init object is valid for one NetAdapterCreate call.
     let status = unsafe {
         create(
             netadaptercx_sys::NetDriverGlobals,
@@ -431,25 +699,30 @@ unsafe fn create_adapter(device: WDFDEVICE) -> NTSTATUS {
         )
     };
     debug_status(b"NetAdapterCreate", status);
-    if status == STATUS_SUCCESS {
-        configure_adapter_link_state(adapter);
-        unsafe {
-            ADAPTER = adapter;
-        }
-    } else {
-        let free: unsafe extern "system" fn(
-            netadaptercx_sys::PNET_DRIVER_GLOBALS,
-            *mut netadaptercx_sys::NETADAPTER_INIT,
-        ) = unsafe {
-            net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterInitFreeTableIndex as usize)
-        };
-        // SAFETY: AdapterCreate did not consume the failed init object.
-        unsafe { free(netadaptercx_sys::NetDriverGlobals, adapter_init) };
+    let free: unsafe extern "system" fn(
+        netadaptercx_sys::PNET_DRIVER_GLOBALS,
+        *mut netadaptercx_sys::NETADAPTER_INIT,
+    ) = unsafe {
+        net_function(netadaptercx_sys::_NETFUNCENUM_NetAdapterInitFreeTableIndex as usize)
+    };
+    // SAFETY: NetAdapterInitFree releases every successful allocation after its
+    // NetAdapterCreate attempt, including a successful creation.
+    unsafe { free(netadaptercx_sys::NetDriverGlobals, adapter_init) };
+    if status != STATUS_SUCCESS {
+        return status;
     }
-    status
+
+    state.adapter = adapter;
+    if !register_instance(state) {
+        return STATUS_DEVICE_BUSY;
+    }
+    STATUS_SUCCESS
 }
 
-fn configure_adapter_link_state(adapter: netadaptercx_sys::NETADAPTER) {
+fn configure_adapter_link_state(
+    adapter: netadaptercx_sys::NETADAPTER,
+    instance_id: usize,
+) {
     let mut link_layer = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES {
         Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES>()
             as ULONG,
@@ -487,8 +760,8 @@ fn configure_adapter_link_state(adapter: netadaptercx_sys::NETADAPTER) {
     let address = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS {
         Length: 6,
         Address: [
-            0x02, 0x57, 0x54, 0x41, 0x50, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x02, 0x57, 0x54, 0x41, 0x50, instance_id as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ],
     };
     let set_permanent: unsafe extern "system" fn(
@@ -540,26 +813,24 @@ fn configure_adapter_link_state(adapter: netadaptercx_sys::NETADAPTER) {
 }
 
 extern "C" fn evt_create_tx_queue(
-    _adapter: netadaptercx_sys::NETADAPTER,
+    adapter: netadaptercx_sys::NETADAPTER,
     queue_init: *mut netadaptercx_sys::NETTXQUEUE_INIT,
 ) -> NTSTATUS {
-    create_packet_queue(
-        queue_init.cast(),
-        true,
-    )
+    create_packet_queue(adapter, queue_init.cast(), true)
 }
 
 extern "C" fn evt_create_rx_queue(
-    _adapter: netadaptercx_sys::NETADAPTER,
+    adapter: netadaptercx_sys::NETADAPTER,
     queue_init: *mut netadaptercx_sys::NETRXQUEUE_INIT,
 ) -> NTSTATUS {
-    create_packet_queue(
-        queue_init.cast(),
-        false,
-    )
+    create_packet_queue(adapter, queue_init.cast(), false)
 }
 
-fn create_packet_queue(queue_init: *mut c_void, is_transmit: bool) -> NTSTATUS {
+fn create_packet_queue(
+    adapter: netadaptercx_sys::NETADAPTER,
+    queue_init: *mut c_void,
+    is_transmit: bool,
+) -> NTSTATUS {
     debug_marker(if is_transmit {
         b"NetTxQueueCreate enter"
     } else {
@@ -614,6 +885,23 @@ fn create_packet_queue(queue_init: *mut c_void, is_transmit: bool) -> NTSTATUS {
         status,
     );
     if status == STATUS_SUCCESS {
+        let state = match unsafe { instance_from_adapter(adapter) } {
+            Some(state) => state,
+            None => return STATUS_DEVICE_NOT_READY,
+        };
+        let queue_context = unsafe {
+            object_context::<QueueContext>(
+                packet_queue.cast(),
+                &raw const QUEUE_CONTEXT_TYPE_INFO,
+            )
+        };
+        if queue_context.is_null() {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        unsafe {
+            (*queue_context).is_transmit = is_transmit;
+            (*queue_context).instance = state;
+        }
         let get_rings: unsafe extern "system" fn(
             netadaptercx_sys::PNET_DRIVER_GLOBALS,
             netadaptercx_sys::NETPACKETQUEUE,
@@ -652,60 +940,76 @@ fn create_packet_queue(queue_init: *mut c_void, is_transmit: bool) -> NTSTATUS {
                 &mut extension,
             );
         }
-        unsafe {
-            if is_transmit {
-                TX_QUEUE = packet_queue;
-                TX_RINGS = rings;
-                TX_FRAGMENT_EXTENSION = extension;
-            } else {
-                RX_QUEUE = packet_queue;
-                RX_RINGS = rings;
-                RX_FRAGMENT_EXTENSION = extension;
-            }
+        // Queue-ring discovery is a PASSIVE_LEVEL NetAdapterCx operation.
+        // InstanceStateGuard owns a WDF spin lock and therefore cannot cover it.
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        let state = &mut *state_guard;
+        if is_transmit {
+            state.tx_queue = packet_queue;
+            state.tx_rings = rings;
+            state.tx_fragment_extension = extension;
+        } else {
+            state.rx_queue = packet_queue;
+            state.rx_rings = rings;
+            state.rx_fragment_extension = extension;
         }
     }
     status
 }
 
 extern "C" fn evt_packet_queue_start(queue: netadaptercx_sys::NETPACKETQUEUE) {
-    let (tx_queue, rx_queue) = unsafe { (TX_QUEUE, RX_QUEUE) };
-    if queue == tx_queue {
-        TX_QUEUE_STARTED.store(true, Ordering::Release);
-    } else if queue == rx_queue {
-        RX_QUEUE_STARTED.store(true, Ordering::Release);
+    if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let state = &mut *state_guard;
+        if queue == state.tx_queue {
+            state.tx_queue_started.store(true, Ordering::Release);
+        } else if queue == state.rx_queue {
+            state.rx_queue_started.store(true, Ordering::Release);
+        }
     }
 }
 
 extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
-    let (tx_queue, rx_queue) = unsafe { (TX_QUEUE, RX_QUEUE) };
-    if queue == tx_queue {
-        TX_QUEUE_STARTED.store(false, Ordering::Release);
-    } else if queue == rx_queue {
-        RX_QUEUE_STARTED.store(false, Ordering::Release);
+    if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let state = &mut *state_guard;
+        if queue == state.tx_queue {
+            state.tx_queue_started.store(false, Ordering::Release);
+        } else if queue == state.rx_queue {
+            state.rx_queue_started.store(false, Ordering::Release);
+        }
     }
 }
 
 extern "C" fn evt_packet_queue_advance(queue: netadaptercx_sys::NETPACKETQUEUE) {
-    let (tx_queue, rx_queue, tx_rings, rx_rings, tx_extension, rx_extension) = unsafe {
-        (
-            TX_QUEUE,
-            RX_QUEUE,
-            TX_RINGS,
-            RX_RINGS,
-            TX_FRAGMENT_EXTENSION,
-            RX_FRAGMENT_EXTENSION,
-        )
+    let Some(state) = (unsafe { instance_from_packet_queue(queue) }) else {
+        return;
     };
-    if queue == rx_queue && !rx_rings.is_null() {
-        inject_receive_frames(queue, rx_rings, &rx_extension);
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return;
+    };
+    let state = &mut *state_guard;
+    let rx_rings = state.rx_rings;
+    let rx_extension = state.rx_fragment_extension;
+    if queue == state.rx_queue && !rx_rings.is_null() {
+        inject_receive_frames(state, queue, rx_rings, &rx_extension);
     }
-    if queue != tx_queue || tx_rings.is_null() {
+    if queue != state.tx_queue || state.tx_rings.is_null() {
         return;
     }
-    capture_transmit_packets(tx_rings, &tx_extension);
+    let tx_rings = state.tx_rings;
+    let tx_extension = state.tx_fragment_extension;
+    capture_transmit_packets(state, tx_rings, &tx_extension);
 }
 
 fn inject_receive_frames(
+    state: &mut InstanceState,
     queue: netadaptercx_sys::NETPACKETQUEUE,
     rings: *const netadaptercx_sys::NET_RING_COLLECTION,
     extension: &netadaptercx_sys::NET_EXTENSION,
@@ -735,41 +1039,41 @@ fn inject_receive_frames(
             break;
         }
 
-        let frame = match dequeue_frame() {
+        let frame = match dequeue_frame(state) {
             Some(frame) => frame,
             None => break,
         };
         let packet = match unsafe { packet_at(packet_ring, packet_begin) } {
             Some(packet) => unsafe { &mut *packet },
             None => {
-                let _ = enqueue_existing_frame(frame);
+                let _ = enqueue_existing_frame(state, frame);
                 break;
             }
         };
         let fragment = match unsafe { fragment_at(fragment_ring, fragment_begin) } {
             Some(fragment) => unsafe { &mut *fragment },
             None => {
-                let _ = enqueue_existing_frame(frame);
+                let _ = enqueue_existing_frame(state, frame);
                 break;
             }
         };
         let address = match unsafe { fragment_virtual_address(extension, fragment_begin) } {
             Some(address) => unsafe { &*address },
             None => {
-                let _ = enqueue_existing_frame(frame);
+                let _ = enqueue_existing_frame(state, frame);
                 break;
             }
         };
         let mut total_length = 0usize;
         if !validate_fragment(fragment, address, &mut total_length) {
-            let _ = enqueue_existing_frame(frame);
+            let _ = enqueue_existing_frame(state, frame);
             break;
         }
         let frame_length = frame.as_bytes().len();
         let offset = fragment.Offset() as usize;
         let capacity = fragment.Capacity() as usize;
         if frame_length > capacity.saturating_sub(offset) {
-            let _ = enqueue_existing_frame(frame);
+            let _ = enqueue_existing_frame(state, frame);
             break;
         }
 
@@ -803,7 +1107,7 @@ fn inject_receive_frames(
         injected += 1;
     }
 
-    if injected != 0 && RX_NOTIFICATION_ENABLED.load(Ordering::Acquire) {
+    if injected != 0 && state.rx_notification_armed.swap(false, Ordering::AcqRel) {
         let notify: unsafe extern "system" fn(
             netadaptercx_sys::PNET_DRIVER_GLOBALS,
             netadaptercx_sys::NETPACKETQUEUE,
@@ -820,6 +1124,7 @@ fn inject_receive_frames(
 }
 
 fn capture_transmit_packets(
+    state: &mut InstanceState,
     rings: *const netadaptercx_sys::NET_RING_COLLECTION,
     extension: &netadaptercx_sys::NET_EXTENSION,
 ) {
@@ -892,33 +1197,37 @@ fn capture_transmit_packets(
             break;
         }
 
-        let mut bytes = Vec::with_capacity(total_length);
-        fragment_index = fragment_begin;
-        for _ in 0..fragment_count {
-            let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
-                Some(fragment) => unsafe { &*fragment },
-                None => return,
-            };
-            let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
-                Some(address) => unsafe { &*address },
-                None => return,
-            };
-            let start = unsafe {
-                (address.VirtualAddress as *const u8).add(fragment.Offset() as usize)
-            };
-            let length = fragment.ValidLength() as usize;
-            let data = unsafe { core::slice::from_raw_parts(start, length) };
-            bytes.extend_from_slice(data);
-            fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
-                Some(index) => index,
-                None => return,
-            };
-        }
-
-        if let Ok(frame) = Frame::from_bytes(&bytes) {
-            if enqueue_existing_frame(frame).is_ok() {
-                captured = true;
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(total_length).is_ok() {
+            fragment_index = fragment_begin;
+            for _ in 0..fragment_count {
+                let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
+                    Some(fragment) => unsafe { &*fragment },
+                    None => return,
+                };
+                let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
+                    Some(address) => unsafe { &*address },
+                    None => return,
+                };
+                let start = unsafe {
+                    (address.VirtualAddress as *const u8).add(fragment.Offset() as usize)
+                };
+                let length = fragment.ValidLength() as usize;
+                let data = unsafe { core::slice::from_raw_parts(start, length) };
+                bytes.extend_from_slice(data);
+                fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
+                    Some(index) => index,
+                    None => return,
+                };
             }
+
+            if let Ok(frame) = Frame::from_vec(bytes) {
+                if enqueue_existing_frame(state, frame).is_ok() {
+                    captured = true;
+                }
+            }
+        } else {
+            debug_status(b"Tx capture allocation", STATUS_INSUFFICIENT_RESOURCES);
         }
 
         let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
@@ -938,7 +1247,7 @@ fn capture_transmit_packets(
     }
 
     if captured {
-        enqueue_work_item(unsafe { READ_WORK_ITEM });
+        enqueue_work_item(state.read_work_item);
     }
 }
 
@@ -967,27 +1276,38 @@ extern "C" fn evt_packet_queue_set_notification_enabled(
     queue: netadaptercx_sys::NETPACKETQUEUE,
     enabled: wdk_sys::BOOLEAN,
 ) {
-    let rx_queue = unsafe { RX_QUEUE };
-    if queue == rx_queue {
-        RX_NOTIFICATION_ENABLED.store(enabled != 0, Ordering::Release);
-        if enabled != 0 {
-            let (rings, extension) = unsafe { (RX_RINGS, RX_FRAGMENT_EXTENSION) };
-            if !rings.is_null() {
-                inject_receive_frames(queue, rings, &extension);
+    if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let state = &mut *state_guard;
+        if queue == state.rx_queue {
+            state.rx_notification_armed.store(enabled != 0, Ordering::Release);
+            if enabled != 0 {
+                let rx_rings = state.rx_rings;
+                let rx_extension = state.rx_fragment_extension;
+                if !rx_rings.is_null() {
+                    inject_receive_frames(state, queue, rx_rings, &rx_extension);
+                }
             }
         }
     }
 }
 
 extern "C" fn evt_packet_queue_cancel(queue: netadaptercx_sys::NETPACKETQUEUE) {
-    let (rings, is_receive) = unsafe {
-        if queue == TX_QUEUE {
-            (TX_RINGS, false)
-        } else if queue == RX_QUEUE {
-            (RX_RINGS, true)
-        } else {
-            return;
-        }
+    let Some(state) = (unsafe { instance_from_packet_queue(queue) }) else {
+        return;
+    };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return;
+    };
+    let state = &mut *state_guard;
+    let (rings, is_receive) = if queue == state.tx_queue {
+        (state.tx_rings, false)
+    } else if queue == state.rx_queue {
+        (state.rx_rings, true)
+    } else {
+        return;
     };
 
     if rings.is_null() {
@@ -1007,12 +1327,12 @@ extern "C" fn evt_packet_queue_cancel(queue: netadaptercx_sys::NETPACKETQUEUE) {
     }
 
     if is_receive {
-        RX_NOTIFICATION_ENABLED.store(false, Ordering::Release);
+        state.rx_notification_armed.store(false, Ordering::Release);
     }
 }
 
 extern "C" fn evt_set_receive_filter(
-    _adapter: netadaptercx_sys::NETADAPTER,
+    adapter: netadaptercx_sys::NETADAPTER,
     receive_filter: netadaptercx_sys::NETRECEIVEFILTER,
 ) {
     let get_packet_filter: unsafe extern "system" fn(
@@ -1059,7 +1379,13 @@ extern "C" fn evt_set_receive_filter(
         };
         if address_list.is_null() {
             debug_status(b"ReceiveFilter multicast list", STATUS_INVALID_BUFFER_SIZE);
-            update_receive_filter_state(packet_filters, &addresses[..0]);
+            if let Some(state) = unsafe { instance_from_adapter(adapter) } {
+                let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+                    return;
+                };
+                let state = &mut *state_guard;
+                update_receive_filter_state(state, packet_filters, &addresses[..0]);
+            }
             return;
         }
         for (index, address) in addresses.iter_mut().take(address_count).enumerate() {
@@ -1075,14 +1401,21 @@ extern "C" fn evt_set_receive_filter(
         }
     }
 
-    update_receive_filter_state(packet_filters, &addresses[..address_count]);
+    if let Some(state) = unsafe { instance_from_adapter(adapter) } {
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let state = &mut *state_guard;
+        update_receive_filter_state(state, packet_filters, &addresses[..address_count]);
+    }
 }
 
 fn update_receive_filter_state(
+    state: &mut InstanceState,
     packet_filters: netadaptercx_sys::_NET_PACKET_FILTER_FLAGS,
     multicast_addresses: &[[u8; ETHERNET_ADDRESS_LENGTH]],
 ) {
-    let lock = unsafe { FRAME_LOCK };
+    let lock = state.frame_lock;
     if lock.is_null() {
         debug_status(b"ReceiveFilter state lock", STATUS_DEVICE_NOT_READY);
         return;
@@ -1090,52 +1423,99 @@ fn update_receive_filter_state(
 
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        ACTIVE_PACKET_FILTERS = packet_filters;
-        ACTIVE_MULTICAST_ADDRESS_COUNT = multicast_addresses.len();
+        state.active_packet_filters = packet_filters;
+        state.active_multicast_address_count = multicast_addresses.len();
         for (index, address) in multicast_addresses.iter().enumerate() {
-            ACTIVE_MULTICAST_ADDRESSES[index] = *address;
+            state.active_multicast_addresses[index] = *address;
         }
         for index in multicast_addresses.len()..MAXIMUM_MULTICAST_ADDRESSES {
-            ACTIVE_MULTICAST_ADDRESSES[index] = [0; ETHERNET_ADDRESS_LENGTH];
+            state.active_multicast_addresses[index] = [0; ETHERNET_ADDRESS_LENGTH];
         }
         call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
     }
 }
 
-fn clear_receive_filter_state() {
-    update_receive_filter_state(0, &[]);
+fn clear_receive_filter_state(state: &mut InstanceState) {
+    update_receive_filter_state(state, 0, &[]);
 }
 
 unsafe extern "C" fn evt_device_d0_entry(
-    _device: WDFDEVICE,
+    device: WDFDEVICE,
     _previous_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
+    if let Some(state) = unsafe { instance_from_pnp_device(device) } {
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        let state = &mut *state_guard;
+        reopen_frame_queue(state);
+        state.lifecycle.store(INSTANCE_OPEN, Ordering::Release);
+    }
     STATUS_SUCCESS
 }
 
 unsafe extern "C" fn evt_device_d0_exit(
-    _device: WDFDEVICE,
+    device: WDFDEVICE,
     _target_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
+    if let Some(state) = unsafe { instance_from_pnp_device(device) } {
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        let (read_queue, write_queue) = {
+            let state = &mut *state_guard;
+            state.lifecycle.store(INSTANCE_SUSPENDED, Ordering::Release);
+            (state.read_queue, state.write_queue)
+        };
+        drop(state_guard);
+        purge_queue(read_queue);
+        purge_queue(write_queue);
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        let state = &mut *state_guard;
+        clear_frame_queue(state);
+        state.pending_reads.store(0, Ordering::Release);
+        state.pending_writes.store(0, Ordering::Release);
+    }
     STATUS_SUCCESS
 }
 
 extern "C" fn evt_device_prepare_hardware(
-    _device: WDFDEVICE,
+    device: WDFDEVICE,
     _resources_raw: WDFCMRESLIST,
     _resources_translated: WDFCMRESLIST,
 ) -> NTSTATUS {
-    let adapter = unsafe { ADAPTER };
+    let Some(state) = (unsafe { instance_from_pnp_device(device) }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    let (adapter, instance_id) = {
+        let state = &mut *state_guard;
+        state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
+        (state.adapter, state.instance_id)
+    };
+    drop(state_guard);
     if adapter.is_null() {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    configure_adapter_link_state(adapter, instance_id);
+
+    // Match NET_ADAPTER_TX_CAPABILITIES_INIT: this is a system-managed,
+    // non-DMA path with no fragment-count limit.
     let mut tx = netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES {
         Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES>() as ULONG,
+        MappingRequirement:
+            netadaptercx_sys::_NET_MEMORY_MAPPING_REQUIREMENT_NetMemoryMappingRequirementNone,
+        PayloadBackfill: 0,
+        MaximumNumberOfFragments: netadaptercx_sys::SIZE_T::MAX,
         FragmentBufferAlignment: 1,
-        MaximumNumberOfFragments: 1,
+        FragmentRingNumberOfElementsHint: 0,
         MaximumNumberOfQueues: 1,
-        ..netadaptercx_sys::NET_ADAPTER_TX_CAPABILITIES::default()
+        DmaCapabilities: core::ptr::null_mut(),
     };
     let mut rx = netadaptercx_sys::NET_ADAPTER_RX_CAPABILITIES {
         Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_RX_CAPABILITIES>() as ULONG,
@@ -1222,14 +1602,20 @@ extern "C" fn evt_device_prepare_hardware(
 }
 
 extern "C" fn evt_device_release_hardware(
-    _device: WDFDEVICE,
+    device: WDFDEVICE,
     _resources_translated: WDFCMRESLIST,
 ) -> NTSTATUS {
-    let adapter = unsafe {
-        let adapter = ADAPTER;
-        ADAPTER = core::ptr::null_mut();
-        adapter
+    let Some(state) = (unsafe { instance_from_pnp_device(device) }) else {
+        return STATUS_DEVICE_NOT_READY;
     };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    let (adapter, read_queue, write_queue) = {
+        let state = &mut *state_guard;
+        (state.adapter, state.read_queue, state.write_queue)
+    };
+    drop(state_guard);
     if !adapter.is_null() {
         let stop: unsafe extern "system" fn(
             netadaptercx_sys::PNET_DRIVER_GLOBALS,
@@ -1242,35 +1628,33 @@ extern "C" fn evt_device_release_hardware(
         unsafe { stop(netadaptercx_sys::NetDriverGlobals, adapter) };
     }
 
-    purge_queue(unsafe { READ_QUEUE });
-    purge_queue(unsafe { WRITE_QUEUE });
-    clear_frame_queue();
-    clear_receive_filter_state();
-    PENDING_READS.store(0, Ordering::Release);
-    PENDING_WRITES.store(0, Ordering::Release);
-    unsafe {
-        TX_QUEUE = core::ptr::null_mut();
-        RX_QUEUE = core::ptr::null_mut();
-        TX_RINGS = core::ptr::null();
-        RX_RINGS = core::ptr::null();
-        TX_FRAGMENT_EXTENSION = netadaptercx_sys::NET_EXTENSION {
-            Reserved: [core::ptr::null_mut(); 4],
-            __bindgen_anon_1: netadaptercx_sys::_NET_EXTENSION__bindgen_ty_1 { Enabled: 0 },
-        };
-        RX_FRAGMENT_EXTENSION = netadaptercx_sys::NET_EXTENSION {
-            Reserved: [core::ptr::null_mut(); 4],
-            __bindgen_anon_1: netadaptercx_sys::_NET_EXTENSION__bindgen_ty_1 { Enabled: 0 },
-        };
-    }
-    TX_QUEUE_STARTED.store(false, Ordering::Release);
-    RX_QUEUE_STARTED.store(false, Ordering::Release);
-    RX_NOTIFICATION_ENABLED.store(false, Ordering::Release);
-    PNP_DEVICE_ADDED.store(false, Ordering::Release);
+    purge_queue(read_queue);
+    purge_queue(write_queue);
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    let state = &mut *state_guard;
+    clear_frame_queue(state);
+    clear_receive_filter_state(state);
+    state.pending_reads.store(0, Ordering::Release);
+    state.pending_writes.store(0, Ordering::Release);
+    state.tx_queue = core::ptr::null_mut();
+    state.rx_queue = core::ptr::null_mut();
+    state.tx_rings = core::ptr::null();
+    state.rx_rings = core::ptr::null();
+    state.tx_fragment_extension = netadaptercx_sys::NET_EXTENSION::default();
+    state.rx_fragment_extension = netadaptercx_sys::NET_EXTENSION::default();
+    state.tx_queue_started.store(false, Ordering::Release);
+    state.rx_queue_started.store(false, Ordering::Release);
+    state.rx_notification_armed.store(false, Ordering::Release);
+    unregister_instance(adapter);
+    state.adapter = core::ptr::null_mut();
+    state.lifecycle.store(INSTANCE_CLOSED, Ordering::Release);
 
     STATUS_SUCCESS
 }
 
-fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
+fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTATUS {
     let sddl = unicode_string(&CONTROL_SDDL);
     let mut control_init = unsafe {
         call_unsafe_wdf_function_binding!(
@@ -1307,7 +1691,8 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
         call_unsafe_wdf_function_binding!(WdfDeviceInitSetExclusive, control_init, 1);
     }
 
-    let device_name = unicode_string(&CONTROL_DEVICE_NAME);
+    let device_name_buffer = control_name(state.instance_id, false);
+    let device_name = unicode_string(&device_name_buffer);
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceInitAssignName,
@@ -1334,18 +1719,58 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
     };
     debug_status(b"WdfControlDeviceCreate", status);
     if status != STATUS_SUCCESS {
+        if !control_init.is_null() {
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfDeviceInitFree, control_init);
+            }
+        }
         return status;
     }
-
+    let frame_queue = match FrameQueue::try_new(FRAME_QUEUE_LIMIT) {
+        Ok(frame_queue) => frame_queue,
+        Err(_) => {
+            debug_status(b"FrameQueueCreate", STATUS_INSUFFICIENT_RESOURCES);
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+            }
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    };
+    let mut lock_attributes = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ParentObject: device.cast(),
+        ExecutionLevel:
+            wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ..WDF_OBJECT_ATTRIBUTES::default()
+    };
     let mut frame_lock: WDFSPINLOCK = core::ptr::null_mut();
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfSpinLockCreate,
-            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut lock_attributes,
             &mut frame_lock,
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return status;
+    }
+    let mut state_lock: WDFSPINLOCK = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfSpinLockCreate,
+            &mut lock_attributes,
+            &mut state_lock,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
 
@@ -1369,6 +1794,9 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
 
@@ -1396,8 +1824,12 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
+    state.read_work_item = read_work_item;
 
     let mut write_work_config = WDF_WORKITEM_CONFIG {
         Size: core::mem::size_of::<WDF_WORKITEM_CONFIG>() as ULONG,
@@ -1414,8 +1846,12 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
+    state.write_work_item = write_work_item;
 
     let mut read_queue_config = WDF_IO_QUEUE_CONFIG {
         Size: core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
@@ -1435,6 +1871,9 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
 
@@ -1456,10 +1895,14 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
 
-    let symbolic_link = unicode_string(&CONTROL_SYMBOLIC_LINK);
+    let symbolic_link_buffer = control_name(state.instance_id, true);
+    let symbolic_link = unicode_string(&symbolic_link_buffer);
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreateSymbolicLink,
@@ -1468,20 +1911,78 @@ fn create_control_device(driver: WDFDRIVER) -> NTSTATUS {
         )
     };
     if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
         return status;
     }
 
     unsafe {
         call_unsafe_wdf_function_binding!(WdfControlFinishInitializing, device);
-        CONTROL_DEVICE = device;
-        READ_QUEUE = read_queue;
-        WRITE_QUEUE = write_queue;
-        FRAME_LOCK = frame_lock;
-        FRAME_QUEUE = Some(FrameQueue::new(FRAME_QUEUE_LIMIT));
-        READ_WORK_ITEM = read_work_item;
-        WRITE_WORK_ITEM = write_work_item;
+        state.control_device = device;
+        state.read_queue = read_queue;
+        state.write_queue = write_queue;
+        state.frame_lock = frame_lock;
+        state.state_lock = state_lock;
+        state.frame_queue = Some(frame_queue);
+        state.read_work_item = read_work_item;
+        state.write_work_item = write_work_item;
     }
     STATUS_SUCCESS
+}
+
+unsafe extern "C" fn evt_instance_context_destroy(object: WDFOBJECT) {
+    let context = unsafe {
+        object_context::<DeviceContext>(
+            object,
+            &raw const DEVICE_CONTEXT_TYPE_INFO,
+        )
+    };
+    if !context.is_null() && unsafe { !(*context).instance.is_null() } {
+        let state = unsafe { (*context).instance };
+        unsafe { (*context).instance = core::ptr::null_mut(); }
+        let control_device = unsafe { (*state).control_device };
+        unsafe { (*state).control_device = core::ptr::null_mut(); }
+        if !control_device.is_null() {
+            // Control devices cannot use a PnP device as their WDF parent.
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, control_device.cast());
+            }
+        }
+        if !unsafe { (*state).adapter.is_null() } {
+            unsafe { unregister_instance((*state).adapter); }
+        }
+        INSTANCE_STATES[unsafe { (*state).instance_id } - 1]
+            .compare_exchange(
+                state,
+                core::ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok();
+        unsafe { release_instance_id((*state).instance_id); }
+        unsafe { drop(Box::from_raw(state)); }
+    }
+}
+
+fn control_name(instance_id: usize, symbolic: bool) -> [u16; 32] {
+    let prefix: &[u8] = if symbolic {
+        b"\\DosDevices\\Global\\WinTapRust"
+    } else {
+        b"\\Device\\WinTapRust"
+    };
+    let mut result = [0u16; 32];
+    let mut length = 0;
+    for byte in prefix {
+        result[length] = *byte as u16;
+        length += 1;
+    }
+    if instance_id > 1 {
+        result[length] = b'0' as u16 + instance_id as u16;
+        length += 1;
+    }
+    result[length] = 0;
+    result
 }
 
 extern "C" fn evt_file_create(
@@ -1496,22 +1997,78 @@ extern "C" fn evt_file_create(
 
 extern "C" fn evt_file_close(_file_object: WDFFILEOBJECT) {}
 
-extern "C" fn evt_file_cleanup(_file_object: WDFFILEOBJECT) {}
+extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
+    let device = unsafe {
+        call_unsafe_wdf_function_binding!(WdfFileObjectGetDevice, file_object)
+    };
+    if let Some(state) = unsafe { instance_from_device(device) } {
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let (was_suspended, read_queue, write_queue) = {
+            let state = &mut *state_guard;
+            let was_suspended =
+                state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
+            state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
+            (was_suspended, state.read_queue, state.write_queue)
+        };
+        drop(state_guard);
+        purge_queue(read_queue);
+        purge_queue(write_queue);
+        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        let state = &mut *state_guard;
+        clear_frame_queue(state);
+        state.pending_reads.store(0, Ordering::Release);
+        state.pending_writes.store(0, Ordering::Release);
+        if !state.adapter.is_null() && !was_suspended {
+            reopen_frame_queue(state);
+            state.lifecycle.store(INSTANCE_OPEN, Ordering::Release);
+        }
+    }
+}
 
 extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize) {
-    if !try_admit(&PENDING_READS, PENDING_READ_LIMIT) {
+    let Some(state) = (unsafe { instance_from_io_queue(_queue) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
+    let state = &mut *state_guard;
+    if state.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+    if !try_admit(&state.pending_reads, PENDING_READ_LIMIT) {
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
     }
-    let target = unsafe { READ_QUEUE };
+    let target = state.read_queue;
     if !forward_request(request, target) {
-        release_request(&PENDING_READS);
-    } else {
-        enqueue_work_item(unsafe { READ_WORK_ITEM });
+        release_request(&state.pending_reads);
+    } else if has_queued_frame(state) {
+        enqueue_work_item(state.read_work_item);
     }
 }
 
 extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize) {
+    let Some(state) = (unsafe { instance_from_io_queue(_queue) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
+    let state = &mut *state_guard;
+    if state.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
     if length == 0 {
         complete_request(request, STATUS_SUCCESS);
         return;
@@ -1520,25 +2077,34 @@ extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize)
         complete_request(request, STATUS_INVALID_PARAMETER);
         return;
     }
-    if !try_admit(&PENDING_WRITES, PENDING_WRITE_LIMIT) {
+    if !try_admit(&state.pending_writes, PENDING_WRITE_LIMIT) {
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
     }
-    let target = unsafe { WRITE_QUEUE };
+    let target = state.write_queue;
     if !forward_request(request, target) {
-        release_request(&PENDING_WRITES);
+        release_request(&state.pending_writes);
     } else {
-        enqueue_work_item(unsafe { WRITE_WORK_ITEM });
+        enqueue_work_item(state.write_work_item);
     }
 }
 
 extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: ULONG) {
-    let read_queue = unsafe { READ_QUEUE };
-    let write_queue = unsafe { WRITE_QUEUE };
+    let Some(state) = (unsafe { instance_from_io_queue(queue) }) else {
+        complete_request(request, STATUS_CANCELLED);
+        return;
+    };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        complete_request(request, STATUS_CANCELLED);
+        return;
+    };
+    let state = &mut *state_guard;
+    let read_queue = state.read_queue;
+    let write_queue = state.write_queue;
     if queue == read_queue {
-        release_request(&PENDING_READS);
+        release_request(&state.pending_reads);
     } else if queue == write_queue {
-        release_request(&PENDING_WRITES);
+        release_request(&state.pending_writes);
     }
     complete_request(request, STATUS_CANCELLED);
 }
@@ -1552,6 +2118,7 @@ fn forward_request(request: WDFREQUEST, target_queue: WDFQUEUE) -> bool {
     let status = unsafe {
         call_unsafe_wdf_function_binding!(WdfRequestForwardToIoQueue, request, target_queue)
     };
+    debug_status(b"WdfRequestForwardToIoQueue", status);
     if status != STATUS_SUCCESS {
         complete_request(request, status);
         return false;
@@ -1616,20 +2183,27 @@ fn enqueue_work_item(work_item: WDFWORKITEM) {
     }
 }
 
-extern "C" fn evt_write_drain_work_item(_work_item: WDFWORKITEM) {
+extern "C" fn evt_write_drain_work_item(work_item: WDFWORKITEM) {
+    let Some(state) = (unsafe { instance_from_work_item(work_item) }) else {
+        return;
+    };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return;
+    };
+    let state = &mut *state_guard;
     loop {
         let mut request = core::ptr::null_mut();
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfIoQueueRetrieveNextRequest,
-                WRITE_QUEUE,
+                state.write_queue,
                 &mut request,
             )
         };
         if status != STATUS_SUCCESS {
             return;
         }
-        release_request(&PENDING_WRITES);
+        release_request(&state.pending_writes);
 
         let mut input = core::ptr::null_mut::<c_void>();
         let mut input_length = 0usize;
@@ -1652,47 +2226,56 @@ extern "C" fn evt_write_drain_work_item(_work_item: WDFWORKITEM) {
         }
 
         let bytes = unsafe { core::slice::from_raw_parts(input.cast::<u8>(), input_length) };
-        match enqueue_frame(bytes) {
+        match enqueue_frame(state, bytes) {
             Ok(()) => {
                 complete_request_with_information(request, STATUS_SUCCESS, input_length);
-                enqueue_work_item(unsafe { READ_WORK_ITEM });
+                enqueue_work_item(state.read_work_item);
             }
             Err(QueueError::Full) => complete_request(request, STATUS_DEVICE_BUSY),
             Err(QueueError::Closed) => complete_request(request, STATUS_DEVICE_NOT_READY),
             Err(QueueError::InvalidFrameLength) => {
                 complete_request(request, STATUS_INVALID_BUFFER_SIZE)
             }
+            Err(QueueError::InsufficientResources) => {
+                complete_request(request, STATUS_INSUFFICIENT_RESOURCES)
+            }
         }
     }
 }
 
-extern "C" fn evt_read_completion_work_item(_work_item: WDFWORKITEM) {
+extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
+    let Some(state) = (unsafe { instance_from_work_item(work_item) }) else {
+        return;
+    };
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return;
+    };
+    let state = &mut *state_guard;
     loop {
         let mut request = core::ptr::null_mut();
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfIoQueueRetrieveNextRequest,
-                READ_QUEUE,
+                state.read_queue,
                 &mut request,
             )
         };
         if status != STATUS_SUCCESS {
             return;
         }
-        release_request(&PENDING_READS);
-
-        let frame = match dequeue_frame() {
+        let frame = match dequeue_frame(state) {
             Some(frame) => frame,
             None => {
-                let target = unsafe { READ_QUEUE };
+                let target = state.read_queue;
                 if forward_request(request, target) {
-                    PENDING_READS.fetch_add(1, Ordering::AcqRel);
+                    return;
                 } else {
-                    complete_request(request, STATUS_DEVICE_NOT_READY);
+                    release_request(&state.pending_reads);
                 }
                 return;
             }
         };
+        release_request(&state.pending_reads);
 
         let mut output = core::ptr::null_mut::<c_void>();
         let mut output_length = 0usize;
@@ -1706,7 +2289,7 @@ extern "C" fn evt_read_completion_work_item(_work_item: WDFWORKITEM) {
             )
         };
         if status != STATUS_SUCCESS {
-            let _ = enqueue_existing_frame(frame);
+            let _ = enqueue_existing_frame(state, frame);
             complete_request(request, status);
             continue;
         }
@@ -1721,15 +2304,16 @@ extern "C" fn evt_read_completion_work_item(_work_item: WDFWORKITEM) {
     }
 }
 
-fn enqueue_frame(bytes: &[u8]) -> Result<(), QueueError> {
+fn enqueue_frame(state: &mut InstanceState, bytes: &[u8]) -> Result<(), QueueError> {
     let frame = Frame::from_bytes(bytes)?;
-    let lock = unsafe { FRAME_LOCK };
+    let lock = state.frame_lock;
     if lock.is_null() {
         return Err(QueueError::Closed);
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let result = (*core::ptr::addr_of_mut!(FRAME_QUEUE))
+        let result = state
+            .frame_queue
             .as_mut()
             .ok_or(QueueError::Closed)
             .and_then(|queue| queue.enqueue(frame));
@@ -1738,14 +2322,15 @@ fn enqueue_frame(bytes: &[u8]) -> Result<(), QueueError> {
     }
 }
 
-fn enqueue_existing_frame(frame: Frame) -> Result<(), QueueError> {
-    let lock = unsafe { FRAME_LOCK };
+fn enqueue_existing_frame(state: &mut InstanceState, frame: Frame) -> Result<(), QueueError> {
+    let lock = state.frame_lock;
     if lock.is_null() {
         return Err(QueueError::Closed);
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let result = (*core::ptr::addr_of_mut!(FRAME_QUEUE))
+        let result = state
+            .frame_queue
             .as_mut()
             .ok_or(QueueError::Closed)
             .and_then(|queue| queue.enqueue(frame));
@@ -1754,14 +2339,15 @@ fn enqueue_existing_frame(frame: Frame) -> Result<(), QueueError> {
     }
 }
 
-fn dequeue_frame() -> Option<Frame> {
-    let lock = unsafe { FRAME_LOCK };
+fn dequeue_frame(state: &mut InstanceState) -> Option<Frame> {
+    let lock = state.frame_lock;
     if lock.is_null() {
         return None;
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let frame = (*core::ptr::addr_of_mut!(FRAME_QUEUE))
+        let frame = state
+            .frame_queue
             .as_mut()
             .and_then(FrameQueue::dequeue);
         call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
@@ -1769,23 +2355,62 @@ fn dequeue_frame() -> Option<Frame> {
     }
 }
 
-fn clear_frame_queue() {
-    let lock = unsafe { FRAME_LOCK };
+fn has_queued_frame(state: &mut InstanceState) -> bool {
+    let lock = state.frame_lock;
+    if lock.is_null() {
+        return false;
+    }
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
+        let has_frame = state
+            .frame_queue
+            .as_ref()
+            .is_some_and(|queue| !queue.is_empty());
+        call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+        has_frame
+    }
+}
+
+fn clear_frame_queue(state: &mut InstanceState) {
+    let lock = state.frame_lock;
     if !lock.is_null() {
         unsafe {
             call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-            if let Some(queue) = (*core::ptr::addr_of_mut!(FRAME_QUEUE)).as_mut() {
+            if let Some(queue) = state.frame_queue.as_mut() {
                 queue.close();
             }
             call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
         }
     }
 }
+
+fn reopen_frame_queue(state: &mut InstanceState) {
+    let lock = state.frame_lock;
+    if !lock.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
+            if let Some(queue) = state.frame_queue.as_mut() {
+                queue.reopen();
+            }
+            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+        }
+    }
+}
+
 fn unicode_string(buffer: &[u16]) -> UNICODE_STRING {
-    let byte_length = (buffer.len() - 1) * core::mem::size_of::<u16>();
+    let length = buffer
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(buffer.len());
+    let byte_length = length * core::mem::size_of::<u16>();
+    let maximum_length = if length < buffer.len() {
+        byte_length + core::mem::size_of::<u16>()
+    } else {
+        byte_length
+    };
     UNICODE_STRING {
         Length: byte_length as u16,
-        MaximumLength: (byte_length + core::mem::size_of::<u16>()) as u16,
+        MaximumLength: maximum_length as u16,
         Buffer: buffer.as_ptr() as *mut u16,
     }
 }

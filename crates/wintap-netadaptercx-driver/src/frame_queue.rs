@@ -10,6 +10,7 @@ pub enum QueueError {
     InvalidFrameLength,
     Full,
     Closed,
+    InsufficientResources,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,9 +30,20 @@ impl Frame {
             return Err(QueueError::InvalidFrameLength);
         }
 
-        Ok(Self {
-            data: data.to_vec(),
-        })
+        let mut copied = Vec::new();
+        copied
+            .try_reserve_exact(data.len())
+            .map_err(|_| QueueError::InsufficientResources)?;
+        copied.extend_from_slice(data);
+        Self::from_vec(copied)
+    }
+
+    pub fn from_vec(data: Vec<u8>) -> Result<Self, QueueError> {
+        if !(FRAME_MINIMUM..=FRAME_MAXIMUM).contains(&data.len()) {
+            return Err(QueueError::InvalidFrameLength);
+        }
+
+        Ok(Self { data })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -46,12 +58,17 @@ pub struct FrameQueue {
 }
 
 impl FrameQueue {
-    pub fn new(limit: usize) -> Self {
-        Self {
-            frames: VecDeque::with_capacity(limit),
+    pub fn try_new(limit: usize) -> Result<Self, QueueError> {
+        let mut frames = VecDeque::new();
+        frames
+            .try_reserve_exact(limit)
+            .map_err(|_| QueueError::InsufficientResources)?;
+
+        Ok(Self {
+            frames,
             limit,
             state: QueueState::Open,
-        }
+        })
     }
 
     pub fn enqueue(&mut self, frame: Frame) -> Result<(), QueueError> {
@@ -79,6 +96,11 @@ impl FrameQueue {
     pub fn close(&mut self) {
         self.frames.clear();
         self.state = QueueState::Closed;
+    }
+
+    pub fn reopen(&mut self) {
+        self.frames.clear();
+        self.state = QueueState::Open;
     }
 
     pub fn len(&self) -> usize {
@@ -118,7 +140,7 @@ mod tests {
 
     #[test]
     fn enforces_limit_and_preserves_fifo_ownership() {
-        let mut queue = FrameQueue::new(1);
+        let mut queue = FrameQueue::try_new(1).unwrap();
         queue.enqueue(frame()).unwrap();
         assert_eq!(queue.enqueue(frame()), Err(QueueError::Full));
         assert_eq!(queue.len(), 1);
@@ -128,7 +150,7 @@ mod tests {
 
     #[test]
     fn closing_rejects_new_frames_and_releases_queued_frames() {
-        let mut queue = FrameQueue::new(2);
+        let mut queue = FrameQueue::try_new(2).unwrap();
         queue.enqueue(frame()).unwrap();
         queue.begin_close();
         assert_eq!(queue.state(), QueueState::Closing);
@@ -136,5 +158,19 @@ mod tests {
         queue.close();
         assert_eq!(queue.state(), QueueState::Closed);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn reopen_discards_stale_frames_and_accepts_new_frames() {
+        let mut queue = FrameQueue::try_new(2).unwrap();
+        queue.enqueue(frame()).unwrap();
+        queue.close();
+
+        queue.reopen();
+
+        assert_eq!(queue.state(), QueueState::Open);
+        assert!(queue.is_empty());
+        queue.enqueue(frame()).unwrap();
+        assert_eq!(queue.len(), 1);
     }
 }
