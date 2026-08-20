@@ -45,6 +45,21 @@ publishes the open lifecycle state.
   direction, no primary failure, no cleanup error, no reflected injection,
   and no remaining test adapter.
 
+The approved two-TAP switch change adds the `wintap-switch-core` library and
+the Windows `wintap-switch` executable. The core provides collection-oriented
+endpoint identities, MAC/VLAN learning with a fixed 4,096-entry forwarding
+database, peer-only forwarding, bounded buffer-slot generations, and explicit
+I/O-ring version selection. The executable opens the two existing control
+endpoints exclusively, probes and creates the contiguous v3 I/O-ring path,
+registers handles and buffers, relays completions, and drains cancellation
+before teardown. Dynamic PnP provisioning, arbitrary-N forwarding, and v4
+scatter/gather remain deferred pending dedicated validation.
+
+Switch verification completed: five core unit tests passed via direct
+`rustc --test`; both switch crates passed `cargo check` and the executable
+linked successfully; the startup path explicitly fails when the static TAP
+endpoint is unavailable; and specification artifact validation passed.
+
 ## Deferred evidence
 
 - The harness requires an elevated administrator session and test signing for

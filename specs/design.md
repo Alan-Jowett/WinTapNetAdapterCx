@@ -14,6 +14,9 @@
 - Queues are bounded and use cancellation-aware backpressure.
 - Every asynchronous operation has one terminal completion and one owner at
   every transition.
+- The first switch release opens exactly the two existing static adapter
+  endpoints; endpoint handling is collection-oriented so future dynamic
+  devices can be added without changing completion ownership.
 - Protocol tests exercise the existing Ethernet/TAP boundary and do not add
   an IP/TUN mode or test-only driver path.
 
@@ -527,6 +530,75 @@ added the driver-store package, it removes the recorded published INF after
 both devices are gone. It captures adapter, address, route, neighbor,
 firewall, PnP, service, driver-event, command, and packet diagnostics on every
 failure path.
+
+## Two-TAP user-mode switch design
+
+The switch is a privileged user-mode component above the existing TAP control
+devices. It does not add a driver-internal peer link, change the driver packet
+contract, or provision PnP devices. The first release constructs an endpoint
+collection containing exactly `\\.\WinTapRust` and `\\.\WinTapRust2`, maps each
+endpoint to its stable adapter identity, and opens both handles exclusively.
+Endpoint selection is represented by endpoint identity rather than by a
+hard-coded destination branch so a future dynamic provisioning effort can
+extend the collection without changing slot ownership rules.
+
+### Forwarding database and frame policy
+
+The switch maintains a bounded 4,096-entry table keyed by source MAC address
+and VLAN identifier. A learned entry records the endpoint on which the source
+was observed. Learning occurs before destination resolution; an observation
+on the other endpoint immediately replaces the prior endpoint. Existing
+entries are retained when the table is full, and entries do not age in the
+first release.
+
+Known unicast is sent to the learned destination endpoint. Unknown unicast,
+broadcast, and multicast are sent to every eligible endpoint other than the
+source endpoint. With the two-endpoint first-release collection, each flood
+has one recipient. A frame whose destination resolves to its source endpoint
+is not written. Frame validation, VLAN parsing, and forwarding decisions run
+before a write is built; malformed or unsupported frames fail or are recorded
+according to the switch validation contract and are never forwarded.
+
+### I/O-ring resources and completion state
+
+Before creating the data plane, the switch calls `QueryIoRingCapabilities` and
+`IsIoRingOpSupported` for the required read and write operations. It records
+the maximum supported version and creates the newest usable ring that meets
+the required contiguous read/write contract. Version-3 operations are the
+initial baseline. Version-4 scatter/gather operations are selected only when
+runtime probes and dedicated validation confirm support; otherwise the switch
+continues with the validated contiguous path. If required read/write support
+is absent, startup fails explicitly.
+
+The switch registers both handles and a fixed pool of 1514-byte buffers. Read
+depth, write depth, registered buffer count, and FDB capacity are finite
+configuration values. Each buffer slot has the states `Free`,
+`ReadPending`, `Dispatching`, `WritePending`, and `Free`, with a generation
+counter incremented on reuse. Completion `userData` contains endpoint, slot,
+and generation. A source slot remains unavailable for repost until its read
+and every peer write using that slot have terminal completions.
+
+Shutdown, endpoint removal, and cancellation stop new reads, submit operation
+cancellation, drain each original completion, and only then deregister buffers
+and handles or close the ring. A completion with an unknown endpoint, slot, or
+generation is rejected as stale and cannot release a current slot. No
+completion path may free a buffer before all operations referencing it have
+terminated.
+
+### Switch lifecycle and synchronization
+
+The switch lifecycle is `Created -> Probing -> Open -> Running -> Draining ->
+Closed`. Capability failure transitions to `Closed` without publishing a
+partially initialized data plane. Endpoint close, device removal, owner close,
+and process shutdown all enter `Draining`, prevent new reads and writes, and
+preserve the original failure while reporting cleanup failures separately.
+
+The endpoint collection, FDB, slot states, and pending-operation counters use
+one documented lock order. Completion callbacks do not reacquire a lock that
+they already hold, and notification/submission calls that may reenter the
+completion path occur outside the state lock. User buffers and ring resources
+are accessed only at permitted user-mode execution contexts; all completion
+and cancellation paths are idempotent.
 
 ## Execution-environment design
 

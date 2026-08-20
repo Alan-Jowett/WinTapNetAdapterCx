@@ -80,6 +80,14 @@ network state, and only a driver-store package added by that run.
 It runs 257 IPv4/IPv6 relay iterations by default; use `-RelayIterations` to
 select a bounded alternative.
 
+## Two-TAP switch core
+
+The `wintap-switch-core` crate implements the first-release switch contract
+above the two existing control endpoints. It provides collection-oriented
+endpoint identities, MAC/VLAN learning with a bounded 4,096-entry FDB,
+peer-only forwarding decisions, and generation-protected bounded buffer-slot
+state. Dynamic PnP provisioning and arbitrary-N forwarding remain deferred.
+
 ## Intended platform
 
 - Windows 10 and later

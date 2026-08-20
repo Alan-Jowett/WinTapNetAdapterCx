@@ -28,6 +28,13 @@ for specification audit
   defect without changing the public Win32 read/write contract.
 - Reconcile the permanent-neighbor relay policy by validating and suppressing
   ARP and IPv6 Neighbor Discovery instead of forwarding control traffic.
+- Define a first-release user-mode two-TAP switch using the two existing
+  statically defined adapters.
+- Require bounded I/O-ring operation with explicit startup failure when the
+  required runtime capabilities are unavailable.
+- Preserve an endpoint abstraction that can accommodate future dynamically
+  provisioned devices without implementing dynamic provisioning in this
+  change.
 - Do not modify C source, headers, INF files, project files, tests, generated
   artifacts, or build configuration during discovery.
 
@@ -411,6 +418,85 @@ only in queue cancellation. Notification remains edge-triggered across
 owner-only cleanup, and teardown cannot leak, duplicate, or misdirect a
 frame.
 
+### REQ-017 — Two-TAP user-mode switch
+
+**Before:** The repository specifies a routed dual-adapter relay harness, but
+does not define a forwarding-database or user-mode switch contract.
+
+**After:** The project shall define a privileged user-mode process that
+exclusively opens the two existing WinTap TAP control endpoints, learns source
+MAC/VLAN locations, and forwards valid Ethernet frames according to this
+policy:
+
+1. Known unicast traffic is forwarded to the learned destination endpoint.
+2. Unknown unicast, broadcast, and multicast traffic is flooded to the other
+   endpoint.
+3. A source observed on the other endpoint immediately moves the learned
+   entry.
+4. The forwarding database has 4,096 entries, does not age entries in the
+   first release, and preserves existing entries when full.
+5. A frame is never forwarded to the endpoint from which it was read.
+
+**Trace:** User-provided switch-feasibility argument; `tap-switch-feasibility.md`
+Decision and Forwarding behavior; extends REQ-002, REQ-003, REQ-005, REQ-006,
+and REQ-015.
+
+**Invariant impact:** Forwarding state and pending work remain bounded. Each
+frame has one forwarding decision and one user-mode ownership path at every
+transition. Source-endpoint exclusion prevents reflection.
+
+### REQ-018 — Bounded I/O-ring data plane
+
+**Before:** The repository has overlapped-I/O relay evidence but no I/O-ring
+contract or runtime capability policy.
+
+**After:** The switch shall probe I/O-ring capabilities before starting its
+data plane, require supported read and write operations, use a bounded
+registered buffer pool and bounded read/write depth, and encode endpoint,
+buffer slot, and generation in every completion. The initial path shall use
+ordinary contiguous version-3 operations. Version-4 scatter/gather is
+optional and may be enabled only after runtime support and operation
+validation. If the required I/O-ring capability is unavailable, switch
+startup shall fail explicitly; the existing overlapped relay is not a fallback
+for this change.
+
+The switch shall repost a read only after its source read and all writes using
+that buffer have terminal completions. On cancellation, removal, or shutdown,
+it shall stop posting reads, cancel outstanding operations, consume original
+completions, and only then deregister buffers and handles or close the ring.
+Generation values shall prevent stale completions from being associated with a
+recycled slot.
+
+**Trace:** User-provided switch-feasibility argument; `tap-switch-feasibility.md`
+I/O-ring design, versioning, compatibility, and risks; extends REQ-002,
+REQ-003, REQ-004, and REQ-006.
+
+**Invariant impact:** No user buffer is reused while an operation can still
+reference it. Cancellation and teardown preserve completion and resource
+release ordering. Read depth, write depth, registered buffers, and completion
+state are finite.
+
+### REQ-019 — Forward-compatible endpoint abstraction
+
+**Before:** Current identities and relay behavior are explicitly two-adapter
+and fixed-name oriented.
+
+**After:** The switch-facing contract shall represent endpoints as a
+collection with stable per-endpoint identity and peer-selection semantics,
+while the first release supplies exactly the two existing statically defined
+adapters. This change shall not provision or manage additional devices, but
+its forwarding and lifecycle interfaces shall not encode a hard two-endpoint
+assumption beyond the first-release flood policy. Dynamic PnP provisioning,
+stable arbitrary-instance identity, and forwarding to more than one recipient
+are deferred to a separate future change.
+
+**Trace:** User-provided switch-feasibility argument; `tap-switch-feasibility.md`
+current constraints; `multi-adapter.md` proposal; extends REQ-012 and REQ-015.
+
+**Invariant impact:** Endpoint identity is independent of buffer-slot reuse.
+Future endpoint addition must not invalidate ownership, teardown, or
+completion-generation rules for existing endpoints.
+
 ## Scope boundaries
 
 - **In scope:** A NetAdapterCx software Ethernet adapter and a TAP-style
@@ -423,6 +509,9 @@ frame.
 - **In scope:** A dedicated dual-adapter IPv4/IPv6 TAP relay harness, its
   DevCon-based test provisioning, route/neighbor/firewall setup, diagnostics,
   cleanup, and hosted/VM execution.
+- **In scope:** The first-release user-mode two-TAP switch data-plane
+  contract, forwarding database, bounded I/O-ring lifecycle, and validation
+  using the two existing static adapter identities.
 - **In scope:** Rust kernel-mode driver behavior, generated NetAdapterCx FFI,
   safe wrapper boundaries, Rust-specific panic and build configuration, and
   ABI/layout validation.
@@ -432,7 +521,8 @@ frame.
   from the initial milestone), protocol-specific
   user-mode libraries, packet capture beyond the virtual adapter contract,
   driver-internal peer linking, bridging/NAT/routing policy, and production
-  signing/distribution services.
+  signing/distribution services, dynamic adapter provisioning, arbitrary-N
+  forwarding, and an overlapped-I/O fallback for the switch.
 
 ## Open questions requiring user decisions
 
@@ -468,8 +558,15 @@ frame.
 17. **Resolved:** REQ-015 runs in hosted CI and a manual Hyper-V/WinDbg VM.
 18. **Resolved:** REQ-015 removes a driver-store package only if that test run
     added it.
+19. **Resolved:** The first switch release uses exactly the two existing
+    statically defined adapters.
+20. **Resolved:** Missing required I/O-ring runtime capabilities fail switch
+    startup; overlapped I/O is not a switch fallback.
+21. **Resolved:** Endpoint handling is collection-oriented for future dynamic
+    devices, but dynamic provisioning and arbitrary-N forwarding are deferred.
 
 ## Discovery gate
 
-CHG-031 requirements discovery is complete. Phase 3 remains blocked until the
-requirements, design, and validation patches are approved together.
+The switch requirements change is complete for specification review. Phase 3
+remains blocked until the requirements, design, and validation patches are
+approved together.
