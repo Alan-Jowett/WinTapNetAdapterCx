@@ -71,6 +71,7 @@ const STATUS_DEVICE_NOT_READY: NTSTATUS = 0xC000_00A3_u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as i32;
 const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000_000D_u32 as i32;
 const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206_u32 as i32;
+const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023_u32 as i32;
 const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as i32;
 const INSTANCE_OPEN: u8 = 0;
 const INSTANCE_SUSPENDED: u8 = 1;
@@ -1000,18 +1001,25 @@ extern "C" fn evt_packet_queue_advance(queue: netadaptercx_sys::NETPACKETQUEUE) 
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return;
     };
-    let state = &mut *state_guard;
-    let rx_rings = state.rx_rings;
-    let rx_extension = state.rx_fragment_extension;
-    if queue == state.rx_queue && !rx_rings.is_null() {
-        inject_receive_frames(state, rx_rings, &rx_extension);
+    let (is_transmit, tx_rings, tx_extension, read_queue, read_work_item) = {
+        let state_ref = &mut *state_guard;
+        let rx_rings = state_ref.rx_rings;
+        let rx_extension = state_ref.rx_fragment_extension;
+        if queue == state_ref.rx_queue && !rx_rings.is_null() {
+            inject_receive_frames(state_ref, rx_rings, &rx_extension);
+        }
+        (
+            queue == state_ref.tx_queue && !state_ref.tx_rings.is_null(),
+            state_ref.tx_rings,
+            state_ref.tx_fragment_extension,
+            state_ref.read_queue,
+            state_ref.read_work_item,
+        )
+    };
+    drop(state_guard);
+    if is_transmit {
+        capture_transmit_packets(state, read_queue, read_work_item, tx_rings, &tx_extension);
     }
-    if queue != state.tx_queue || state.tx_rings.is_null() {
-        return;
-    }
-    let tx_rings = state.tx_rings;
-    let tx_extension = state.tx_fragment_extension;
-    capture_transmit_packets(state, tx_rings, &tx_extension);
 }
 
 fn inject_receive_frames(
@@ -1119,7 +1127,9 @@ fn inject_receive_frames(
 }
 
 fn capture_transmit_packets(
-    state: &mut InstanceState,
+    state: *mut InstanceState,
+    read_queue: WDFQUEUE,
+    read_work_item: WDFWORKITEM,
     rings: *const netadaptercx_sys::NET_RING_COLLECTION,
     extension: &netadaptercx_sys::NET_EXTENSION,
 ) {
@@ -1199,6 +1209,33 @@ fn capture_transmit_packets(
             break;
         }
 
+        if at_passive_level()
+            && deliver_transmit_packet_to_read(
+                state,
+                read_queue,
+                fragment_ring,
+                extension,
+                fragment_begin,
+                fragment_count,
+                total_length,
+            )
+        {
+            let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
+                Some(index) => index,
+                None => break,
+            };
+            let next_fragment =
+                match unsafe { advance_index(&*fragment_ring, fragment_begin, fragment_count) } {
+                    Some(index) => index,
+                    None => break,
+                };
+            unsafe {
+                (*packet_ring).BeginIndex = next_packet;
+                (*fragment_ring).BeginIndex = next_fragment;
+            }
+            continue;
+        }
+
         let mut bytes = Vec::new();
         if bytes.try_reserve_exact(total_length).is_ok() {
             fragment_index = fragment_begin;
@@ -1224,7 +1261,7 @@ fn capture_transmit_packets(
             }
 
             if let Ok(frame) = Frame::from_vec(bytes) {
-                if enqueue_existing_capture_frame(state, frame).is_ok() {
+                if unsafe { enqueue_existing_capture_frame(&mut *state, frame) }.is_ok() {
                     captured = true;
                 }
             }
@@ -1248,8 +1285,91 @@ fn capture_transmit_packets(
     }
 
     if captured {
-        enqueue_work_item(state.read_work_item);
+        enqueue_work_item(read_work_item);
     }
+}
+
+fn at_passive_level() -> bool {
+    unsafe { wdk_sys::ntddk::KeGetCurrentIrql() == 0 }
+}
+
+fn deliver_transmit_packet_to_read(
+    state: *mut InstanceState,
+    read_queue: WDFQUEUE,
+    fragment_ring: *mut netadaptercx_sys::NET_RING,
+    extension: &netadaptercx_sys::NET_EXTENSION,
+    fragment_begin: u32,
+    fragment_count: u32,
+    total_length: usize,
+) -> bool {
+    let mut request = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(WdfIoQueueRetrieveNextRequest, read_queue, &mut request,)
+    };
+    if status != STATUS_SUCCESS {
+        return false;
+    }
+
+    unsafe {
+        release_request(&(*state).pending_reads);
+    }
+
+    let mut output = core::ptr::null_mut::<c_void>();
+    let mut output_length = 0usize;
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestRetrieveOutputBuffer,
+            request,
+            total_length,
+            &mut output,
+            &mut output_length,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        complete_request(request, status);
+        return false;
+    }
+    if output_length < total_length {
+        complete_request(request, STATUS_BUFFER_TOO_SMALL);
+        return false;
+    }
+
+    let mut fragment_index = fragment_begin;
+    let mut output_offset = 0usize;
+    for _ in 0..fragment_count {
+        let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
+            Some(fragment) => unsafe { &*fragment },
+            None => {
+                complete_request(request, STATUS_DEVICE_NOT_READY);
+                return false;
+            }
+        };
+        let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
+            Some(address) => unsafe { &*address },
+            None => {
+                complete_request(request, STATUS_DEVICE_NOT_READY);
+                return false;
+            }
+        };
+        let length = fragment.ValidLength() as usize;
+        let source =
+            unsafe { (address.VirtualAddress as *const u8).add(fragment.Offset() as usize) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(source, output.cast::<u8>().add(output_offset), length);
+        }
+        output_offset += length;
+        fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
+            Some(index) => index,
+            None => {
+                complete_request(request, STATUS_DEVICE_NOT_READY);
+                return false;
+            }
+        };
+    }
+
+    debug_assert!(output_offset == total_length);
+    complete_request_with_information(request, STATUS_SUCCESS, output_offset);
+    true
 }
 
 fn validate_fragment(

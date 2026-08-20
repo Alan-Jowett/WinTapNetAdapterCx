@@ -232,6 +232,37 @@ No separate NetAdapter pause/restart callback API was found in the installed
 headers, so pause/restart remains deferred rather than being represented by
 an invented callback.
 
+### TX capture and READ delivery
+
+TX capture shall preserve the NetAdapterCx ring ownership contract. A packet
+callback owns entries in `[BeginIndex, EndIndex)` and must finish any
+inspection and data copy before advancing `BeginIndex`. It shall not leave
+framework-owned entries indefinitely pending while waiting for a user READ
+IRP, because doing so can exhaust the TX ring and stall the networking stack.
+
+When the TX packet callback is executing at `PASSIVE_LEVEL`, it may match a
+compatible pending READ IRP, retrieve the output buffer, copy the complete
+frame directly from the framework TX fragment(s), complete the request, and
+then return the framework-owned entries. The callback must release any
+adapter/state lock before calling WDF routines that may access request
+buffers or complete requests.
+
+When the callback executes above `PASSIVE_LEVEL`, it must not access a user
+buffer or complete a request requiring user-buffer processing. It shall copy
+the frame into nonpaged driver-owned storage, advance the framework ring, and
+use the existing passive-level work item to drain captured frames into
+pending READ IRPs. A READ callback may opportunistically drain an already
+queued capture frame at passive level, but it shall not inspect or mutate TX
+ring indices.
+
+If no compatible READ IRP is available, the captured frame enters the bounded
+`capture_queue`. If the capture queue is full, the driver shall apply the
+documented deterministic backpressure/error behavior without retaining the
+framework TX entry indefinitely. If a pending READ output buffer is too
+small, the request completes with `STATUS_BUFFER_TOO_SMALL`; the driver
+stages the frame in `capture_queue`, advances the framework ring, and leaves
+the frame available for a later compatible read.
+
 ## Queue state and backpressure
 
 The design shall maintain separate bounded queues for:
@@ -271,9 +302,10 @@ registered, or supported by the I/O-ring API shall fail explicitly rather than
 being clamped or wrapped.
 
 Packet callbacks only manipulate nonpaged driver-owned state and schedule
-passive work for packet-driven user-buffer access and request completion. The
-inline write callback performs its verified capture and request completion at
-its own WDF execution level. RX ring mutation is confined to
+passive work for packet-driven user-buffer access and request completion,
+except for the explicitly permitted passive-level direct READ delivery.
+The inline write callback performs its verified capture and request completion
+at its own WDF execution level. RX ring mutation is confined to
 `EVT_PACKET_QUEUE_ADVANCE` for indication and `EVT_PACKET_QUEUE_CANCEL` for
 return; a notification callback may only arm/disarm notification and request
 a subsequent advance.
@@ -304,6 +336,9 @@ ring-capacity and cancellation boundary.
   callback can still access it.
 - Adapter teardown shall wait for an executing inline write callback before
   closing the injection queue, destroying its lock, or releasing adapter state.
+- Adapter teardown shall also wait for direct passive-level READ delivery and
+  passive capture-drain work before releasing pending requests, capture
+  frames, or packet-ring state.
 
 ## IRQL and pageability
 
@@ -316,6 +351,10 @@ ring-capacity and cancellation boundary.
 - The write callback's execution-level and allocation contract shall be
   verified before the adapter is published; unsupported inline requirements
   shall fail initialization explicitly.
+- The TX capture callback shall branch on its actual execution IRQL. Only a
+  passive-level callback may retrieve READ output buffers or complete a read
+  through direct delivery; elevated-level callbacks shall use nonpaged
+  capture and passive deferred completion.
 - The implementation shall use SAL annotations and verifier-friendly lock
   discipline for every public callback and asynchronous completion path.
 

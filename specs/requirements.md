@@ -35,6 +35,9 @@ changes are being delivered
 - Remove the artificial 256-slot pending-I/O limit while retaining an even,
   shared total depth across both endpoints and explicit resource-limit
   failures.
+- Deliver captured TX frames directly to pending READ IRPs when packet
+  callback execution is at passive level, while retaining deferred delivery
+  for elevated-IRQL callbacks.
 - Preserve an endpoint abstraction that can accommodate future dynamically
   provisioned devices without implementing dynamic provisioning in this
   change.
@@ -565,6 +568,40 @@ closure, cancellation, or notification reentrancy. A request is completed
 only after its frame has been safely captured or rejected, and no user buffer
 or request may remain reachable after completion.
 
+### REQ-024 — IRQL-aware inline TAP read delivery
+
+**Before:** Captured TX frames are always copied into a driver-owned
+`Frame`, placed in `capture_queue`, and delivered to pending READ IRPs by a
+passive-level WDF work item.
+
+**After:** When the TX packet callback executes at `PASSIVE_LEVEL` and a
+compatible pending READ IRP is available, the driver shall validate and copy
+the captured frame directly from the NetAdapterCx TX fragment(s) into the
+IRP output buffer before returning the framework-owned ring entries. When the
+callback executes above `PASSIVE_LEVEL`, or when no compatible READ IRP is
+available, the driver shall preserve the frame in nonpaged driver-owned
+storage, return the framework-owned ring entries, and complete the READ IRP
+from a passive-level drain path.
+
+The implementation shall not manipulate NetAdapterCx ring ownership from the
+WDF read callback or another context outside the packet callback contract.
+It shall not leave framework-owned TX entries indefinitely pending solely
+because no READ IRP is currently available. A bounded capture queue remains
+the backpressure boundary.
+
+**Trace:** User request to deliver directly when possible while retaining a
+work-item fallback for elevated IRQL; extends REQ-002, REQ-003, REQ-006,
+REQ-016, and REQ-021.
+
+**Invariant impact:** Direct delivery must occur before the packet ring
+entries are returned and only at an IRQL that permits WDF output-buffer
+access and request completion. Elevated-IRQL callbacks must never access
+user buffers. A too-small output buffer shall be completed with
+`STATUS_BUFFER_TOO_SMALL`; the frame shall then be staged in the bounded
+capture queue and the packet ring entry returned rather than held pending.
+Request cancellation, queue exhaustion, callback reentrancy, adapter stop,
+and owner teardown must retain exactly-once completion and frame ownership.
+
 ## Scope boundaries
 
 - **In scope:** A NetAdapterCx software Ethernet adapter and a TAP-style
@@ -585,6 +622,9 @@ or request may remain reachable after completion.
   ABI/layout validation.
 - **In scope:** Removing the C/C++ implementation and publishing an
   unambiguous Rust-only driver package.
+- **In scope:** Opportunistic passive-level direct delivery from NetAdapterCx
+  TX fragments to pending READ IRPs, with bounded nonpaged capture and
+  passive deferred completion when direct delivery is unavailable.
 - **Out of scope unless explicitly added:** IP/TUN mode (decision: excluded
   from the initial milestone), protocol-specific
   user-mode libraries, packet capture beyond the virtual adapter contract,
@@ -639,9 +679,14 @@ or request may remain reachable after completion.
 23. **Resolved:** Valid TAP writes are captured and completed inline by the
     passive WDF I/O callback; no write manual queue or write work item is
     required.
+24. **Resolved:** Captured TX frames are delivered directly to pending READ
+    IRPs only when the packet callback runs at `PASSIVE_LEVEL`; elevated-IRQL
+    callbacks use bounded nonpaged capture followed by passive deferred
+    completion, and TX ring entries are not held indefinitely waiting for a
+    read.
 
 ## Specification approval gate
 
-REQ-020 and REQ-021 were propagated to the requirements, design, and
-validation specifications and explicitly approved before implementation. The
-package is now carried forward as part of the implementation deliverable.
+REQ-020, REQ-021, and REQ-024 were propagated to the requirements, design,
+and validation specifications and explicitly approved before implementation.
+The package is now carried forward as part of the implementation deliverable.
