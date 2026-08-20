@@ -263,6 +263,8 @@ pub enum SlotError {
     NotFree,
     StaleCompletion,
     InvalidTransition,
+    GenerationExhausted,
+    AllocationFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,15 +279,22 @@ pub struct BufferPool {
 
 impl BufferPool {
     pub fn new(count: usize) -> Self {
-        Self {
-            slots: vec![
-                BufferSlot {
-                    generation: 0,
-                    state: SlotState::Free
-                };
-                count
-            ],
-        }
+        Self::try_new(count).expect("buffer pool allocation failed")
+    }
+
+    pub fn try_new(count: usize) -> Result<Self, SlotError> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(count)
+            .map_err(|_| SlotError::AllocationFailed)?;
+        slots.resize(
+            count,
+            BufferSlot {
+                generation: 0,
+                state: SlotState::Free,
+            },
+        );
+        Ok(Self { slots })
     }
 
     pub fn begin_read(&mut self, slot: usize) -> Result<SlotCompletion, SlotError> {
@@ -293,7 +302,11 @@ impl BufferPool {
         if slot_ref.state != SlotState::Free {
             return Err(SlotError::NotFree);
         }
-        slot_ref.generation = slot_ref.generation.wrapping_add(1);
+        slot_ref.generation = slot_ref
+            .generation
+            .checked_add(1)
+            .filter(|generation| *generation <= u32::MAX as u64)
+            .ok_or(SlotError::GenerationExhausted)?;
         slot_ref.state = SlotState::ReadPending;
         Ok(SlotCompletion {
             slot,
@@ -374,6 +387,14 @@ mod tests {
         frame[..6].copy_from_slice(&destination);
         frame[6..12].copy_from_slice(&source);
         frame
+    }
+
+    #[test]
+    fn rejects_generation_beyond_completion_identity_width() {
+        let mut pool = BufferPool::try_new(1).unwrap();
+        pool.slots[0].generation = u32::MAX as u64;
+
+        assert_eq!(pool.begin_read(0), Err(SlotError::GenerationExhausted));
     }
 
     #[test]
@@ -464,5 +485,17 @@ mod tests {
         let second = pool.begin_read(0).unwrap();
         assert_eq!(pool.begin_dispatch(first), Err(SlotError::StaleCompletion));
         pool.begin_dispatch(second).unwrap();
+    }
+
+    #[test]
+    fn buffer_pool_supports_slots_above_256() {
+        let mut pool = BufferPool::new(512);
+        let completion = pool.begin_read(511).unwrap();
+        pool.begin_dispatch(completion).unwrap();
+        pool.begin_writes(completion, 1).unwrap();
+        pool.complete_write(completion).unwrap();
+
+        let reused = pool.begin_read(511).unwrap();
+        assert!(reused.generation > completion.generation);
     }
 }

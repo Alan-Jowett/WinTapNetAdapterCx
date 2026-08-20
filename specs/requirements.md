@@ -1,9 +1,9 @@
 # WinTapNetAdapterCx Requirements
 
 **Workflow:** `/evolve`  
-**Phase:** Phase 2 — Specification Changes  
-**Status:** Baseline requirements approved; CHG-032 audit revision approved
-for specification audit
+**Phase:** Phase 8 — Create Deliverable
+**Status:** Specification package approved; implementation and validation
+changes are being delivered
 **Evidence scope:** `README.md`, repository layout, and user-provided project purpose
 
 ## Change manifest
@@ -32,6 +32,9 @@ for specification audit
   statically defined adapters.
 - Require bounded I/O-ring operation with explicit startup failure when the
   required runtime capabilities are unavailable.
+- Remove the artificial 256-slot pending-I/O limit while retaining an even,
+  shared total depth across both endpoints and explicit resource-limit
+  failures.
 - Preserve an endpoint abstraction that can accommodate future dynamically
   provisioned devices without implementing dynamic provisioning in this
   change.
@@ -497,6 +500,36 @@ current constraints; `multi-adapter.md` proposal; extends REQ-012 and REQ-015.
 Future endpoint addition must not invalidate ownership, teardown, or
 completion-generation rules for existing endpoints.
 
+### REQ-020 — Resource-bounded scalable pending I/O depth
+
+**Before:** The switch limits pending reads and writes to an application-level
+maximum of 256 operations because completion metadata reserves only 8 bits for
+the buffer slot. The configured depth is otherwise treated as separate
+per-endpoint capacity.
+
+**After:** The switch shall accept one positive, even total pending
+read/write-depth value shared across both endpoints. Each endpoint shall
+receive equal capacity, equal to half the configured total, and the
+completion identity representation shall support every allocated buffer slot
+without an artificial fixed maximum. The effective depth shall be limited
+only by representable sizes, checked arithmetic, available memory, I/O-ring
+API/resource limits, and successful registration of the required buffers and
+operations. Invalid values, overflow, allocation failure, unsupported API
+limits, and registration failure shall produce explicit startup errors; the
+switch shall not silently clamp, wrap, or fall back to a smaller depth.
+
+The existing two-endpoint behavior and teardown ordering remain unchanged:
+all operations referencing a slot must reach terminal completion before the
+slot or its registered buffer is reused or released.
+
+**Trace:** User request to increase the maximum pending reads/writes beyond
+256; Phase 1 discovery decision for one shared even total limited by available
+memory and runtime resources; extends REQ-018 and REQ-019.
+
+**Invariant impact:** Equal endpoint capacity is derived from one validated
+total. Completion identity remains unique for every live operation, and
+resource exhaustion fails before partial publication of the data plane.
+
 ## Scope boundaries
 
 - **In scope:** A NetAdapterCx software Ethernet adapter and a TAP-style
@@ -510,8 +543,8 @@ completion-generation rules for existing endpoints.
   DevCon-based test provisioning, route/neighbor/firewall setup, diagnostics,
   cleanup, and hosted/VM execution.
 - **In scope:** The first-release user-mode two-TAP switch data-plane
-  contract, forwarding database, bounded I/O-ring lifecycle, and validation
-  using the two existing static adapter identities.
+  contract, forwarding database, resource-bounded scalable I/O-ring lifecycle,
+  and validation using the two existing static adapter identities.
 - **In scope:** Rust kernel-mode driver behavior, generated NetAdapterCx FFI,
   safe wrapper boundaries, Rust-specific panic and build configuration, and
   ABI/layout validation.
@@ -564,9 +597,13 @@ completion-generation rules for existing endpoints.
     startup; overlapped I/O is not a switch fallback.
 21. **Resolved:** Endpoint handling is collection-oriented for future dynamic
     devices, but dynamic provisioning and arbitrary-N forwarding are deferred.
+22. **Resolved:** Pending reads and writes use one shared positive even total
+    depth across both endpoints, with equal per-endpoint capacity. There is no
+    artificial fixed maximum; available memory, checked arithmetic, and
+    I/O-ring resource limits determine the effective maximum.
 
-## Discovery gate
+## Specification approval gate
 
-The switch requirements change is complete for specification review. Phase 3
-remains blocked until the requirements, design, and validation patches are
-approved together.
+REQ-020 was propagated to the requirements, design, and validation
+specifications and explicitly approved before implementation. The package is
+now carried forward as part of the implementation deliverable.

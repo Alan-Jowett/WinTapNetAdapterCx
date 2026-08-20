@@ -1,8 +1,9 @@
 # WinTapNetAdapterCx Design Specification
 
 **Workflow:** `/evolve`  
-**Phase:** Phase 2 — Specification Changes  
-**Status:** CHG-032 audit revision approved for specification audit
+**Phase:** Phase 8 — Create Deliverable
+**Status:** Specification package approved; implementation and validation
+changes are being delivered
 **Trace source:** `specs/requirements.md`
 
 ## Design principles
@@ -244,11 +245,14 @@ independently. They may share a lock when all queue operations use the same
 lock order, but they shall remain separate queue objects and their fullness,
 close, reopen, dequeue, and teardown transitions shall not affect one another.
 
-The pending read and write queues each have a finite limit of 256 requests.
-Requests beyond the limit fail with an explicit busy status. Request counters
-are owned by the queue transition that marks a request pending and are
-decremented exactly once when the request is retrieved, cancelled, purged, or
-removed after a forwarding failure.
+The switch's pending read and write capacity is one validated positive even
+total configured value shared across both endpoints. Each endpoint receives
+half of that total capacity. Requests beyond the allocated capacity fail with
+an explicit busy/resource status. Request counters are owned by the queue
+transition that marks a request pending and are decremented exactly once when
+the request is retrieved, cancelled, purged, or removed after a forwarding
+failure. The implementation shall not impose an additional fixed maximum;
+allocation and arithmetic must be checked before resources are published.
 
 Each queue shall have explicit states: `OPEN`, `CLOSING`, and `CLOSED`.
 
@@ -258,8 +262,11 @@ Each queue shall have explicit states: `OPEN`, `CLOSING`, and `CLOSED`.
 - `CLOSED`: all queue references and requests are released; new work fails.
 
 When a frame queue is full, a request may wait only while the queue is `OPEN`.
-Waiting requests must be cancellable. Queue limits shall be finite and
-configuration shall reject zero, overflowed, or unsupported sizes.
+Waiting requests must be cancellable. Queue limits shall be finite for a given
+run and configuration shall reject zero, odd, overflowed, or unsupported
+sizes. A requested depth that cannot be represented, allocated, registered,
+or supported by the I/O-ring API shall fail explicitly rather than being
+clamped or wrapped.
 
 The implementation resumes blocked user writes from a passive WDF work item
 after RX ring capacity is consumed; this keeps request-buffer capture on a WDF
@@ -570,20 +577,32 @@ runtime probes and dedicated validation confirm support; otherwise the switch
 continues with the validated contiguous path. If required read/write support
 is absent, startup fails explicitly.
 
-The switch registers both handles and a fixed pool of 1514-byte buffers. Read
-depth, write depth, registered buffer count, and FDB capacity are finite
-configuration values. Each buffer slot has the states `Free`,
-`ReadPending`, `Dispatching`, `WritePending`, and `Free`, with a generation
-counter incremented on reuse. Completion `userData` contains endpoint, slot,
-and generation. A source slot remains unavailable for repost until its read
-and every peer write using that slot have terminal completions.
+The switch registers both handles and a pool of 1514-byte buffers sized from
+the validated shared total. The total is split equally between the two
+endpoints, with checked multiplication and allocation before ring
+registration. FDB capacity remains 4,096 entries. Each buffer slot has the
+states `Free`, `ReadPending`, `Dispatching`, `WritePending`, and `Free`, with a
+generation counter incremented on reuse. Completion `userData` uses bits
+0-30 for the slot, bits 31-62 for the generation, and bit 63 for cancellation.
+The endpoint is derived from the slot partition and the operation direction is
+retained with the active slot, so every live operation remains uniquely
+identified without truncation or collision. Encoding and decoding shall use
+checked operations and reject unknown or out-of-range values. A source slot
+remains unavailable for repost until its read and every peer write using that
+slot have terminal completions.
+
+Startup validates the positive even total, derives equal endpoint capacity,
+checks all size calculations, allocates the complete pool, configures ring
+depths, and registers every buffer before entering `Running`. Any failure
+unwinds all allocated resources and reports the primary error explicitly.
 
 Shutdown, endpoint removal, and cancellation stop new reads, submit operation
 cancellation, drain each original completion, and only then deregister buffers
-and handles or close the ring. A completion with an unknown endpoint, slot, or
-generation is rejected as stale and cannot release a current slot. No
-completion path may free a buffer before all operations referencing it have
-terminated.
+and handles or close the ring. A completion with an unknown slot, direction,
+or generation is rejected as stale and cannot release a current slot.
+Cancellation markers must identify the same live operation as normal
+completion metadata. No completion path may free a buffer before all
+operations referencing it have terminated.
 
 ### Switch lifecycle and synchronization
 

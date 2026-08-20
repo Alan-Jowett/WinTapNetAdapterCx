@@ -8,10 +8,11 @@ mod windows_runtime {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use wintap_switch_core::{
-        select_io_ring_version, BufferPool, EndpointId, ForwardingError, IoRingCapabilities,
-        IoRingVersion, Switch, FRAME_MAXIMUM,
+        BufferPool, EndpointId, FRAME_MAXIMUM, ForwardingError, IoRingCapabilities, IoRingVersion,
+        Switch, select_io_ring_version,
     };
 
     type Handle = *mut core::ffi::c_void;
@@ -35,11 +36,16 @@ mod windows_runtime {
     const FILE_WRITE_FLAG_NONE: Dword = 0;
     const CTRL_C_EVENT: Dword = 0;
     const CTRL_CLOSE_EVENT: Dword = 2;
-    const CANCEL_COMPLETION_MARKER: Ulonglong = 1_u64 << 62;
+    const CANCEL_COMPLETION_MARKER: Ulonglong = 1_u64 << 63;
     const COMPLETION_WAIT_MILLISECONDS: Dword = 100;
     const ENDPOINT_COUNT: usize = 2;
     const DEFAULT_READ_DEPTH: usize = 128;
-    const MAX_READ_DEPTH: usize = 256;
+    const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+    const SLOT_BITS: u32 = 31;
+    const GENERATION_SHIFT: u32 = SLOT_BITS;
+    const GENERATION_BITS: u32 = 32;
+    const SLOT_MASK: Ulonglong = (1_u64 << SLOT_BITS) - 1;
+    const GENERATION_MASK: Ulonglong = (1_u64 << GENERATION_BITS) - 1;
 
     #[repr(C)]
     struct RawIoRingCapabilities {
@@ -187,15 +193,110 @@ mod windows_runtime {
         }
     }
 
+    struct IoRingGuard(Handle);
+
+    impl Drop for IoRingGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseIoRing(self.0);
+            }
+        }
+    }
+
+    impl IoRingGuard {
+        fn into_inner(self) -> Handle {
+            let ring = self.0;
+            std::mem::forget(self);
+            ring
+        }
+    }
+
     struct Runtime {
         ring: Handle,
         endpoints: [Endpoint; 2],
-        buffers: Vec<Box<[u8; FRAME_MAXIMUM]>>,
+        buffers: Vec<Vec<u8>>,
         _registered_files: [Handle; 2],
         _registered_buffers: Vec<IoRingBufferInfo>,
         pool: BufferPool,
-        active: Vec<Option<(wintap_switch_core::SlotCompletion, Handle, Ulonglong)>>,
+        active: Vec<Option<(wintap_switch_core::SlotCompletion, Handle, Ulonglong, bool)>>,
         reads_per_endpoint: usize,
+        stats: RuntimeStats,
+    }
+
+    struct RuntimeStats {
+        enabled: bool,
+        started: Instant,
+        last_report: Instant,
+        wait_calls: u64,
+        signaled_wakes: u64,
+        batches: u64,
+        completions: u64,
+        reads: u64,
+        writes: u64,
+        max_batch: u64,
+    }
+
+    impl RuntimeStats {
+        fn new(enabled: bool) -> Self {
+            let now = Instant::now();
+            Self {
+                enabled,
+                started: now,
+                last_report: now,
+                wait_calls: 0,
+                signaled_wakes: 0,
+                batches: 0,
+                completions: 0,
+                reads: 0,
+                writes: 0,
+                max_batch: 0,
+            }
+        }
+
+        fn record_wait(&mut self, signaled: bool) {
+            self.wait_calls += 1;
+            if signaled {
+                self.signaled_wakes += 1;
+            }
+        }
+
+        fn record_batch(&mut self, reads: u64, writes: u64) {
+            let completions = reads + writes;
+            self.batches += 1;
+            self.completions += completions;
+            self.reads += reads;
+            self.writes += writes;
+            self.max_batch = self.max_batch.max(completions);
+            self.report(false);
+        }
+
+        fn report(&mut self, force: bool) {
+            if !self.enabled || (!force && self.last_report.elapsed() < STATS_REPORT_INTERVAL) {
+                return;
+            }
+            let elapsed = self.started.elapsed().as_secs_f64();
+            let average_batch = if self.batches == 0 {
+                0.0
+            } else {
+                self.completions as f64 / self.batches as f64
+            };
+            let average_reads_per_wake = if self.signaled_wakes == 0 {
+                0.0
+            } else {
+                self.reads as f64 / self.signaled_wakes as f64
+            };
+            eprintln!(
+                "io-ring stats: elapsed={elapsed:.1}s waits={} signaled_wakes={} batches={} completions={} reads={} writes={} avg_completions_per_batch={average_batch:.2} avg_reads_per_wake={average_reads_per_wake:.2} max_batch={}",
+                self.wait_calls,
+                self.signaled_wakes,
+                self.batches,
+                self.completions,
+                self.reads,
+                self.writes,
+                self.max_batch,
+            );
+            self.last_report = Instant::now();
+        }
     }
 
     impl Drop for Runtime {
@@ -207,15 +308,19 @@ mod windows_runtime {
     }
 
     impl Runtime {
-        fn start(read_depth: usize) -> Result<Self, String> {
-            if read_depth == 0 || read_depth > MAX_READ_DEPTH || read_depth % ENDPOINT_COUNT != 0 {
-                return Err(format!(
-                    "read depth must be an even value between 2 and {MAX_READ_DEPTH}"
-                ));
+        fn start(total_depth: usize, stats_enabled: bool) -> Result<Self, String> {
+            if total_depth == 0 || total_depth % ENDPOINT_COUNT != 0 {
+                return Err("read depth must be a positive even value".to_string());
             }
-            let reads_per_endpoint = read_depth / ENDPOINT_COUNT;
-            let queue_size =
-                Dword::try_from(read_depth).map_err(|_| "read depth is too large".to_string())?;
+            if total_depth > SLOT_MASK as usize + 1 {
+                return Err("read depth exceeds completion identity capacity".to_string());
+            }
+            let reads_per_endpoint = total_depth / ENDPOINT_COUNT;
+            let total_bytes = total_depth
+                .checked_mul(FRAME_MAXIMUM)
+                .ok_or_else(|| "read depth buffer-size calculation overflowed".to_string())?;
+            let queue_size = Dword::try_from(total_depth)
+                .map_err(|_| "read depth exceeds I/O-ring limits".to_string())?;
             let maximum_version = query_capabilities()?;
 
             let endpoints = [
@@ -237,57 +342,70 @@ mod windows_runtime {
                 unsafe { CreateIoRing(IORING_VERSION_3, flags, queue_size, queue_size, &mut ring) },
                 "CreateIoRing",
             )?;
+            let ring = IoRingGuard(ring);
             let capabilities = IoRingCapabilities {
                 maximum_version,
-                supports_read: unsafe { IsIoRingOpSupported(ring, IORING_OP_READ) != 0 },
-                supports_write: unsafe { IsIoRingOpSupported(ring, IORING_OP_WRITE) != 0 },
+                supports_read: unsafe { IsIoRingOpSupported(ring.0, IORING_OP_READ) != 0 },
+                supports_write: unsafe { IsIoRingOpSupported(ring.0, IORING_OP_WRITE) != 0 },
                 supports_read_scatter: false,
                 supports_write_gather: false,
             };
             let version = match select_io_ring_version(capabilities) {
                 Ok(version) => version,
                 Err(error) => {
-                    unsafe {
-                        CloseIoRing(ring);
-                    }
                     return Err(format!(
                         "required I/O-ring capability unavailable: {error:?}"
                     ));
                 }
             };
             if version != IoRingVersion::V3 {
-                unsafe {
-                    CloseIoRing(ring);
-                }
                 return Err("v4 scatter/gather requires dedicated validation".to_string());
             }
 
             let mut buffers = Vec::new();
             buffers
-                .try_reserve_exact(read_depth)
+                .try_reserve_exact(total_depth)
                 .map_err(|_| "buffer pool allocation failed".to_string())?;
-            for _ in 0..read_depth {
-                buffers.push(Box::new([0; FRAME_MAXIMUM]));
+            if total_bytes < FRAME_MAXIMUM {
+                return Err("read depth buffer-size calculation was invalid".to_string());
             }
-            let registrations: Vec<_> = buffers
-                .iter()
-                .map(|buffer| IoRingBufferInfo {
+            for _ in 0..total_depth {
+                let mut buffer = Vec::new();
+                buffer
+                    .try_reserve_exact(FRAME_MAXIMUM)
+                    .map_err(|_| "buffer pool allocation failed".to_string())?;
+                buffer.resize(FRAME_MAXIMUM, 0);
+                buffers.push(buffer);
+            }
+            let mut registrations = Vec::new();
+            registrations
+                .try_reserve_exact(buffers.len())
+                .map_err(|_| "buffer registration allocation failed".to_string())?;
+            for buffer in &buffers {
+                registrations.push(IoRingBufferInfo {
                     address: buffer.as_ptr() as *mut u8,
                     length: FRAME_MAXIMUM as Dword,
-                })
-                .collect();
+                });
+            }
+            let registration_count = Dword::try_from(registrations.len())
+                .map_err(|_| "registered buffer count exceeds I/O-ring limits".to_string())?;
             let files = [endpoints[0].handle, endpoints[1].handle];
             check_hr(
                 unsafe {
-                    BuildIoRingRegisterFileHandles(ring, files.len() as Dword, files.as_ptr(), 0)
+                    BuildIoRingRegisterFileHandles(
+                        ring.0,
+                        Dword::try_from(files.len()).expect("static endpoint count fits Dword"),
+                        files.as_ptr(),
+                        0,
+                    )
                 },
                 "BuildIoRingRegisterFileHandles",
             )?;
             check_hr(
                 unsafe {
                     BuildIoRingRegisterBuffers(
-                        ring,
-                        registrations.len() as Dword,
+                        ring.0,
+                        registration_count,
                         registrations.as_ptr(),
                         0,
                     )
@@ -296,30 +414,39 @@ mod windows_runtime {
             )?;
             let mut submitted = 0;
             check_hr(
-                unsafe { SubmitIoRing(ring, 2, 0, &mut submitted) },
+                unsafe { SubmitIoRing(ring.0, 2, 0, &mut submitted) },
                 "SubmitIoRing",
             )?;
             for _ in 0..2 {
                 let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
                 check_hr(
-                    unsafe { PopIoRingCompletion(ring, completion.as_mut_ptr()) },
+                    unsafe { PopIoRingCompletion(ring.0, completion.as_mut_ptr()) },
                     "PopIoRingCompletion",
                 )?;
                 let completion = unsafe { completion.assume_init() };
                 check_hr(completion.result_code, "I/O-ring registration")?;
             }
 
+            let pool = BufferPool::try_new(total_depth)
+                .map_err(|error| format!("buffer pool allocation failed: {error:?}"))?;
+            let mut active = Vec::new();
+            active
+                .try_reserve_exact(total_depth)
+                .map_err(|_| "active operation allocation failed".to_string())?;
+            active.resize(total_depth, None);
+            let ring = ring.into_inner();
             let mut runtime = Self {
                 ring,
                 endpoints,
                 buffers,
                 _registered_files: files,
                 _registered_buffers: registrations,
-                pool: BufferPool::new(read_depth),
-                active: (0..read_depth).map(|_| None).collect(),
+                pool,
+                active,
                 reads_per_endpoint,
+                stats: RuntimeStats::new(stats_enabled),
             };
-            for slot in 0..read_depth {
+            for slot in 0..total_depth {
                 runtime.post_read(slot)?;
             }
             runtime.submit()?;
@@ -344,7 +471,7 @@ mod windows_runtime {
                         buffer_ref(slot as Dword),
                         FRAME_MAXIMUM as Dword,
                         0,
-                        encode_completion(slot, completion.generation, false),
+                        encode_completion(slot, completion.generation)?,
                         IORING_SQE_FLAG_NONE,
                     )
                 },
@@ -353,7 +480,8 @@ mod windows_runtime {
             self.active[slot] = Some((
                 completion,
                 endpoint.handle,
-                encode_completion(slot, completion.generation, false),
+                encode_completion(slot, completion.generation)?,
+                false,
             ));
             Ok(())
         }
@@ -366,14 +494,14 @@ mod windows_runtime {
             )
         }
 
-        fn wait_for_completion(&self) -> Result<(), String> {
+        fn wait_for_completion(&self) -> Result<bool, String> {
             let mut submitted = 0;
             let status =
                 unsafe { SubmitIoRing(self.ring, 1, COMPLETION_WAIT_MILLISECONDS, &mut submitted) };
             if status == WAIT_TIMEOUT {
-                Ok(())
+                Ok(false)
             } else {
-                check_hr(status, "SubmitIoRing wait")
+                check_hr(status, "SubmitIoRing wait").map(|()| true)
             }
         }
 
@@ -381,7 +509,7 @@ mod windows_runtime {
             &self,
             completion: &IoRingCompletion,
         ) -> Result<(usize, u64, bool), String> {
-            let (slot, generation, is_write) = decode_completion(completion.user_data);
+            let (slot, generation) = decode_completion(completion.user_data)?;
             if slot >= self.active.len() {
                 return Err(format!("completion references invalid slot {slot}"));
             }
@@ -395,95 +523,126 @@ mod windows_runtime {
                 return Err(format!("stale or unexpected completion for slot {slot}"));
             }
             check_hr(completion.result_code, "I/O-ring operation")?;
-            Ok((slot, generation, is_write))
+            Ok((slot, generation, active.3))
+        }
+
+        fn process_completion(
+            &mut self,
+            switch: &mut Switch,
+            completion: IoRingCompletion,
+        ) -> Result<bool, String> {
+            let (slot, generation, is_write) = self.validate_completion(&completion)?;
+            let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
+            self.active[slot] = None;
+            if is_write {
+                self.pool
+                    .complete_write(slot_completion)
+                    .map_err(|error| format!("write completion: {error:?}"))?;
+                self.post_read(slot)?;
+            } else {
+                self.pool
+                    .begin_dispatch(slot_completion)
+                    .map_err(|error| format!("read completion: {error:?}"))?;
+                let source = self.endpoint_for_slot(slot).id;
+                let length = completion.information as usize;
+                if length <= FRAME_MAXIMUM {
+                    let recipients = match switch.forward(source, &self.buffers[slot][..length]) {
+                        Ok(recipients) => recipients,
+                        Err(ForwardingError::InvalidFrame(_)) => {
+                            self.pool
+                                .complete_dispatch(slot_completion)
+                                .map_err(|error| format!("invalid frame: {error:?}"))?;
+                            self.post_read(slot)?;
+                            return Ok(true);
+                        }
+                        Err(error) => {
+                            return Err(format!("forwarding failure: {error:?}"));
+                        }
+                    };
+                    if let Some(destination) = recipients.first() {
+                        let peer = if *destination == self.endpoints[0].id {
+                            self.endpoints[0].handle
+                        } else {
+                            self.endpoints[1].handle
+                        };
+                        self.pool
+                            .begin_writes(slot_completion, 1)
+                            .map_err(|error| format!("begin write: {error:?}"))?;
+                        check_hr(
+                            unsafe {
+                                BuildIoRingWriteFile(
+                                    self.ring,
+                                    handle_ref(peer),
+                                    buffer_ref(slot as Dword),
+                                    length as Dword,
+                                    0,
+                                    FILE_WRITE_FLAG_NONE,
+                                    encode_completion(slot, generation)?,
+                                    IORING_SQE_FLAG_NONE,
+                                )
+                            },
+                            "BuildIoRingWriteFile",
+                        )?;
+                        self.active[slot] = Some((
+                            slot_completion,
+                            peer,
+                            encode_completion(slot, generation)?,
+                            true,
+                        ));
+                    } else {
+                        self.pool
+                            .complete_dispatch(slot_completion)
+                            .map_err(|error| format!("drop completion: {error:?}"))?;
+                        self.post_read(slot)?;
+                    }
+                } else {
+                    self.pool
+                        .complete_dispatch(slot_completion)
+                        .map_err(|error| format!("invalid frame completion: {error:?}"))?;
+                    self.post_read(slot)?;
+                }
+            }
+            Ok(!is_write)
         }
 
         fn run(&mut self) -> Result<(), String> {
             let mut switch = Switch::static_pair();
             loop {
                 if STOP_REQUESTED.load(Ordering::SeqCst) {
+                    self.stats.report(true);
                     return self.shutdown();
                 }
                 let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
                 let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
                 if status == S_FALSE {
-                    self.wait_for_completion()?;
+                    let signaled = self.wait_for_completion()?;
+                    self.stats.record_wait(signaled);
                     continue;
                 }
                 check_hr(status, "PopIoRingCompletion")?;
-                let completion = unsafe { completion.assume_init() };
-                let (slot, generation, is_write) = self.validate_completion(&completion)?;
-                let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
-                self.active[slot] = None;
-                if is_write {
-                    self.pool
-                        .complete_write(slot_completion)
-                        .map_err(|error| format!("write completion: {error:?}"))?;
-                    self.post_read(slot)?;
+                let mut reads = 0;
+                let mut writes = 0;
+                if self.process_completion(&mut switch, unsafe { completion.assume_init() })? {
+                    reads += 1;
                 } else {
-                    self.pool
-                        .begin_dispatch(slot_completion)
-                        .map_err(|error| format!("read completion: {error:?}"))?;
-                    let source = self.endpoint_for_slot(slot).id;
-                    let length = completion.information as usize;
-                    if length <= FRAME_MAXIMUM {
-                        let recipients = match switch.forward(source, &self.buffers[slot][..length])
-                        {
-                            Ok(recipients) => recipients,
-                            Err(ForwardingError::InvalidFrame(_)) => {
-                                self.pool
-                                    .complete_dispatch(slot_completion)
-                                    .map_err(|error| format!("invalid frame: {error:?}"))?;
-                                self.post_read(slot)?;
-                                self.submit()?;
-                                continue;
-                            }
-                            Err(error) => {
-                                return Err(format!("forwarding failure: {error:?}"));
-                            }
-                        };
-                        if let Some(destination) = recipients.first() {
-                            let peer = if *destination == self.endpoints[0].id {
-                                self.endpoints[0].handle
-                            } else {
-                                self.endpoints[1].handle
-                            };
-                            self.pool
-                                .begin_writes(slot_completion, 1)
-                                .map_err(|error| format!("begin write: {error:?}"))?;
-                            check_hr(
-                                unsafe {
-                                    BuildIoRingWriteFile(
-                                        self.ring,
-                                        handle_ref(peer),
-                                        buffer_ref(slot as Dword),
-                                        length as Dword,
-                                        0,
-                                        FILE_WRITE_FLAG_NONE,
-                                        encode_completion(slot, generation, true),
-                                        IORING_SQE_FLAG_NONE,
-                                    )
-                                },
-                                "BuildIoRingWriteFile",
-                            )?;
-                            self.active[slot] = Some((
-                                slot_completion,
-                                peer,
-                                encode_completion(slot, generation, true),
-                            ));
-                        } else {
-                            self.pool
-                                .complete_dispatch(slot_completion)
-                                .map_err(|error| format!("drop completion: {error:?}"))?;
-                            self.post_read(slot)?;
-                        }
+                    writes += 1;
+                }
+
+                loop {
+                    let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
+                    let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
+                    if status == S_FALSE {
+                        break;
+                    }
+                    check_hr(status, "PopIoRingCompletion")?;
+                    if self.process_completion(&mut switch, unsafe { completion.assume_init() })? {
+                        reads += 1;
                     } else {
-                        self.pool
-                            .complete_dispatch(slot_completion)
-                            .map_err(|error| format!("invalid frame completion: {error:?}"))?;
-                        self.post_read(slot)?;
+                        writes += 1;
                     }
                 }
+
+                self.stats.record_batch(reads, writes);
                 self.submit()?;
             }
         }
@@ -496,7 +655,7 @@ mod windows_runtime {
                             self.ring,
                             handle_ref(active.1),
                             active.2,
-                            CANCEL_COMPLETION_MARKER | active.0.slot as Ulonglong,
+                            CANCEL_COMPLETION_MARKER | active.2,
                         )
                     },
                     "BuildIoRingCancelRequest",
@@ -517,15 +676,21 @@ mod windows_runtime {
                 check_hr(status, "PopIoRingCompletion")?;
                 let completion = unsafe { completion.assume_init() };
                 if completion.user_data & CANCEL_COMPLETION_MARKER != 0 {
-                    let slot = (completion.user_data & 0xff) as usize;
+                    let operation = completion.user_data & !CANCEL_COMPLETION_MARKER;
+                    let (slot, _) = decode_completion(operation)?;
                     if slot >= self.active.len() {
                         return Err(format!("cancellation references invalid slot {slot}"));
                     }
-                    if let Some(active) = self.active[slot].take() {
-                        self.pool
-                            .cancel(active.0)
-                            .map_err(|error| format!("cancel completion: {error:?}"))?;
+                    let Some(active) = self.active[slot] else {
+                        continue;
+                    };
+                    if active.2 != operation {
+                        continue;
                     }
+                    self.active[slot] = None;
+                    self.pool
+                        .cancel(active.0)
+                        .map_err(|error| format!("cancel completion: {error:?}"))?;
                     continue;
                 }
                 let (slot, generation, _) = self.validate_completion(&completion)?;
@@ -590,16 +755,28 @@ mod windows_runtime {
         }
     }
 
-    fn encode_completion(slot: usize, generation: u64, write: bool) -> Ulonglong {
-        (slot as Ulonglong) | (generation << 8) | ((write as Ulonglong) << 63)
+    fn encode_completion(slot: usize, generation: u64) -> Result<Ulonglong, String> {
+        let slot = Ulonglong::try_from(slot)
+            .map_err(|_| "slot does not fit completion identity".to_string())?;
+        if slot > SLOT_MASK {
+            return Err("slot count exceeds completion identity capacity".to_string());
+        }
+        if generation == 0 || generation > GENERATION_MASK {
+            return Err("slot generation exceeds completion identity capacity".to_string());
+        }
+        Ok(slot | (generation << GENERATION_SHIFT))
     }
 
-    fn decode_completion(value: Ulonglong) -> (usize, u64, bool) {
-        (
-            (value & 0xff) as usize,
-            (value >> 8) & 0x007f_ffff_ffff_ffff,
-            value >> 63 != 0,
-        )
+    fn decode_completion(value: Ulonglong) -> Result<(usize, u64), String> {
+        if value & CANCEL_COMPLETION_MARKER != 0 {
+            return Err("completion identity contains cancellation marker".to_string());
+        }
+        let slot = (value & SLOT_MASK) as usize;
+        let generation = (value >> GENERATION_SHIFT) & GENERATION_MASK;
+        if generation == 0 {
+            return Err("completion identity contains invalid generation".to_string());
+        }
+        Ok((slot, generation))
     }
 
     fn check_hr(status: HResult, operation: &str) -> Result<(), String> {
@@ -610,9 +787,10 @@ mod windows_runtime {
         }
     }
 
-    fn parse_read_depth() -> Result<usize, String> {
+    fn parse_arguments() -> Result<(usize, bool), String> {
         let mut args = env::args().skip(1);
         let mut read_depth = DEFAULT_READ_DEPTH;
+        let mut stats_enabled = false;
         while let Some(argument) = args.next() {
             if argument == "--read-depth" {
                 let value = args
@@ -621,25 +799,26 @@ mod windows_runtime {
                 read_depth = value
                     .parse()
                     .map_err(|_| format!("invalid read depth '{value}'"))?;
+            } else if argument == "--stats" {
+                stats_enabled = true;
             } else if argument == "--help" || argument == "-h" {
-                println!(
-                    "Usage: wintap-switch.exe [--read-depth <even count from 2 to {MAX_READ_DEPTH}>]"
-                );
+                println!("Usage: wintap-switch.exe [--read-depth <positive even total>] [--stats]");
                 println!("Default read depth: {DEFAULT_READ_DEPTH}");
+                println!("--stats reports I/O-ring batching counters every 5 seconds");
                 std::process::exit(0);
             } else {
                 return Err(format!("unknown argument '{argument}'"));
             }
         }
-        Ok(read_depth)
+        Ok((read_depth, stats_enabled))
     }
 
     pub fn run() -> Result<(), String> {
-        let read_depth = parse_read_depth()?;
+        let (read_depth, stats_enabled) = parse_arguments()?;
         if unsafe { SetConsoleCtrlHandler(Some(console_handler), 1) } == 0 {
             return Err("SetConsoleCtrlHandler failed".to_string());
         }
-        let result = Runtime::start(read_depth)?.run();
+        let result = Runtime::start(read_depth, stats_enabled)?.run();
         unsafe {
             SetConsoleCtrlHandler(Some(console_handler), 0);
         }
