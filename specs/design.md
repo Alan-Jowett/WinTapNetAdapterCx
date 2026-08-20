@@ -2,7 +2,7 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 2 — Specification Changes  
-**Status:** Pending specification audit and user approval  
+**Status:** CHG-032 audit revision approved for specification audit
 **Trace source:** `specs/requirements.md`
 
 ## Design principles
@@ -150,7 +150,8 @@ and stopped or deleted only through the verified NetAdapterCx/WDF lifecycle.
    pending I/O capacity, or creates a frame object. A zero-byte `WriteFile`
    completes as a Win32 no-op before the request reaches this callback.
 4. Once queued, ownership transfers to a nonpaged frame object owned by the
-   adapter receive-injection path.
+   adapter injection queue. The injection queue is distinct from the queue
+   used for stack transmit capture and user reads.
 5. The user request completes only after the driver has copied or otherwise
    safely captured the frame; it shall not retain a user buffer.
 6. The frame is submitted to the Windows networking stack using the verified
@@ -172,6 +173,44 @@ and stopped or deleted only through the verified NetAdapterCx/WDF lifecycle.
 6. If a pending read cannot accept the frame because its output buffer is too
    small, that request completes with `STATUS_BUFFER_TOO_SMALL` and the frame
    remains queued for a later compatible read.
+
+### NetAdapterCx RX indication
+
+The injection queue is the software adapter's receive-completion source. A
+write worker captures a validated user frame into that queue, completes the
+write after capture, and never wakes the read-completion worker for that
+frame. The transmit queue capture path is the only producer for the bounded
+queue consumed by TAP reads.
+
+When the RX queue is polling, `EVT_PACKET_QUEUE_ADVANCE` consumes injection
+frames. When polling is disabled, `EVT_PACKET_QUEUE_SET_NOTIFICATION_ENABLED`
+records whether notification is armed; an injection producer may request more
+RX polling only while that state is armed and only once per enable cycle. The
+notification call shall occur outside a lock that could be reentered by the
+serialized packet-queue callbacks. `EVT_PACKET_QUEUE_SET_NOTIFICATION_ENABLED`
+does not copy an injection frame or mutate ring indices itself.
+Owner-only TAP cleanup that leaves the RX queue running preserves an armed
+notification cycle; D0 exit, RX queue stop, RX cancellation, and release
+hardware disarm it.
+
+Within RX queue advance, the driver owns entries beginning at `BeginIndex` and
+ending immediately before `EndIndex`. It copies a complete injection frame
+only to a driver-owned packet/fragment pair. Before copying, it initializes
+the fragment `Offset` to zero, bounds the complete frame against capacity, and
+sets `ValidLength` to the copied length. It clears `Ignore`, initializes
+`FragmentIndex`, `FragmentCount`, and all applicable `NET_PACKET_LAYOUT`
+fields, then advances both packet and fragment `BeginIndex` together. It does
+not modify `EndIndex` or advance either begin index beyond the corresponding
+end index. `NextIndex` remains optional queue-local post bookkeeping and is
+not a cross-callback ownership signal.
+
+RX cancellation first marks every unindicated packet ignored, then returns
+the outstanding packet and fragment entries to NetAdapterCx by advancing their
+`BeginIndex` values to their corresponding `EndIndex` values. This is the
+only permitted RX ring mutation outside `EVT_PACKET_QUEUE_ADVANCE`. Adapter
+stop, owner teardown, and queue deletion close and release the injection and
+capture queues independently. No queued injection frame may be exposed by a
+TAP read, and no captured TX frame may be injected into the networking stack.
 
 The implementation uses the installed WDK ring iterator contract:
 `NetTxQueueGetRingCollection`, `NetRxQueueGetRingCollection`,
@@ -197,6 +236,11 @@ The design shall maintain separate bounded queues for:
 - received Ethernet frames awaiting user reads;
 - pending overlapped reads and writes.
 
+The injection and captured-frame queues each use the configured frame limit
+independently. They may share a lock when all queue operations use the same
+lock order, but they shall remain separate queue objects and their fullness,
+close, reopen, dequeue, and teardown transitions shall not affect one another.
+
 The pending read and write queues each have a finite limit of 256 requests.
 Requests beyond the limit fail with an explicit busy status. Request counters
 are owned by the queue transition that marks a request pending and are
@@ -219,16 +263,21 @@ after RX ring capacity is consumed; this keeps request-buffer capture on a WDF
 I/O/work-item path rather than doing it from the packet callback.
 
 Packet callbacks only manipulate nonpaged driver-owned state and schedule
-passive work for user-buffer access and request completion.
+passive work for user-buffer access and request completion. RX ring mutation
+is confined to `EVT_PACKET_QUEUE_ADVANCE` for indication and
+`EVT_PACKET_QUEUE_CANCEL` for return; a notification callback may only
+arm/disarm notification and request a subsequent advance.
 
 Pending reads and writes are held by WDF manual queues. WDF owns cancellation
 while a request is queued, and synchronous queue purge owns terminal
 completion during cleanup; the driver does not register a second cancellation
 owner for those requests.
 
-RX ring index ownership is intentionally not changed by the maintenance
-patches. The existing `BeginIndex` advancement requires runtime or verified
-sample evidence before a semantic correction is safe.
+The installed NetAdapterCx ring guidance verifies that a client driver owns
+`[BeginIndex, EndIndex)` and returns completed RX entries by advancing
+`BeginIndex`; `EndIndex` remains framework-owned. The receive path shall
+follow that contract and retain runtime/Driver Verifier validation for every
+ring-capacity and cancellation boundary.
 
 ## Synchronization
 
@@ -443,15 +492,30 @@ destination write reaches a terminal completion. On timeout, cancellation, or
 failure, all outstanding operations are cancelled and completed before their
 buffers or handles are released.
 
-The relay forwards required ARP/Neighbor Discovery and protocol traffic
-without modifying Ethernet bytes. It rejects malformed or out-of-contract
-frames rather than forwarding them. The IPv4 client sends an unbound ICMP Echo
-to B and the IPv6 client sends an unbound ICMPv6 Echo to B. Captured traffic
-must prove each request originated on A, crossed A-to-B, and each reply crossed
-B-to-A. Assertions validate Ethernet addresses, IP version, addresses, header
-length and total length where applicable, ICMP/ICMPv6 type, code, identifier,
-sequence, payload, IPv4 checksum, and ICMP or ICMPv6 checksum including the
-IPv6 pseudo-header.
+The relay forwards validated IPv4/IPv6 data traffic without modifying Ethernet
+bytes. Because active-store permanent peer neighbors eliminate discovery
+dependency, it validates and counts ARP and ICMPv6 Neighbor Discovery
+(including Duplicate Address Detection) but suppresses them instead of writing
+them to the peer endpoint. It rejects malformed or out-of-contract frames
+rather than forwarding them. The IPv4 client sends an unbound ICMP Echo to B
+and the IPv6 client sends an unbound ICMPv6 Echo to B. Captured traffic must
+prove each request originated on A, crossed A-to-B, and each reply crossed
+B-to-A. A byte-identical A-to-B request returned by the B-to-A TAP read is a
+directional-isolation failure and shall not be silently filtered. Unrelated
+traffic may be recorded, suppressed when it is ARP/NDP, or discarded and
+rearmed according to the relay filter; only a validated B-to-A Echo Reply
+satisfies the round-trip assertion. Assertions validate Ethernet addresses, IP
+version, addresses, header length and total length where applicable,
+ICMP/ICMPv6 type, code, identifier, sequence, payload, IPv4 checksum, and
+ICMP or ICMPv6 checksum including the IPv6 pseudo-header.
+
+Neighbor Solicitation validation follows RFC 4861. Address-resolution
+solicitations use a solicited-node multicast destination and include the
+source link-layer option on Ethernet. A valid unicast Neighbor Unreachability
+Detection probe may use the target's unicast destination and omit that option.
+Duplicate Address Detection uses the unspecified source, a solicited-node
+multicast destination, and no source link-layer option. Each valid control
+frame is counted, suppressed, and rearmed without a peer write.
 
 ### Cleanup and diagnostics
 

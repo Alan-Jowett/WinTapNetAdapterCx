@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Runs the REQ-015 routed dual-adapter WinTap relay test.
+Runs the REQ-015/REQ-016 routed dual-adapter WinTap relay test.
 
 .DESCRIPTION
 This is intentionally separate from run-wintap-harness.ps1.  It provisions
@@ -23,7 +23,10 @@ param(
     [string]$DiagnosticsPath = ".\artifacts\wintap-dual-adapter-harness",
 
     [ValidateRange(5, 300)]
-    [int]$TimeoutSeconds = 30
+    [int]$TimeoutSeconds = 30,
+
+    [ValidateRange(1, 4096)]
+    [int]$RelayIterations = 257
 )
 
 $ErrorActionPreference = "Stop"
@@ -201,24 +204,24 @@ function Save-Packet([string]$Direction, [byte[]]$Frame) {
     [IO.File]::WriteAllBytes((Join-Path $script:DiagnosticsPath $name), $Frame)
 }
 
-function Save-EnvironmentDiagnostics {
+function Save-EnvironmentDiagnostics([string]$Prefix) {
     if (-not $script:DiagnosticsPath) {
         return
     }
 
-    Save-Diagnostics "net-adapters.txt" { Get-NetAdapter -IncludeHidden | Format-List * }
-    Save-Diagnostics "ip-addresses.txt" { Get-NetIPAddress | Format-List * }
-    Save-Diagnostics "routes.txt" { Get-NetRoute | Format-List * }
-    Save-Diagnostics "neighbors.txt" { Get-NetNeighbor | Format-List * }
-    Save-Diagnostics "firewall.txt" {
+    Save-Diagnostics "$Prefix-net-adapters.txt" { Get-NetAdapter -IncludeHidden | Format-List * }
+    Save-Diagnostics "$Prefix-ip-addresses.txt" { Get-NetIPAddress | Format-List * }
+    Save-Diagnostics "$Prefix-routes.txt" { Get-NetRoute | Format-List * }
+    Save-Diagnostics "$Prefix-neighbors.txt" { Get-NetNeighbor | Format-List * }
+    Save-Diagnostics "$Prefix-firewall.txt" {
         Get-NetFirewallRule -Name "WinTapDual-$script:RunId-*" -ErrorAction SilentlyContinue |
             Get-NetFirewallAddressFilter | Format-List *
     }
-    Save-Diagnostics "pnp-devices.txt" { Get-PnpDevice -Class Net | Format-List * }
-    Save-Diagnostics "driver-service.txt" {
+    Save-Diagnostics "$Prefix-pnp-devices.txt" { Get-PnpDevice -Class Net | Format-List * }
+    Save-Diagnostics "$Prefix-driver-service.txt" {
         Get-Service -Name $driverService -ErrorAction SilentlyContinue | Format-List *
     }
-    Save-Diagnostics "driver-events.txt" {
+    Save-Diagnostics "$Prefix-driver-events.txt" {
         Get-WinEvent -FilterHashtable @{
             LogName = "System"
             StartTime = (Get-Date).AddMinutes(-15)
@@ -226,7 +229,7 @@ function Save-EnvironmentDiagnostics {
             Where-Object { $_.ProviderName -eq "Service Control Manager" -and $_.Message -match $driverService } |
             Format-List *
     }
-    Save-Diagnostics "command-records.txt" { $script:CommandRecords | Format-List * }
+    Save-Diagnostics "$Prefix-command-records.txt" { $script:CommandRecords | Format-List * }
 }
 
 function Assert-TestSigning {
@@ -276,7 +279,11 @@ function Get-MacBytes([string]$MacAddress) {
 }
 
 function Get-MacDash([string]$MacAddress) {
-    ((Get-MacBytes $MacAddress | ForEach-Object { $_.ToString("X2") }) -join "-")
+    $normalized = Get-NormalizedMac $MacAddress
+    $octets = for ($i = 0; $i -lt $normalized.Length; $i += 2) {
+        $normalized.Substring($i, 2)
+    }
+    return ($octets -join "-")
 }
 
 function Test-BytesEqual([byte[]]$Left, [byte[]]$Right) {
@@ -293,6 +300,11 @@ function Test-BytesEqual([byte[]]$Left, [byte[]]$Right) {
 
 function Get-UInt16BigEndian([byte[]]$Bytes, [int]$Offset) {
     return ([uint16]$Bytes[$Offset] -shl 8) -bor [uint16]$Bytes[$Offset + 1]
+}
+
+function Set-UInt16BigEndian([byte[]]$Bytes, [int]$Offset, [uint16]$Value) {
+    $Bytes[$Offset] = [byte](($Value -shr 8) -band 0xff)
+    $Bytes[$Offset + 1] = [byte]($Value -band 0xff)
 }
 
 function Get-UInt32BigEndian([byte[]]$Bytes, [int]$Offset) {
@@ -397,9 +409,18 @@ function Resolve-DevCon {
 }
 
 function Get-MatchingPnpDevices {
+    $hardwareIds = @($hardwareIdA, $hardwareIdB)
     return @(
-        Get-PnpDevice -ErrorAction Stop | Where-Object {
-            $_.InstanceId -match "(?i)^ROOT\\WINTAPRUST2?(\\|$)"
+        # PnP assigns ROOT\NET instance IDs, so ownership must use the hardware-ID property.
+        Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop | Where-Object {
+            $deviceHardwareIds = @($_.HardwareID | ForEach-Object { [string]$_ })
+            -not [string]::IsNullOrWhiteSpace($_.PNPDeviceID) -and
+            @($deviceHardwareIds | Where-Object { $hardwareIds -contains $_ }).Count -gt 0
+        } | ForEach-Object {
+            [pscustomobject]@{
+                InstanceId = [string]$_.PNPDeviceID
+                HardwareIds = @($_.HardwareID | ForEach-Object { [string]$_ })
+            }
         }
     )
 }
@@ -635,7 +656,23 @@ function Assert-ExactRoute($Route) {
     )
     Assert-True ($matching.Count -ge 1) `
         "The exact host route $($Route.DestinationPrefix) through ifIndex $($Route.InterfaceIndex) is missing."
-    $selected = @(Find-NetRoute -RemoteIPAddress $Route.RemoteAddress -ErrorAction Stop)
+    $findResults = @(Find-NetRoute -RemoteIPAddress $Route.RemoteAddress -ErrorAction Stop)
+    $selected = @(
+        $findResults | Where-Object {
+            $null -ne $_.PSObject.Properties["DestinationPrefix"]
+        }
+    )
+    $diagnosticName = "route-selection-$($Route.RemoteAddress -replace '[:.]', '_').txt"
+    Save-Diagnostics $diagnosticName {
+        "Expected interface: $($Route.InterfaceIndex)"
+        "Expected prefix: $($Route.DestinationPrefix)"
+        "Configured route(s):"
+        $matching | Format-List *
+        "Find-NetRoute result(s):"
+        $findResults | Format-List *
+        "Selected route result(s):"
+        $selected | Format-List *
+    }
     Assert-True ($selected.Count -eq 1 -and
         $selected[0].InterfaceIndex -eq $Route.InterfaceIndex -and
         $selected[0].DestinationPrefix -eq $Route.DestinationPrefix) `
@@ -723,6 +760,7 @@ function Start-IoOperation(
         SourceOperation = $SourceOperation
         Description = $Description
         Disposed = $false
+        OwnsBuffer = $false
     }
     if (-not $success -and -not $operation.Pending) {
         [WinTapDualNative]::CloseHandle($event) | Out-Null
@@ -771,12 +809,15 @@ function Dispose-IoOperation($Operation) {
     $Operation.Disposed = $true
 }
 
-function Dispose-ReadOperation($Operation) {
+function Dispose-BufferedIoOperation($Operation) {
     if ($null -eq $Operation -or $Operation.Disposed) {
         return
     }
     Dispose-IoOperation $Operation
-    [Runtime.InteropServices.Marshal]::FreeHGlobal($Operation.Buffer)
+    if ($Operation.OwnsBuffer) {
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($Operation.Buffer)
+        $Operation.OwnsBuffer = $false
+    }
 }
 
 function Copy-FrameFromRead($Operation) {
@@ -792,6 +833,7 @@ function New-RelayRead($Relay, [string]$Direction) {
     $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(1514)
     try {
         $read = Start-IoOperation $handle $buffer 1514 $false $null "$Direction source read"
+        $read.OwnsBuffer = $true
         $read | Add-Member -NotePropertyName Direction -NotePropertyValue $Direction
         return $read
     } catch {
@@ -858,6 +900,40 @@ function Get-IPv6PseudoHeader([byte[]]$Source, [byte[]]$Destination, [int]$Paylo
     return ,$pseudo
 }
 
+function Test-IPv6UnspecifiedAddress([byte[]]$Address) {
+    Assert-True ($Address.Length -eq 16) "IPv6 address has an invalid length."
+    foreach ($octet in $Address) {
+        if ($octet -ne 0) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-SolicitedNodeMulticastAddress([byte[]]$Address) {
+    if ($Address.Length -ne 16 -or $Address[0] -ne 0xff -or $Address[1] -ne 0x02 -or
+        $Address[11] -ne 0x01 -or $Address[12] -ne 0xff) {
+        return $false
+    }
+    foreach ($offset in 2..10) {
+        if ($Address[$offset] -ne 0) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-SolicitedNodeMulticastAddress([byte[]]$Target) {
+    Assert-True ($Target.Length -eq 16) "IPv6 Neighbor Discovery target has an invalid length."
+    [byte[]]$address = [byte[]]::new(16)
+    $address[0] = 0xff
+    $address[1] = 0x02
+    $address[11] = 0x01
+    $address[12] = 0xff
+    [Array]::Copy($Target, 13, $address, 13, 3)
+    return ,$address
+}
+
 function Assert-Icmpv6Checksum(
     [byte[]]$Frame,
     [int]$IcmpOffset,
@@ -887,7 +963,8 @@ function Assert-IPv6Icmpv6Structure([byte[]]$Frame) {
     $destination = [byte[]]$Frame[($ipOffset + 24)..($ipOffset + 39)]
     Assert-Icmpv6Checksum $Frame $icmpOffset $payloadLength $source $destination
 
-    $fixedLength = switch ($Frame[$icmpOffset]) {
+    $neighborDiscoveryType = $Frame[$icmpOffset]
+    $fixedLength = switch ($neighborDiscoveryType) {
         133 { 8 }  # Router Solicitation
         134 { 16 } # Router Advertisement
         135 { 24 } # Neighbor Solicitation
@@ -897,13 +974,200 @@ function Assert-IPv6Icmpv6Structure([byte[]]$Frame) {
     }
     Assert-True ($Frame[$icmpOffset + 1] -eq 0) "ICMPv6 neighbor-discovery code is invalid."
     Assert-True ($payloadLength -ge $fixedLength) "ICMPv6 neighbor-discovery message is truncated."
+    Assert-True ($Frame[$ipOffset + 7] -eq 255) "ICMPv6 neighbor-discovery hop limit is invalid."
 
+    $hasSourceLinkLayerAddress = $false
     for ($optionOffset = $icmpOffset + $fixedLength; $optionOffset -lt $payloadEnd) {
         Assert-True ($optionOffset + 2 -le $payloadEnd) "ICMPv6 neighbor-discovery option is truncated."
         $optionLength = [int]$Frame[$optionOffset + 1] * 8
         Assert-True ($optionLength -gt 0 -and $optionOffset + $optionLength -le $payloadEnd) `
             "ICMPv6 neighbor-discovery option length is invalid."
+        if ($Frame[$optionOffset] -eq 1) {
+            Assert-True ($optionLength -eq 8) `
+                "ICMPv6 neighbor-discovery source link-layer option has an invalid length."
+            $hasSourceLinkLayerAddress = $true
+        }
         $optionOffset += $optionLength
+    }
+
+    if ($neighborDiscoveryType -eq 135) {
+        [byte[]]$source = [byte[]]$Frame[($ipOffset + 8)..($ipOffset + 23)]
+        [byte[]]$destination = [byte[]]$Frame[($ipOffset + 24)..($ipOffset + 39)]
+        [byte[]]$target = [byte[]]$Frame[($icmpOffset + 8)..($icmpOffset + 23)]
+        Assert-True ($target[0] -ne 0xff) "Neighbor Solicitation target is multicast."
+        if (Test-IPv6UnspecifiedAddress $source) {
+            Assert-True (Test-SolicitedNodeMulticastAddress $destination) `
+                "Duplicate Address Detection Neighbor Solicitation destination is not solicited-node multicast."
+            Assert-True (-not $hasSourceLinkLayerAddress) `
+                "Duplicate Address Detection Neighbor Solicitation includes a source link-layer option."
+        } elseif (Test-SolicitedNodeMulticastAddress $destination) {
+            Assert-True $hasSourceLinkLayerAddress `
+                "Multicast Neighbor Solicitation with a source address lacks a source link-layer option."
+        } else {
+            Assert-True (Test-BytesEqual $destination $target) `
+                "Unicast Neighbor Solicitation destination is not the target address."
+        }
+    }
+}
+
+function Test-IPv6NeighborDiscoveryFrame([byte[]]$Frame) {
+    Assert-IPv6FrameStructure $Frame
+    $ipOffset = 14
+    if ($Frame[$ipOffset + 6] -ne 58) {
+        return $false
+    }
+
+    $payloadLength = Get-UInt16BigEndian $Frame ($ipOffset + 4)
+    Assert-True ($payloadLength -ge 4) "ICMPv6 payload is truncated."
+    $icmpOffset = $ipOffset + 40
+    if ($Frame[$icmpOffset] -notin @(133, 134, 135, 136, 137)) {
+        return $false
+    }
+
+    Assert-IPv6Icmpv6Structure $Frame
+    return $true
+}
+
+function Increment-RelayControlFrame($Relay, [string]$Kind, [string]$Direction) {
+    $Relay.ControlFrames[$Kind][$Direction] = [int]$Relay.ControlFrames[$Kind][$Direction] + 1
+}
+
+function Assert-NoReflectedInjection($Relay, [string]$Direction, [byte[]]$Frame) {
+    foreach ($injectedFrame in $Relay.InjectedFrames[$Direction]) {
+        if (Test-BytesEqual $Frame $injectedFrame) {
+            throw "The $Direction TAP read returned a byte-identical frame injected into that endpoint."
+        }
+    }
+}
+
+function New-RelayArpControlFrame($Relay, [string]$Direction) {
+    $sourceAdapter = if ($Direction -eq "AtoB") { $Relay.Adapters.A } else { $Relay.Adapters.B }
+    $destinationAdapter = if ($Direction -eq "AtoB") { $Relay.Adapters.B } else { $Relay.Adapters.A }
+    $sourceAddress = if ($Direction -eq "AtoB") { $ipv4A } else { $ipv4B }
+    $destinationAddress = if ($Direction -eq "AtoB") { $ipv4B } else { $ipv4A }
+    [byte[]]$frame = [byte[]]::new(42)
+    [Array]::Copy((Get-MacBytes $destinationAdapter.MacAddress), 0, $frame, 0, 6)
+    [Array]::Copy((Get-MacBytes $sourceAdapter.MacAddress), 0, $frame, 6, 6)
+    Set-UInt16BigEndian $frame 12 0x0806
+    Set-UInt16BigEndian $frame 14 1
+    Set-UInt16BigEndian $frame 16 0x0800
+    $frame[18] = 6
+    $frame[19] = 4
+    Set-UInt16BigEndian $frame 20 1
+    [Array]::Copy((Get-MacBytes $sourceAdapter.MacAddress), 0, $frame, 22, 6)
+    [Array]::Copy(([System.Net.IPAddress]::Parse($sourceAddress).GetAddressBytes()), 0, $frame, 28, 4)
+    [Array]::Copy(([System.Net.IPAddress]::Parse($destinationAddress).GetAddressBytes()), 0, $frame, 38, 4)
+    return ,$frame
+}
+
+function New-RelayNeighborSolicitationFrame($Relay, [string]$Direction) {
+    $sourceAdapter = if ($Direction -eq "AtoB") { $Relay.Adapters.A } else { $Relay.Adapters.B }
+    $sourceAddress = if ($Direction -eq "AtoB") { $ipv6A } else { $ipv6B }
+    $targetAddress = if ($Direction -eq "AtoB") { $ipv6B } else { $ipv6A }
+    [byte[]]$source = [System.Net.IPAddress]::Parse($sourceAddress).GetAddressBytes()
+    [byte[]]$target = [System.Net.IPAddress]::Parse($targetAddress).GetAddressBytes()
+    [byte[]]$destination = Get-SolicitedNodeMulticastAddress $target
+    [byte[]]$sourceMac = Get-MacBytes $sourceAdapter.MacAddress
+    [byte[]]$frame = [byte[]]::new(86)
+    [Array]::Copy([byte[]](0x33, 0x33, 0xff, $target[13], $target[14], $target[15]), 0, $frame, 0, 6)
+    [Array]::Copy($sourceMac, 0, $frame, 6, 6)
+    Set-UInt16BigEndian $frame 12 0x86dd
+    $frame[14] = 0x60
+    Set-UInt16BigEndian $frame 18 32
+    $frame[20] = 58
+    $frame[21] = 255
+    [Array]::Copy($source, 0, $frame, 22, 16)
+    [Array]::Copy($destination, 0, $frame, 38, 16)
+    $frame[54] = 135
+    $frame[55] = 0
+    [Array]::Copy($target, 0, $frame, 62, 16)
+    $frame[78] = 1
+    $frame[79] = 1
+    [Array]::Copy($sourceMac, 0, $frame, 80, 6)
+    [byte[]]$checksumBuffer = [byte[]]::new(72)
+    [Array]::Copy((Get-IPv6PseudoHeader $source $destination 32), 0, $checksumBuffer, 0, 40)
+    [Array]::Copy($frame, 54, $checksumBuffer, 40, 32)
+    Set-UInt16BigEndian $frame 56 (Get-InternetChecksum $checksumBuffer 0 $checksumBuffer.Length)
+    return ,$frame
+}
+
+function New-RelayUnicastNeighborSolicitationFrame($Relay, [string]$Direction) {
+    $sourceAdapter = if ($Direction -eq "AtoB") { $Relay.Adapters.A } else { $Relay.Adapters.B }
+    $destinationAdapter = if ($Direction -eq "AtoB") { $Relay.Adapters.B } else { $Relay.Adapters.A }
+    $sourceAddress = if ($Direction -eq "AtoB") { $ipv6A } else { $ipv6B }
+    $targetAddress = if ($Direction -eq "AtoB") { $ipv6B } else { $ipv6A }
+    [byte[]]$source = [System.Net.IPAddress]::Parse($sourceAddress).GetAddressBytes()
+    [byte[]]$target = [System.Net.IPAddress]::Parse($targetAddress).GetAddressBytes()
+    [byte[]]$frame = [byte[]]::new(78)
+    [Array]::Copy((Get-MacBytes $destinationAdapter.MacAddress), 0, $frame, 0, 6)
+    [Array]::Copy((Get-MacBytes $sourceAdapter.MacAddress), 0, $frame, 6, 6)
+    Set-UInt16BigEndian $frame 12 0x86dd
+    $frame[14] = 0x60
+    Set-UInt16BigEndian $frame 18 24
+    $frame[20] = 58
+    $frame[21] = 255
+    [Array]::Copy($source, 0, $frame, 22, 16)
+    [Array]::Copy($target, 0, $frame, 38, 16)
+    $frame[54] = 135
+    $frame[55] = 0
+    [Array]::Copy($target, 0, $frame, 62, 16)
+    [byte[]]$checksumBuffer = [byte[]]::new(64)
+    [Array]::Copy((Get-IPv6PseudoHeader $source $target 24), 0, $checksumBuffer, 0, 40)
+    [Array]::Copy($frame, 54, $checksumBuffer, 40, 24)
+    Set-UInt16BigEndian $frame 56 (Get-InternetChecksum $checksumBuffer 0 $checksumBuffer.Length)
+    return ,$frame
+}
+
+function New-RelayDuplicateAddressDetectionFrame($Relay, [string]$Direction) {
+    $sourceAdapter = if ($Direction -eq "AtoB") { $Relay.Adapters.A } else { $Relay.Adapters.B }
+    $targetAddress = if ($Direction -eq "AtoB") { $ipv6B } else { $ipv6A }
+    [byte[]]$source = [byte[]]::new(16)
+    [byte[]]$target = [System.Net.IPAddress]::Parse($targetAddress).GetAddressBytes()
+    [byte[]]$destination = Get-SolicitedNodeMulticastAddress $target
+    [byte[]]$frame = [byte[]]::new(78)
+    [Array]::Copy([byte[]](0x33, 0x33, 0xff, $target[13], $target[14], $target[15]), 0, $frame, 0, 6)
+    [Array]::Copy((Get-MacBytes $sourceAdapter.MacAddress), 0, $frame, 6, 6)
+    Set-UInt16BigEndian $frame 12 0x86dd
+    $frame[14] = 0x60
+    Set-UInt16BigEndian $frame 18 24
+    $frame[20] = 58
+    $frame[21] = 255
+    [Array]::Copy($source, 0, $frame, 22, 16)
+    [Array]::Copy($destination, 0, $frame, 38, 16)
+    $frame[54] = 135
+    $frame[55] = 0
+    [Array]::Copy($target, 0, $frame, 62, 16)
+    [byte[]]$checksumBuffer = [byte[]]::new(64)
+    [Array]::Copy((Get-IPv6PseudoHeader $source $destination 24), 0, $checksumBuffer, 0, 40)
+    [Array]::Copy($frame, 54, $checksumBuffer, 40, 24)
+    Set-UInt16BigEndian $frame 56 (Get-InternetChecksum $checksumBuffer 0 $checksumBuffer.Length)
+    return ,$frame
+}
+
+function Assert-ControlFrameSuppression($Relay) {
+    foreach ($direction in @("AtoB", "BtoA")) {
+        $arpBefore = [int]$Relay.ControlFrames["Arp"][$direction]
+        $ndpBefore = [int]$Relay.ControlFrames["Ndp"][$direction]
+        $arp = New-RelayArpControlFrame $Relay $direction
+        $ndp = New-RelayNeighborSolicitationFrame $Relay $direction
+        $unicastNdp = New-RelayUnicastNeighborSolicitationFrame $Relay $direction
+        $dad = New-RelayDuplicateAddressDetectionFrame $Relay $direction
+        Save-Packet "$direction-control-arp" $arp
+        Save-Packet "$direction-control-ndp" $ndp
+        Save-Packet "$direction-control-unicast-ndp" $unicastNdp
+        Save-Packet "$direction-control-dad" $dad
+        Assert-True (-not (Observe-RelayFrame $Relay $direction $arp)) `
+            "$direction ARP control frame was not suppressed."
+        Assert-True (-not (Observe-RelayFrame $Relay $direction $ndp)) `
+            "$direction Neighbor Discovery control frame was not suppressed."
+        Assert-True (-not (Observe-RelayFrame $Relay $direction $unicastNdp)) `
+            "$direction unicast Neighbor Discovery control frame was not suppressed."
+        Assert-True (-not (Observe-RelayFrame $Relay $direction $dad)) `
+            "$direction Duplicate Address Detection control frame was not suppressed."
+        Assert-True ([int]$Relay.ControlFrames["Arp"][$direction] -eq $arpBefore + 1) `
+            "$direction ARP suppression was not counted."
+        Assert-True ([int]$Relay.ControlFrames["Ndp"][$direction] -eq $ndpBefore + 3) `
+            "$direction Neighbor Discovery, unicast NUD, and Duplicate Address Detection suppression was not counted."
     }
 }
 
@@ -1022,40 +1286,56 @@ function Assert-IPv6IcmpFrame($Relay, [string]$Direction, [byte[]]$Frame) {
 function Observe-RelayFrame($Relay, [string]$Direction, [byte[]]$Frame) {
     Assert-True ($Frame.Length -ge 14 -and $Frame.Length -le 1514) `
         "Relay received an out-of-range Ethernet frame length $($Frame.Length)."
+    Assert-NoReflectedInjection $Relay $Direction $Frame
     $etherType = Get-UInt16BigEndian $Frame 12
     if ($etherType -eq 0x0806) {
         Assert-ArpFrame $Frame
-        return
+        Increment-RelayControlFrame $Relay "Arp" $Direction
+        # Static peer neighbors resolve the test endpoints before relay starts.
+        # Relaying ARP/DAD control traffic would reflect it indefinitely between the adapters.
+        return $false
     }
     if ($etherType -eq 0x0800) {
         Assert-IPv4FrameStructure $Frame
         $source = [System.Net.IPAddress]::new([byte[]]$Frame[26..29]).ToString()
         $destination = [System.Net.IPAddress]::new([byte[]]$Frame[30..33]).ToString()
         if ($source -eq $ipv4A -and $destination -eq $ipv4B) {
-            Assert-True ($Direction -eq "AtoB") `
-                "IPv4 test endpoint traffic used the wrong relay direction."
+            if ($Direction -ne "AtoB") {
+                return $false
+            }
             Assert-IPv4IcmpFrame $Relay $Direction $Frame
         } elseif ($source -eq $ipv4B -and $destination -eq $ipv4A) {
-            Assert-True ($Direction -eq "BtoA") `
-                "IPv4 test endpoint traffic used the wrong relay direction."
+            if ($Direction -ne "BtoA") {
+                return $false
+            }
             Assert-IPv4IcmpFrame $Relay $Direction $Frame
+        } else {
+            return $false
         }
-        return
+        return $true
     }
     if ($etherType -eq 0x86dd) {
+        if (Test-IPv6NeighborDiscoveryFrame $Frame) {
+            Increment-RelayControlFrame $Relay "Ndp" $Direction
+            return $false
+        }
         Assert-IPv6Icmpv6Structure $Frame
         $source = [System.Net.IPAddress]::new([byte[]]$Frame[22..37]).ToString()
         $destination = [System.Net.IPAddress]::new([byte[]]$Frame[38..53]).ToString()
         if ($source -eq $ipv6A -and $destination -eq $ipv6B) {
-            Assert-True ($Direction -eq "AtoB") `
-                "IPv6 test endpoint traffic used the wrong relay direction."
+            if ($Direction -ne "AtoB") {
+                return $false
+            }
             Assert-IPv6IcmpFrame $Relay $Direction $Frame
         } elseif ($source -eq $ipv6B -and $destination -eq $ipv6A) {
-            Assert-True ($Direction -eq "BtoA") `
-                "IPv6 test endpoint traffic used the wrong relay direction."
+            if ($Direction -ne "BtoA") {
+                return $false
+            }
             Assert-IPv6IcmpFrame $Relay $Direction $Frame
+        } else {
+            return $false
         }
-        return
+        return $true
     }
     throw "Unsupported EtherType 0x$('{0:X4}' -f $etherType) cannot be relayed."
 }
@@ -1067,6 +1347,15 @@ function Start-Relay([IntPtr]$HandleA, [IntPtr]$HandleB, $Adapters) {
         Adapters = $Adapters
         Reads = @{}
         Writes = @{}
+        InjectedFrames = @{
+            AtoB = [System.Collections.Generic.List[byte[]]]::new()
+            BtoA = [System.Collections.Generic.List[byte[]]]::new()
+        }
+        ControlFrames = @{
+            Arp = @{ AtoB = 0; BtoA = 0 }
+            Ndp = @{ AtoB = 0; BtoA = 0 }
+        }
+        OwnerReopenValidated = $false
         Proofs = @{
             IPv4Request = $null
             IPv4Reply = $false
@@ -1086,11 +1375,25 @@ function Complete-RelayRead($Relay, [string]$Direction) {
         "$($read.Description) completed with Win32 error $($result.Error)."
     $frame = Copy-FrameFromRead $read
     Save-Packet $Direction $frame
-    Observe-RelayFrame $Relay $Direction $frame
+    if (-not (Observe-RelayFrame $Relay $Direction $frame)) {
+        Dispose-BufferedIoOperation $read
+        $Relay.Reads[$Direction] = New-RelayRead $Relay $Direction
+        return
+    }
     $destinationHandle = if ($Direction -eq "AtoB") { $Relay.HandleB } else { $Relay.HandleA }
-    $write = Start-IoOperation $destinationHandle $read.Buffer ([int]$read.Transferred) $true $read `
-        "$Direction destination write"
+    $writeBuffer = [Runtime.InteropServices.Marshal]::AllocHGlobal([int]$read.Transferred)
+    try {
+        [Runtime.InteropServices.Marshal]::Copy($frame, 0, $writeBuffer, [int]$read.Transferred)
+        $write = Start-IoOperation $destinationHandle $writeBuffer ([int]$read.Transferred) $true $read `
+            "$Direction destination write"
+        $write.OwnsBuffer = $true
+    } catch {
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($writeBuffer)
+        throw
+    }
     $write | Add-Member -NotePropertyName Direction -NotePropertyValue $Direction
+    $targetReadDirection = if ($Direction -eq "AtoB") { "BtoA" } else { "AtoB" }
+    $Relay.InjectedFrames[$targetReadDirection].Add([byte[]]$frame.Clone())
     $Relay.Reads[$Direction] = $null
     $Relay.Writes[$Direction] = $write
 }
@@ -1099,8 +1402,8 @@ function Complete-RelayWrite($Relay, [string]$Direction) {
     $write = $Relay.Writes[$Direction]
     Assert-IoSuccess $write
     # The read buffer is freed only after this paired destination write completed.
-    Dispose-IoOperation $write
-    Dispose-ReadOperation $write.SourceOperation
+    Dispose-BufferedIoOperation $write
+    Dispose-BufferedIoOperation $write.SourceOperation
     $Relay.Writes[$Direction] = $null
     $Relay.Reads[$Direction] = New-RelayRead $Relay $Direction
 }
@@ -1165,6 +1468,13 @@ function Invoke-UnboundPingRelay($Relay, [string]$Address, [string]$Family) {
     $ping = [System.Net.NetworkInformation.Ping]::new()
     [byte[]]$payload = [Text.Encoding]::ASCII.GetBytes("WinTapDual-$script:RunId-$Family")
     try {
+        if ($Family -eq "IPv4") {
+            $Relay.Proofs.IPv4Request = $null
+            $Relay.Proofs.IPv4Reply = $false
+        } else {
+            $Relay.Proofs.IPv6Request = $null
+            $Relay.Proofs.IPv6Reply = $false
+        }
         # SendPingAsync has no source-address argument: route selection is deliberately unbound.
         $task = $ping.SendPingAsync($Address, $TimeoutSeconds * 1000, $payload)
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -1222,12 +1532,55 @@ function Stop-Relay($Relay) {
         }
     }
     foreach ($operation in $unique) {
-        if ($operation.SourceOperation) {
-            Dispose-IoOperation $operation
-        } else {
-            Dispose-ReadOperation $operation
+        Dispose-BufferedIoOperation $operation
+    }
+}
+
+function Close-ControlHandles {
+    foreach ($handle in $script:Handles.Values) {
+        if ($handle -and $handle -ne [IntPtr]::new(-1)) {
+            [WinTapDualNative]::CloseHandle($handle) | Out-Null
         }
     }
+    $script:Handles = @{}
+}
+
+function Assert-OwnerReopen($Adapters) {
+    Stop-Relay $script:Relay
+    $script:Relay = $null
+    Close-ControlHandles
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastError = $null
+    $handlesReopened = $false
+    do {
+        [IntPtr]$handleA = [IntPtr]::new(-1)
+        [IntPtr]$handleB = [IntPtr]::new(-1)
+        try {
+            $handleA = Open-ControlHandle $controlPathA
+            Assert-ExclusiveHandle $controlPathA
+            $handleB = Open-ControlHandle $controlPathB
+            Assert-ExclusiveHandle $controlPathB
+            $script:Handles = @{ A = $handleA; B = $handleB }
+            $handlesReopened = $true
+            break
+        } catch {
+            $lastError = $_.Exception.Message
+            foreach ($handle in @($handleA, $handleB)) {
+                if ($handle -and $handle -ne [IntPtr]::new(-1)) {
+                    [WinTapDualNative]::CloseHandle($handle) | Out-Null
+                }
+            }
+            $script:Handles = @{}
+            Start-Sleep -Milliseconds 250
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    Assert-True $handlesReopened "TAP owner close/reopen did not restore the relay: $lastError"
+
+    $script:Relay = Start-Relay $script:Handles.A $script:Handles.B $Adapters
+    Invoke-UnboundPingRelay $script:Relay $ipv4B "IPv4"
+    Invoke-UnboundPingRelay $script:Relay $ipv6B "IPv6"
+    $script:Relay.OwnerReopenValidated = $true
 }
 
 function Invoke-CleanupAction(
@@ -1249,12 +1602,7 @@ function Invoke-Cleanup {
         $script:Relay = $null
     } $errors
     Invoke-CleanupAction "control handles" {
-        foreach ($handle in $script:Handles.Values) {
-            if ($handle -and $handle -ne [IntPtr]::new(-1)) {
-                [WinTapDualNative]::CloseHandle($handle) | Out-Null
-            }
-        }
-        $script:Handles = @{}
+        Close-ControlHandles
     } $errors
     Invoke-CleanupAction "driver-store package tracking" {
         if ($script:DriverPackageSnapshotTaken) {
@@ -1353,8 +1701,13 @@ function Invoke-DualAdapterHarness {
     Configure-Topology $adapters
 
     $script:Relay = Start-Relay $script:Handles.A $script:Handles.B $adapters
-    Invoke-UnboundPingRelay $script:Relay $ipv4B "IPv4"
-    Invoke-UnboundPingRelay $script:Relay $ipv6B "IPv6"
+    Assert-ControlFrameSuppression $script:Relay
+    Assert-OwnerReopen $adapters
+    Assert-ControlFrameSuppression $script:Relay
+    for ($iteration = 0; $iteration -lt $RelayIterations; ++$iteration) {
+        Invoke-UnboundPingRelay $script:Relay $ipv4B "IPv4"
+        Invoke-UnboundPingRelay $script:Relay $ipv6B "IPv6"
+    }
 }
 
 Ensure-DiagnosticsDirectory
@@ -1366,9 +1719,21 @@ try {
     $primaryFailure = $_
     Save-Diagnostics "primary-failure.txt" { $primaryFailure | Format-List * -Force }
 } finally {
-    Save-EnvironmentDiagnostics
+    if ($script:Relay) {
+        Save-Diagnostics "relay-control-frames.txt" {
+            [pscustomobject]@{
+                ControlFrames = $script:Relay.ControlFrames
+                OwnerReopenValidated = $script:Relay.OwnerReopenValidated
+                InjectionFrameCounts = @{
+                    AtoB = $script:Relay.InjectedFrames["AtoB"].Count
+                    BtoA = $script:Relay.InjectedFrames["BtoA"].Count
+                }
+            } | ConvertTo-Json -Depth 5
+        }
+    }
+    Save-EnvironmentDiagnostics "before-cleanup"
     $cleanupErrors = Invoke-Cleanup
-    Save-EnvironmentDiagnostics
+    Save-EnvironmentDiagnostics "after-cleanup"
     if ($cleanupErrors.Count -gt 0) {
         $cleanupErrors | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "cleanup-errors.txt") `
             -Encoding utf8 -Force

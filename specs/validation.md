@@ -2,7 +2,7 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 2 — Specification Changes  
-**Status:** Pending specification audit and user approval  
+**Status:** CHG-032 audit revision approved for specification audit
 **Trace source:** `specs/requirements.md` and `specs/design.md`
 
 ## Acceptance criteria
@@ -10,20 +10,21 @@
 | ID | Requirement | Validation |
 | --- | --- | --- |
 | VAL-001 | REQ-001 | Build and install the NetAdapterCx driver; verify one virtual Ethernet adapter appears with the expected capabilities and identity. |
-| VAL-002 | REQ-002 | Write valid Ethernet frames through the device handle and verify delivery to the Windows networking stack; verify invalid nonzero lengths complete with error 87 without enqueuing a frame and zero-byte writes complete as Win32 no-ops; transmit frames through the stack and verify complete reads in user mode. |
+| VAL-002 | REQ-002 | Write valid Ethernet frames through the device handle and verify delivery to the Windows networking stack; verify invalid nonzero lengths complete with error 87 without enqueuing a frame and zero-byte writes complete as Win32 no-ops; transmit frames through the stack and verify complete reads in user mode without crossing the two directions. |
 | VAL-003 | REQ-003 | Exercise start, pause, restart, stop, surprise removal, owner close, process termination, and cancellation; verify no hangs, double completions, or leaked objects. |
 | VAL-004 | REQ-004 | Build and execute the supported x64 and ARM64 packages on Windows 10 version 2004+ and reject unsupported platform combinations explicitly. |
 | VAL-005 | REQ-005 | Verify non-administrator open/control attempts fail; verify malformed nonzero lengths complete with error 87 and invalid I/O requests cannot corrupt memory or disclose data. |
 | VAL-006 | REQ-006 | Run the complete build, install, packet-path, concurrency, cancellation, power, malformed-input, and cleanup suite with Driver Verifier-compatible settings. |
 | VAL-007 | REQ-007 | Configure and build from a clean environment with CMake and the Visual Studio generator for x64 and ARM64; verify NuGet WDK/SDK dependencies resolve reproducibly and missing prerequisites fail at configuration. |
 | VAL-008 | REQ-008 | Run the complete privileged ICMP Echo Request/Echo Reply round trip through the Ethernet/TAP handle using `192.0.2.1/30` and `192.0.2.2`; verify packet fields, checksums, stack completion, timeout behavior, and cleanup. |
-| VAL-009 | REQ-009 | Execute the full REQ-008 and REQ-015 assertion sets in a GitHub-hosted Windows job and manually in a Hyper-V-capable Windows VM using the same entry points; fail on unavailable privileged operations rather than skipping. |
+| VAL-009 | REQ-009 | Execute the full REQ-008, REQ-015, and REQ-016 assertion sets in a GitHub-hosted Windows job and manually in a Hyper-V-capable Windows VM using the same entry points; fail on unavailable privileged operations rather than skipping. |
 | VAL-010 | REQ-010 | Build the Rust driver and generated NetAdapterCx bindings from a clean pinned environment for x64 and ARM64; verify binding regeneration, ABI/layout checks, panic-abort configuration, and package production. |
 | VAL-011 | REQ-011 | Verify the repository, CMake targets, workflow, harness, and package validation contain no C/C++ driver source, project, INF, fallback, or selector. |
 | VAL-012 | REQ-012 | Build each package and verify `wintap_netadaptercx_driver.inf`, `wintap_netadaptercx_driver.cat`, service `WinTapRust`, and hardware IDs `ROOT\WinTapRust` and `ROOT\WinTapRust2`. |
 | VAL-013 | REQ-013 | Load the test-signed Rust package with NetAdapterCx verifier enabled; verify directed, broadcast, multicast, all-multicast, and promiscuous capability initialization with a nonzero multicast capacity does not trigger `0x19E/0xB`, and TCP/IP binds successfully. |
 | VAL-014 | REQ-014 | Verify the harness captures native overlapped-I/O errors within its C# wrappers and reports pending and cancelled requests accurately. |
 | VAL-015 | REQ-015 | In a clean elevated environment, provision two WinTap adapters, verify their identity and independently exclusive TAP handles, install reciprocal IPv4/IPv6 host routes and static neighbors, relay frames in both directions, and verify unbound IPv4 ICMP and IPv6 ICMPv6 round trips plus complete cleanup. |
+| VAL-016 | REQ-016 | With a destination TAP read already pending, inject a routed request into that destination and fail if the destination's reverse-direction TAP read returns the byte-identical injected request. Record/rearm unrelated traffic; accept only a validated stack-originated reply for the round trip. Exercise notification arming across owner close/reopen, RX ring-capacity boundaries, cancellation, and teardown under NetAdapterCx verifier without a bugcheck or ownership violation. |
 
 | Test | Coverage |
 |---|---|
@@ -56,6 +57,9 @@
 | TC-045 | Start an unbound IPv6 ICMPv6 Echo to B. Verify the same A-to-B and B-to-A relay path, IPv6 endpoint identities, payload, and ICMPv6 pseudo-header checksum. |
 | TC-046 | Exercise malformed/truncated frames, write/read cancellation, route/neighbor/firewall/address failure, partial provisioning, timeout, and device removal. Verify both handles complete before release, only created state is removed, diagnostics persist, and primary failure is retained. |
 | TC-047 | Execute TC-042 through TC-046 using `tests\run-wintap-dual-adapter-harness.ps1` on a GitHub-hosted Windows job and a manual Hyper-V/WinDbg VM; verify shared assertions and no capability-only skip. |
+| TC-048 | Pre-post a TAP read on B, relay A's valid IPv4 Echo Request into B, and fail if B's reverse-direction read returns that byte-identical request. Record/rearm unrelated frames; require B's valid Echo Reply to be relayed to A and reported successful by the unbound Ping client. Repeat for ICMPv6. |
+| TC-049 | Exercise injection while RX polling is active and while receive notification is armed. Close and reopen the TAP owner while RX remains running, then verify a later write requests a new RX advance. Send enough valid routed frames to cross at least one RX-ring capacity handoff, then cancel/stop during queued injection. Under NetAdapterCx verifier, verify packet and fragment ownership remains synchronized, no ring entry is returned twice, and no frame leaks into the TAP read path. |
+| TC-050 | With static peer neighbors installed, present valid ARP, multicast Neighbor Solicitation, unicast Neighbor Unreachability Detection Solicitation without a source link-layer option, and Duplicate Address Detection frames to each relay direction. Verify the harness validates and counts them, performs no peer write, remains free of a reflection loop, and still completes the IPv4 and IPv6 Echo tests. |
 
 ## Functional tests
 
@@ -69,7 +73,8 @@
    contents.
 4. **Multiple outstanding requests:** issue concurrent reads and writes from
    the exclusive owner; verify ordering guarantees documented by the final
-   design and absence of cross-request data.
+   design, absence of cross-request data, and that a pending read cannot
+   consume a queued user-write frame.
 5. **Exclusive ownership:** open the adapter from one elevated process, reject
    a second open, then allow a new owner after clean close and after abnormal
    process termination.
@@ -82,12 +87,15 @@
 8. **Routed dual-adapter relay:** provision two clean root-enumerated
    adapters, relay complete frames between their independent TAP handles, and
    verify IPv4 and IPv6 stack round trips use the configured adapter routes
-   rather than loopback.
+   rather than loopback. With permanent neighbors, validate/count and suppress
+   ARP and IPv6 Neighbor Discovery rather than relaying those control frames.
 
 ## Lifecycle and concurrency tests
 
 - Cancel a pending read while a frame is arriving.
 - Cancel a pending write while the transmit queue is full.
+- Cancel a pending TAP read while an injection frame is awaiting RX queue
+  advance; verify the injection frame cannot be redirected into that read.
 - Close the owner handle with pending reads, pending writes, queued frames, and
   active framework callbacks.
 - Pause and restart with every queue state and with requests in flight.

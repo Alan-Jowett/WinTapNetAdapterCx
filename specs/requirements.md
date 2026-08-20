@@ -2,7 +2,8 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 2 — Specification Changes  
-**Status:** Baseline requirements approved; CHG-031 pending specification audit and user approval
+**Status:** Baseline requirements approved; CHG-032 audit revision approved
+for specification audit
 **Evidence scope:** `README.md`, repository layout, and user-provided project purpose
 
 ## Change manifest
@@ -23,6 +24,10 @@
 - Replace the C driver implementation with Rust, reusing the
   `windows-drivers-rs` WDF ecosystem and adding generated NetAdapterCx FFI
   bindings.
+- Correct the discovered TAP directional-ownership and receive-notification
+  defect without changing the public Win32 read/write contract.
+- Reconcile the permanent-neighbor relay policy by validating and suppressing
+  ARP and IPv6 Neighbor Discovery instead of forwarding control traffic.
 - Do not modify C source, headers, INF files, project files, tests, generated
   artifacts, or build configuration during discovery.
 
@@ -49,6 +54,8 @@
   already exist.
 - **UI-021 (KNOWN):** The user selected removal of a driver-store package only
   when the current test run added it.
+- **UI-022 (KNOWN):** The user selected validation and suppression of ARP and
+  IPv6 Neighbor Discovery frames when permanent neighbors are configured.
 
 ## Baseline requirements
 
@@ -327,7 +334,10 @@ delivered through loopback.
 4. Starts IPv4 ICMP Echo and IPv6 ICMPv6 Echo clients without explicit
    source-address binding, verifies route selection sends each request through
    the opposite WinTap adapter rather than loopback, and relays complete
-   validated Ethernet frames bidirectionally between the two TAP handles.
+   validated data frames bidirectionally between the two TAP handles. With
+   permanent peer-neighbor entries installed, valid ARP and IPv6 Neighbor
+   Discovery frames (including Duplicate Address Detection) are recorded and
+   suppressed rather than written to the peer endpoint.
 5. Validates bounded successful round trips, packet identity, protocol
    headers, Ethernet endpoints, payloads, and applicable checksums; malformed,
    truncated, mismatched, cancelled, and timed-out traffic fails
@@ -349,6 +359,57 @@ Every relayed frame has one completed source read, one completed peer write,
 and no retained user buffer after completion or cancellation. Cleanup is
 idempotent, affects only recorded test-created objects, preserves the primary
 failure, and reports cleanup failure separately. REQ-008 remains unchanged.
+
+### REQ-016 — Directional frame isolation and receive indication
+
+**Before:** The TAP write-to-stack and stack-transmit-to-read paths can share
+one frame queue and a write can wake the user-read completion worker. The RX
+ring ownership policy is deferred despite live evidence that a destination
+TAP read can receive the same A-to-B Echo Request that was just injected into
+that destination.
+
+**After:** Each adapter shall maintain two distinct bounded frame queues:
+
+1. An injection queue owns frames captured from successful TAP writes until
+   they are indicated through the NetAdapterCx receive queue.
+2. A capture queue owns frames copied from the NetAdapterCx transmit queue
+   until they complete a TAP read.
+3. No TAP write frame may complete a TAP read, and no stack-transmit frame
+   may be indicated through the receive queue. The queues may share
+   synchronization but shall not share storage, dequeue operations, capacity,
+   or teardown ownership.
+4. A write worker shall notify NetAdapterCx of queued injection work only
+   when receive notification is enabled, at most once for each enable cycle,
+   and without invoking a user-read completion path. Owner-only cleanup that
+   leaves the RX queue running shall preserve an armed notification cycle so a
+   later owner write can request RX polling; queue stop, cancellation, D0
+   exit, and release may disarm it.
+5. `EVT_PACKET_QUEUE_ADVANCE` is the only callback that may populate an RX
+   frame or advance ring entries to indicate a new frame. It shall populate
+   only driver-owned entries from `BeginIndex` up to, but not including,
+   `EndIndex`; clear `Ignore`; explicitly initialize the fragment `Offset` and
+   `ValidLength`; initialize each indicated packet's fragment and layout
+   fields; and advance packet and fragment `BeginIndex` together after a
+   complete frame is available. It shall never modify `EndIndex` or advance
+   `BeginIndex` beyond it. `EVT_PACKET_QUEUE_CANCEL` is the sole exception:
+   it may mark outstanding RX packets ignored and advance packet and fragment
+   `BeginIndex` to `EndIndex` to return those entries to NetAdapterCx.
+6. RX cancellation shall mark unindicated RX packets ignored before returning
+   them to NetAdapterCx, and stop/removal shall release queued injection and
+   captured frames exactly once.
+
+**Trace:** Runtime evidence (KNOWN): the B endpoint returned the original
+A-to-B IPv4 Echo Request instead of a B-to-A Echo Reply; source inspection
+(KNOWN): the current write worker and transmit capture path use the same frame
+queue; Microsoft NetAdapterCx `NET_RING` and RX element-management guidance
+(KNOWN). Extends REQ-002, REQ-003, REQ-006, and REQ-015.
+
+**Invariant impact:** A frame has exactly one directional owner at every
+transition. A pending TAP read cannot steal a frame awaiting stack delivery.
+RX indication mutations occur in queue advance and RX return mutations occur
+only in queue cancellation. Notification remains edge-triggered across
+owner-only cleanup, and teardown cannot leak, duplicate, or misdirect a
+frame.
 
 ## Scope boundaries
 

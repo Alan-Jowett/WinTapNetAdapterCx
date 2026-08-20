@@ -21,8 +21,12 @@ Ethernet frames with the Windows networking stack.
 
 The approved `REQ-008`/`REQ-009` privileged integration change and the
 `CHG-001` through `CHG-014` maintenance patch set are applied, and
-the approved `CHG-015` through `CHG-020` plus `CHG-022` alignment corrections
-are applied. `CHG-021` was superseded by the consolidated D0 change.
+the approved `CHG-015` through `CHG-020`, `CHG-022`, and `CHG-032` alignment
+corrections are applied. `CHG-021` was superseded by the consolidated D0
+change. `CHG-032` keeps stack-RX injection and stack-TX capture in separate
+frame queues so a successful TAP write cannot complete a TAP read. `CHG-033`
+restarts purged manual control queues before a recovered owner or D0 lifecycle
+re-enters the open state.
 Hosted validation covers repository artifacts, Rust WDK tool provisioning,
 CMake configure/build/package, and package shape for x64 and ARM64. The hosted
 workflow runs the existing ICMP TAP and routed dual-adapter harnesses, uploading
@@ -58,7 +62,8 @@ The DuoNIC-style integration harness provisions two disposable root-enumerated
 WinTap adapters, installs reciprocal endpoint host routes, and relays Ethernet
 frames between their independently exclusive TAP handles. It tests unbound
 IPv4 ICMP and IPv6 ICMPv6 traffic through the adapter datapaths rather than
-loopback:
+loopback, detects byte-identical reflected injections, and validates/counts
+then suppresses ARP and IPv6 Neighbor Discovery/DAD control frames:
 
 ```powershell
 .\tests\run-wintap-dual-adapter-harness.ps1 `
@@ -72,6 +77,8 @@ pre-existing WinTap adapters, resolves `devcon.exe` from the pinned WDK, uses
 `198.51.100.1/30`/`198.51.100.2/30` and
 `2001:db8:515:1::1/64`/`2001:db8:515:1::2/64`, and removes the two devices,
 network state, and only a driver-store package added by that run.
+It runs 257 IPv4/IPv6 relay iterations by default; use `-RelayIterations` to
+select a bounded alternative.
 
 ## Intended platform
 

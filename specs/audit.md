@@ -105,3 +105,126 @@ validation, the principal packet/lifetime/concurrency failure modes have
 explicit controls, and no implementation behavior is being asserted without
 an evidence gate. Phase 4 requires user review of this audit and the complete
 specification set.
+
+---
+
+## CHG-032 Specification Audit Revision
+
+**Workflow:** `/evolve`
+**Phase:** Phase 3 — Specification Audit
+**Verdict:** PASS
+**Scope:** REQ-015, REQ-016, the corresponding design, and VAL-016 /
+TC-048 through TC-050.
+
+### Evidence examined
+
+- `specs/requirements.md`, REQ-015 and REQ-016
+- `specs/design.md`, RX indication, synchronization, and relay assertions
+- `specs/validation.md`, VAL-016 and TC-048 through TC-050
+- Pinned `netadaptercx-sys` generated bindings, which expose
+  `NET_FRAGMENT::set_Offset` (KNOWN)
+- RFC 4861 sections 7.1.1 and 7.2.2, which distinguish valid multicast
+  address-resolution, unicast Neighbor Unreachability Detection, and
+  Duplicate Address Detection solicitations (KNOWN)
+
+### Forward traceability
+
+| Requirement / finding | Design coverage | Validation coverage | Result |
+| --- | --- | --- | --- |
+| Directional injection/capture isolation | Separate producer/consumer ownership and TAP-read exclusion | VAL-016, TC-048 | PASS |
+| RX fragment descriptor initialization | RX indication initializes Offset, bounds capacity, sets ValidLength, then indicates | VAL-016, TC-049 under verifier | PASS |
+| RX cancellation ownership return | Cancellation marks `Ignore` and returns entries; documented exception to advance-only indication | VAL-016, TC-049 | PASS |
+| Notification after owner-only cleanup | Preserved arm state while RX remains running; disarm boundaries are explicit | VAL-016, TC-049 | PASS |
+| Valid relay control traffic | RFC 4861 multicast NS, unicast NUD NS, and DAD rules are distinct before suppression | TC-050 | PASS |
+
+### Adversarial falsification
+
+- **Ring-contract contradiction:** Falsified. The prior absolute
+  queue-advance-only wording conflicted with mandatory cancellation return.
+  The revised requirement and design limit cancellation to `Ignore` updates
+  and returning outstanding entries; no callback may use that exception to
+  indicate a new frame.
+- **Stale RX descriptor state:** Falsified. RX indication now has an explicit
+  Offset/ValidLength initialization contract before the frame copy, with
+  capacity bounds and verifier coverage.
+- **Lost notification after owner reopen:** Falsified. The design preserves
+  an already armed notification cycle unless the framework queue/lifecycle
+  boundary actually stops, cancels, suspends, or releases it.
+- **Over-restrictive Neighbor Solicitation filtering:** Falsified. The relay
+  validates only RFC-required DAD constraints, accepts valid unicast NUD
+  probes without a source link-layer option, and still exercises multicast
+  address resolution.
+- **Unverifiable control suppression:** Falsified. TC-050 requires each
+  validated control case to be counted, suppressed, rearmed, and followed by
+  successful IPv4/IPv6 traffic.
+
+### Known execution limitation
+
+TC-049's Driver Verifier and explicit RX capacity/cancel/owner-reopen runtime
+coverage remains a required implementation-validation gate. This is a
+testable deferred execution item, not a specification contradiction or an
+unbounded acceptance criterion.
+
+### Audit verdict
+
+**PASS.** Every revised requirement has coherent design and validation
+coverage. The cancellation exception is narrowly constrained, descriptor and
+notification lifetimes are explicit, and the control-frame contract admits
+the RFC 4861-valid cases needed by the routed relay.
+
+---
+
+## CHG-033 Implementation Audit
+
+**Workflow:** `/evolve`
+**Phase:** Phase 6 — Implementation Audit
+**Verdict:** PASS
+**Finding:** F-033, classified `fix-impl`
+
+### Scope and evidence
+
+- `crates/wintap-netadaptercx-driver/src/lib.rs`
+- `tests/validate-spec-artifacts.ps1`
+- REQ-003, REQ-016, and TC-049
+- Microsoft WDF documentation for `WdfIoQueuePurgeSynchronously` and
+  `WdfIoQueueStart`
+- Local x64 Release package build and package validation
+- `alanjo-ssp` VM owner-reopen smoke and 257-iteration relay stress runs
+
+### Forward traceability
+
+`evt_file_cleanup` and `evt_device_d0_exit` synchronously purge the manual
+read/write queues. WDF documents that purge stops a queue and requires
+`WdfIoQueueStart` before it can receive requests again. CHG-033 resumes both
+queues before `evt_file_cleanup` or `evt_device_d0_entry` publishes
+`INSTANCE_OPEN`, satisfying REQ-003 lifecycle recovery and REQ-016's
+post-owner-reopen RX-notification path.
+
+### Adversarial checks
+
+- **Lock reentrancy:** PASS. `WdfIoQueueStart` runs after
+  `InstanceStateGuard` is dropped. This is required because WDF may
+  synchronously dispatch request handlers while starting a queue.
+- **Terminal teardown:** PASS. `evt_device_release_hardware` remains terminal
+  and does not resume queues.
+- **Lifecycle race:** PASS. Owner cleanup rechecks `INSTANCE_CLOSING` before
+  reopening frame queues, preventing it from overriding a concurrent suspend
+  or release transition.
+- **Error masking:** PASS. The `WdfRequestForwardToIoQueue` diagnostic
+  remains failure-only; CHG-033 adds no retry or success-shaped fallback.
+- **Regression guard:** PASS. The static artifact validator requires
+  `resume_manual_queues` and `WdfIoQueueStart`; TC-049's owner-reopen relay
+  exercises the resulting post-reopen reads and writes.
+
+### Runtime verification
+
+The VM smoke and 257-iteration stress runs completed successfully.
+`OwnerReopenValidated` was `true`; the stress run recorded 516 injection
+frames in each direction, no primary failure, no cleanup error, and no
+remaining WinTap adapter.
+
+### Remaining limitations
+
+Driver Verifier and explicit D0 power-transition execution remain manual
+gates. The implementation was source-audited for the D0 path but this change
+does not claim a completed power-transition runtime test.

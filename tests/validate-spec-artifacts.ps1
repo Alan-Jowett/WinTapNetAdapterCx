@@ -46,8 +46,15 @@ if ($dualHarness -notmatch 'devcon.exe' -or
     $dualHarness -notmatch 'New-NetRoute' -or
     $dualHarness -notmatch 'ICMPv6' -or
     $dualHarness -notmatch 'CancelIoEx' -or
+    $dualHarness -notmatch 'Win32_PnPEntity' -or
     $dualHarness -notmatch 'Assert-ArpFrame' -or
     $dualHarness -notmatch 'Assert-IPv6Icmpv6Structure' -or
+    $dualHarness -notmatch 'Assert-NoReflectedInjection' -or
+    $dualHarness -notmatch 'Test-IPv6NeighborDiscoveryFrame' -or
+    $dualHarness -notmatch 'New-RelayUnicastNeighborSolicitationFrame' -or
+    $dualHarness -notmatch 'Assert-OwnerReopen' -or
+    $dualHarness -notmatch 'OwnerReopenValidated' -or
+    $dualHarness -notmatch 'ControlFrames' -or
     $dualHarness -notmatch '(?s)if \(\$script:PnpRemovalConfirmed\) \{.*?/delete-driver') {
     throw "The routed dual-adapter harness is incomplete."
 }
@@ -59,7 +66,15 @@ if ($source -notmatch 'export_name = "DriverEntry"' -or
     $source -notmatch 'NetPacketFilterFlagAllMulticast' -or
     $source -notmatch 'NetPacketFilterFlagPromiscuous' -or
     $source -notmatch 'MaximumMulticastAddresses:\s*MAXIMUM_MULTICAST_ADDRESSES' -or
-    $source -notmatch 'evt_set_receive_filter') {
+    $source -notmatch 'evt_set_receive_filter' -or
+    $source -notmatch 'injection_queue' -or
+    $source -notmatch 'capture_queue' -or
+    $source -notmatch 'resume_manual_queues' -or
+    $source -notmatch 'WdfIoQueueStart' -or
+    $source -notmatch 'take_rx_notification' -or
+    $source -notmatch 'set_Offset\(0\)' -or
+    $source -notmatch 'set_Ignore\(0\)' -or
+    $source -notmatch 'set_Ignore\(1\)') {
     throw "The Rust driver identity or receive-filter contract is incomplete."
 }
 
