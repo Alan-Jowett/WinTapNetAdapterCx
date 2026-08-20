@@ -31,5 +31,6 @@ lto = true
 panic = "abort"
 
 [profile.release]
+debug = "full"
 lto = true
 panic = "abort"

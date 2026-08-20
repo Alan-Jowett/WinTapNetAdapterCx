@@ -188,8 +188,14 @@ read/write operations, registers its handles and buffers, and remains in its
 completion loop until Ctrl+C or console close. Start it in the VM:
 
 ```powershell
-ssh "$VmUser@$VmIp" C:\Temp\WinTapSwitch\wintap-switch.exe
+ssh "$VmUser@$VmIp" C:\Temp\WinTapSwitch\wintap-switch.exe --read-depth 128
 ```
+
+`--read-depth` controls the total number of pending read buffers. It must be an
+even value from `2` through `256`; buffers are divided equally between the two
+TAP endpoints because completion slot IDs use an 8-bit encoding. The default
+for this experiment branch is `128`, so use `--read-depth 64` or another
+supported value to compare configurations.
 
 Leave it running long enough to confirm it remains alive, then press Ctrl+C.
 A missing endpoint, unavailable I/O-ring capability, registration failure, or

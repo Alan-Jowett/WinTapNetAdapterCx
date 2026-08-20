@@ -2,6 +2,7 @@
 
 #[cfg(windows)]
 mod windows_runtime {
+    use std::env;
     use std::ffi::OsStr;
     use std::mem::MaybeUninit;
     use std::os::windows::ffi::OsStrExt;
@@ -36,6 +37,9 @@ mod windows_runtime {
     const CTRL_CLOSE_EVENT: Dword = 2;
     const CANCEL_COMPLETION_MARKER: Ulonglong = 1_u64 << 62;
     const COMPLETION_WAIT_MILLISECONDS: Dword = 100;
+    const ENDPOINT_COUNT: usize = 2;
+    const DEFAULT_READ_DEPTH: usize = 128;
+    const MAX_READ_DEPTH: usize = 256;
 
     #[repr(C)]
     struct RawIoRingCapabilities {
@@ -188,9 +192,10 @@ mod windows_runtime {
         endpoints: [Endpoint; 2],
         buffers: Vec<Box<[u8; FRAME_MAXIMUM]>>,
         _registered_files: [Handle; 2],
-        _registered_buffers: [IoRingBufferInfo; 2],
+        _registered_buffers: Vec<IoRingBufferInfo>,
         pool: BufferPool,
-        active: [Option<(wintap_switch_core::SlotCompletion, Handle, Ulonglong)>; 2],
+        active: Vec<Option<(wintap_switch_core::SlotCompletion, Handle, Ulonglong)>>,
+        reads_per_endpoint: usize,
     }
 
     impl Drop for Runtime {
@@ -202,7 +207,15 @@ mod windows_runtime {
     }
 
     impl Runtime {
-        fn start() -> Result<Self, String> {
+        fn start(read_depth: usize) -> Result<Self, String> {
+            if read_depth == 0 || read_depth > MAX_READ_DEPTH || read_depth % ENDPOINT_COUNT != 0 {
+                return Err(format!(
+                    "read depth must be an even value between 2 and {MAX_READ_DEPTH}"
+                ));
+            }
+            let reads_per_endpoint = read_depth / ENDPOINT_COUNT;
+            let queue_size =
+                Dword::try_from(read_depth).map_err(|_| "read depth is too large".to_string())?;
             let maximum_version = query_capabilities()?;
 
             let endpoints = [
@@ -221,7 +234,7 @@ mod windows_runtime {
             };
             let mut ring = null_mut();
             check_hr(
-                unsafe { CreateIoRing(IORING_VERSION_3, flags, 8, 8, &mut ring) },
+                unsafe { CreateIoRing(IORING_VERSION_3, flags, queue_size, queue_size, &mut ring) },
                 "CreateIoRing",
             )?;
             let capabilities = IoRingCapabilities {
@@ -251,20 +264,18 @@ mod windows_runtime {
 
             let mut buffers = Vec::new();
             buffers
-                .try_reserve_exact(2)
+                .try_reserve_exact(read_depth)
                 .map_err(|_| "buffer pool allocation failed".to_string())?;
-            buffers.push(Box::new([0; FRAME_MAXIMUM]));
-            buffers.push(Box::new([0; FRAME_MAXIMUM]));
-            let registrations = [
-                IoRingBufferInfo {
-                    address: buffers[0].as_ptr() as *mut u8,
+            for _ in 0..read_depth {
+                buffers.push(Box::new([0; FRAME_MAXIMUM]));
+            }
+            let registrations: Vec<_> = buffers
+                .iter()
+                .map(|buffer| IoRingBufferInfo {
+                    address: buffer.as_ptr() as *mut u8,
                     length: FRAME_MAXIMUM as Dword,
-                },
-                IoRingBufferInfo {
-                    address: buffers[1].as_ptr() as *mut u8,
-                    length: FRAME_MAXIMUM as Dword,
-                },
-            ];
+                })
+                .collect();
             let files = [endpoints[0].handle, endpoints[1].handle];
             check_hr(
                 unsafe {
@@ -304,13 +315,19 @@ mod windows_runtime {
                 buffers,
                 _registered_files: files,
                 _registered_buffers: registrations,
-                pool: BufferPool::new(2),
-                active: [None, None],
+                pool: BufferPool::new(read_depth),
+                active: (0..read_depth).map(|_| None).collect(),
+                reads_per_endpoint,
             };
-            runtime.post_read(0)?;
-            runtime.post_read(1)?;
+            for slot in 0..read_depth {
+                runtime.post_read(slot)?;
+            }
             runtime.submit()?;
             Ok(runtime)
+        }
+
+        fn endpoint_for_slot(&self, slot: usize) -> &Endpoint {
+            &self.endpoints[slot / self.reads_per_endpoint]
         }
 
         fn post_read(&mut self, slot: usize) -> Result<(), String> {
@@ -318,7 +335,7 @@ mod windows_runtime {
                 .pool
                 .begin_read(slot)
                 .map_err(|error| format!("begin read: {error:?}"))?;
-            let endpoint = &self.endpoints[slot];
+            let endpoint = self.endpoint_for_slot(slot);
             check_hr(
                 unsafe {
                     BuildIoRingReadFile(
@@ -407,7 +424,7 @@ mod windows_runtime {
                     self.pool
                         .begin_dispatch(slot_completion)
                         .map_err(|error| format!("read completion: {error:?}"))?;
-                    let source = self.endpoints[slot].id;
+                    let source = self.endpoint_for_slot(slot).id;
                     let length = completion.information as usize;
                     if length <= FRAME_MAXIMUM {
                         let recipients = match switch.forward(source, &self.buffers[slot][..length])
@@ -593,11 +610,36 @@ mod windows_runtime {
         }
     }
 
+    fn parse_read_depth() -> Result<usize, String> {
+        let mut args = env::args().skip(1);
+        let mut read_depth = DEFAULT_READ_DEPTH;
+        while let Some(argument) = args.next() {
+            if argument == "--read-depth" {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--read-depth requires a value".to_string())?;
+                read_depth = value
+                    .parse()
+                    .map_err(|_| format!("invalid read depth '{value}'"))?;
+            } else if argument == "--help" || argument == "-h" {
+                println!(
+                    "Usage: wintap-switch.exe [--read-depth <even count from 2 to {MAX_READ_DEPTH}>]"
+                );
+                println!("Default read depth: {DEFAULT_READ_DEPTH}");
+                std::process::exit(0);
+            } else {
+                return Err(format!("unknown argument '{argument}'"));
+            }
+        }
+        Ok(read_depth)
+    }
+
     pub fn run() -> Result<(), String> {
+        let read_depth = parse_read_depth()?;
         if unsafe { SetConsoleCtrlHandler(Some(console_handler), 1) } == 0 {
             return Err("SetConsoleCtrlHandler failed".to_string());
         }
-        let result = Runtime::start()?.run();
+        let result = Runtime::start(read_depth)?.run();
         unsafe {
             SetConsoleCtrlHandler(Some(console_handler), 0);
         }
