@@ -516,7 +516,7 @@ mod windows_runtime {
     fn decode_completion(value: Ulonglong) -> (usize, u64, bool) {
         (
             (value & 0xff) as usize,
-            (value >> 8) & 0x7fff_ffff_ffff_ffff,
+            (value >> 8) & 0x007f_ffff_ffff_ffff,
             value >> 63 != 0,
         )
     }
