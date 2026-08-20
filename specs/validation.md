@@ -25,6 +25,9 @@
 | VAL-014 | REQ-014 | Verify the harness captures native overlapped-I/O errors within its C# wrappers and reports pending and cancelled requests accurately. |
 | VAL-015 | REQ-015 | In a clean elevated environment, provision two WinTap adapters, verify their identity and independently exclusive TAP handles, install reciprocal IPv4/IPv6 host routes and static neighbors, relay frames in both directions, and verify unbound IPv4 ICMP and IPv6 ICMPv6 round trips plus complete cleanup. |
 | VAL-016 | REQ-016 | With a destination TAP read already pending, inject a routed request into that destination and fail if the destination's reverse-direction TAP read returns the byte-identical injected request. Record/rearm unrelated traffic; accept only a validated stack-originated reply for the round trip. Exercise notification arming across owner close/reopen, RX ring-capacity boundaries, cancellation, and teardown under NetAdapterCx verifier without a bugcheck or ownership violation. |
+| VAL-017 | REQ-017 | Run the two-TAP switch with the two existing static endpoints; verify source MAC/VLAN learning, known-unicast forwarding, unknown-unicast/broadcast/multicast flooding to only the peer, immediate source movement, no source reflection, and fixed 4,096-entry full-table preservation behavior. |
+| VAL-018 | REQ-018 | On every target OS, record I/O-ring maximum version and read/write/scatter/gather support, require successful read/write capability probes before startup, verify bounded registered buffers and operation depths, and verify explicit startup failure when required support is absent. Exercise slot generations, terminal completions, cancellation, endpoint removal, and resource release ordering. |
+| VAL-019 | REQ-019 | Verify the first release discovers and opens exactly the two existing static endpoints through a collection-oriented endpoint model, and confirm the model has no dynamic provisioning or arbitrary-N behavior while preserving stable endpoint identity and teardown isolation. |
 
 | Test | Coverage |
 |---|---|
@@ -60,6 +63,11 @@
 | TC-048 | Pre-post a TAP read on B, relay A's valid IPv4 Echo Request into B, and fail if B's reverse-direction read returns that byte-identical request. Record/rearm unrelated frames; require B's valid Echo Reply to be relayed to A and reported successful by the unbound Ping client. Repeat for ICMPv6. |
 | TC-049 | Exercise injection while RX polling is active and while receive notification is armed. Close and reopen the TAP owner while RX remains running, then verify a later write requests a new RX advance. Send enough valid routed frames to cross at least one RX-ring capacity handoff, then cancel/stop during queued injection. Under NetAdapterCx verifier, verify packet and fragment ownership remains synchronized, no ring entry is returned twice, and no frame leaks into the TAP read path. |
 | TC-050 | With static peer neighbors installed, present valid ARP, multicast Neighbor Solicitation, unicast Neighbor Unreachability Detection Solicitation without a source link-layer option, and Duplicate Address Detection frames to each relay direction. Verify the harness validates and counts them, performs no peer write, remains free of a reflection loop, and still completes the IPv4 and IPv6 Echo tests. |
+| TC-051 | Feed the switch known, unknown, broadcast, multicast, VLAN-tagged, source-move, source-destination, malformed, and unsupported frames on both static endpoints; verify FDB learning and bounded full-table behavior, peer-only flooding, and no reflection. |
+| TC-052 | Probe I/O-ring capabilities on each target OS, verify required contiguous read/write operations before starting, record the selected version, and verify v4 scatter/gather is used only when separately supported and validated. |
+| TC-053 | Saturate configured read/write slots and the 4,096-entry FDB; verify deterministic bounded backpressure or rejection, slot-generation protection, no cross-frame corruption, and recovery after terminal completions. |
+| TC-054 | Cancel and remove either endpoint during pending reads and peer writes; verify no new reads are posted, every original completion is consumed before deregistration/close, stale generations cannot free reused slots, and cleanup preserves the primary failure. |
+| TC-055 | Verify the endpoint collection accepts the two existing static identities without provisioning additional devices, and inspect the endpoint-selection path for collection-based identity lookup rather than a two-branch-only contract. |
 
 ## Functional tests
 
@@ -96,6 +104,9 @@
 - Cancel a pending write while the transmit queue is full.
 - Cancel a pending TAP read while an injection frame is awaiting RX queue
   advance; verify the injection frame cannot be redirected into that read.
+- Cancel or remove one switch endpoint while the other has pending reads,
+  pending writes, and queued forwarding work; verify the endpoint collection
+  drains independently and does not release shared forwarding resources early.
 - Close the owner handle with pending reads, pending writes, queued frames, and
   active framework callbacks.
 - Pause and restart with every queue state and with requests in flight.
@@ -118,6 +129,8 @@
   safe terminal state.
 - Verify no request remains pending after stop, removal, owner close, or
   cancellation completes.
+- Probe unavailable I/O-ring read/write support and verify explicit switch
+  startup failure without partially opened or registered resources.
 
 ## Security tests
 
@@ -154,6 +167,12 @@ from the pinned WDK package, create both root devices, map their identities to
 the two control endpoints, configure the routed IPv4/IPv6 topology, run the
 bidirectional relay, preserve diagnostics, and clean up its devices and any
 driver package it added.
+
+The first-release switch validation uses the same two statically defined
+control endpoints but a collection-oriented endpoint model. It must not add
+dynamic PnP provisioning, arbitrary-N forwarding, or an overlapped-I/O
+fallback. Its I/O-ring capability and completion tests are separate from the
+existing driver overlapped-I/O harness.
 
 The implementation shall use CMake 3.25 or later and a supported Visual
 Studio generator. The repository presets target Visual Studio 18 2026; hosted
@@ -199,3 +218,4 @@ at its source. TC-015, TC-016, TC-017, TC-018, TC-019, TC-020, and TC-022 are
 implementation and specification trace points for the approved maintenance corrections.
 TC-023 through TC-028 provide trace points for REQ-008 and REQ-009.
 TC-042 through TC-047 provide trace points for REQ-015.
+TC-051 through TC-055 provide trace points for REQ-017 through REQ-019.

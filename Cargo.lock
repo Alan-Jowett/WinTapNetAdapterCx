@@ -949,6 +949,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wintap-switch"
+version = "0.1.0"
+dependencies = [
+ "wintap-switch-core",
+]
+
+[[package]]
+name = "wintap-switch-core"
+version = "0.1.0"
+
+[[package]]
 name = "wintap-wdk-bootstrap"
 version = "0.1.0"
 
