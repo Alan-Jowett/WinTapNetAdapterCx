@@ -39,6 +39,7 @@ mod windows_runtime {
     const COMPLETION_WAIT_MILLISECONDS: Dword = 100;
     const ENDPOINT_COUNT: usize = 2;
     const DEFAULT_READ_DEPTH: usize = 128;
+    const MAX_READ_DEPTH: usize = 256;
 
     #[repr(C)]
     struct RawIoRingCapabilities {
@@ -207,9 +208,9 @@ mod windows_runtime {
 
     impl Runtime {
         fn start(read_depth: usize) -> Result<Self, String> {
-            if read_depth == 0 || read_depth % ENDPOINT_COUNT != 0 {
+            if read_depth == 0 || read_depth > MAX_READ_DEPTH || read_depth % ENDPOINT_COUNT != 0 {
                 return Err(format!(
-                    "read depth must be a positive multiple of {ENDPOINT_COUNT}"
+                    "read depth must be an even value between 2 and {MAX_READ_DEPTH}"
                 ));
             }
             let reads_per_endpoint = read_depth / ENDPOINT_COUNT;
@@ -621,7 +622,9 @@ mod windows_runtime {
                     .parse()
                     .map_err(|_| format!("invalid read depth '{value}'"))?;
             } else if argument == "--help" || argument == "-h" {
-                println!("Usage: wintap-switch.exe [--read-depth <even count>]");
+                println!(
+                    "Usage: wintap-switch.exe [--read-depth <even count from 2 to {MAX_READ_DEPTH}>]"
+                );
                 println!("Default read depth: {DEFAULT_READ_DEPTH}");
                 std::process::exit(0);
             } else {
