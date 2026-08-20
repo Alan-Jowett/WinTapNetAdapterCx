@@ -87,3 +87,70 @@ jobs:
         with:
           name: WinTapRust-${{ matrix.architecture }}
           path: out/cmake/${{ matrix.architecture }}/package/${{ matrix.architecture }}/${{ env.BUILD_CONFIGURATION }}/
+
+  single-adapter-integration:
+    name: Existing ICMP TAP integration
+    needs: package
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: WinTapRust-x64
+          path: .\artifacts\WinTapRust-x64
+      - name: Run existing ICMP TAP harness
+        shell: pwsh
+        run: |
+          .\tests\run-wintap-harness.ps1 -Integration `
+            -InstallDriver `
+            -RequireTestSigning `
+            -PackageDirectory .\artifacts\WinTapRust-x64 `
+            -DiagnosticsPath .\artifacts\wintap-harness
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: WinTapHarnessDiagnostics
+          path: artifacts/wintap-harness/
+          if-no-files-found: warn
+
+  dual-adapter-integration:
+    name: Routed dual-adapter integration
+    needs: package
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: WinTapRust-x64
+          path: .\artifacts\WinTapRust-x64
+      - name: Restore pinned WDK DevCon
+        id: devcon
+        shell: pwsh
+        run: |
+          .\scripts\restore-dependencies.ps1 `
+            -Architecture x64 `
+            -Version "${{ env.WINTAP_WDK_VERSION }}" `
+            -OutputDirectory .\out\packages
+          $matches = @(
+            Get-ChildItem .\out\packages -Recurse -Filter devcon.exe -File |
+              Where-Object { $_.Directory.Name -eq "x64" }
+          )
+          if ($matches.Count -ne 1) {
+            throw "Expected exactly one x64 devcon.exe in the restored WDK package; found $($matches.Count)."
+          }
+          "path=$($matches[0].FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Run routed dual-adapter relay harness
+        shell: pwsh
+        run: |
+          .\tests\run-wintap-dual-adapter-harness.ps1 `
+            -PackageDirectory .\artifacts\WinTapRust-x64 `
+            -Architecture x64 `
+            -WdkVersion "${{ env.WINTAP_WDK_VERSION }}" `
+            -DevConPath "${{ steps.devcon.outputs.path }}" `
+            -DiagnosticsPath .\artifacts\wintap-dual-adapter-harness
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: WinTapDualAdapterDiagnostics
+          path: artifacts/wintap-dual-adapter-harness/
+          if-no-files-found: warn

@@ -2,7 +2,7 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 2 — Specification Changes  
-**Status:** Pending specification audit and user approval  
+**Status:** CHG-032 audit revision approved for specification audit
 **Trace source:** `specs/requirements.md` and `specs/design.md`
 
 ## Acceptance criteria
@@ -10,19 +10,21 @@
 | ID | Requirement | Validation |
 | --- | --- | --- |
 | VAL-001 | REQ-001 | Build and install the NetAdapterCx driver; verify one virtual Ethernet adapter appears with the expected capabilities and identity. |
-| VAL-002 | REQ-002 | Write valid Ethernet frames through the device handle and verify delivery to the Windows networking stack; verify invalid nonzero lengths complete with error 87 without enqueuing a frame and zero-byte writes complete as Win32 no-ops; transmit frames through the stack and verify complete reads in user mode. |
+| VAL-002 | REQ-002 | Write valid Ethernet frames through the device handle and verify delivery to the Windows networking stack; verify invalid nonzero lengths complete with error 87 without enqueuing a frame and zero-byte writes complete as Win32 no-ops; transmit frames through the stack and verify complete reads in user mode without crossing the two directions. |
 | VAL-003 | REQ-003 | Exercise start, pause, restart, stop, surprise removal, owner close, process termination, and cancellation; verify no hangs, double completions, or leaked objects. |
 | VAL-004 | REQ-004 | Build and execute the supported x64 and ARM64 packages on Windows 10 version 2004+ and reject unsupported platform combinations explicitly. |
 | VAL-005 | REQ-005 | Verify non-administrator open/control attempts fail; verify malformed nonzero lengths complete with error 87 and invalid I/O requests cannot corrupt memory or disclose data. |
 | VAL-006 | REQ-006 | Run the complete build, install, packet-path, concurrency, cancellation, power, malformed-input, and cleanup suite with Driver Verifier-compatible settings. |
 | VAL-007 | REQ-007 | Configure and build from a clean environment with CMake and the Visual Studio generator for x64 and ARM64; verify NuGet WDK/SDK dependencies resolve reproducibly and missing prerequisites fail at configuration. |
 | VAL-008 | REQ-008 | Run the complete privileged ICMP Echo Request/Echo Reply round trip through the Ethernet/TAP handle using `192.0.2.1/30` and `192.0.2.2`; verify packet fields, checksums, stack completion, timeout behavior, and cleanup. |
-| VAL-009 | REQ-009 | Execute the full REQ-008 assertion set in a GitHub-hosted Windows job and manually in a Hyper-V-capable Windows VM using the same test entry point; fail on unavailable privileged operations rather than skipping. |
+| VAL-009 | REQ-009 | Execute the full REQ-008, REQ-015, and REQ-016 assertion sets in a GitHub-hosted Windows job and manually in a Hyper-V-capable Windows VM using the same entry points; fail on unavailable privileged operations rather than skipping. |
 | VAL-010 | REQ-010 | Build the Rust driver and generated NetAdapterCx bindings from a clean pinned environment for x64 and ARM64; verify binding regeneration, ABI/layout checks, panic-abort configuration, and package production. |
 | VAL-011 | REQ-011 | Verify the repository, CMake targets, workflow, harness, and package validation contain no C/C++ driver source, project, INF, fallback, or selector. |
-| VAL-012 | REQ-012 | Build each package and verify `wintap_netadaptercx_driver.inf`, `wintap_netadaptercx_driver.cat`, service `WinTapRust`, and hardware ID `ROOT\WinTapRust`. |
+| VAL-012 | REQ-012 | Build each package and verify `wintap_netadaptercx_driver.inf`, `wintap_netadaptercx_driver.cat`, service `WinTapRust`, and hardware IDs `ROOT\WinTapRust` and `ROOT\WinTapRust2`. |
 | VAL-013 | REQ-013 | Load the test-signed Rust package with NetAdapterCx verifier enabled; verify directed, broadcast, multicast, all-multicast, and promiscuous capability initialization with a nonzero multicast capacity does not trigger `0x19E/0xB`, and TCP/IP binds successfully. |
 | VAL-014 | REQ-014 | Verify the harness captures native overlapped-I/O errors within its C# wrappers and reports pending and cancelled requests accurately. |
+| VAL-015 | REQ-015 | In a clean elevated environment, provision two WinTap adapters, verify their identity and independently exclusive TAP handles, install reciprocal IPv4/IPv6 host routes and static neighbors, relay frames in both directions, and verify unbound IPv4 ICMP and IPv6 ICMPv6 round trips plus complete cleanup. |
+| VAL-016 | REQ-016 | With a destination TAP read already pending, inject a routed request into that destination and fail if the destination's reverse-direction TAP read returns the byte-identical injected request. Record/rearm unrelated traffic; accept only a validated stack-originated reply for the round trip. Exercise notification arming across owner close/reopen, RX ring-capacity boundaries, cancellation, and teardown under NetAdapterCx verifier without a bugcheck or ownership violation. |
 
 | Test | Coverage |
 |---|---|
@@ -49,6 +51,15 @@
 | TC-038 | Install `ROOT\WinTapRust` after removing any stale C package; verify service `WinTapRust` starts and no C device or service is selected. |
 | TC-040 | Issue an empty-queue overlapped read and verify `ReadFile` returns false with error 997; cancel it and verify `GetOverlappedResult` returns false with error 995. Repeat this error-observation path before ARP/ICMP assertions. |
 | TC-041 | Verify a 0-byte overlapped write completes as a Win32 no-op. Issue 1-byte, 13-byte, and 1515-byte overlapped writes; verify each completes with error 87, transfers no bytes, leaves no queued frame or retained pending request, and is followed by a successful valid-frame write. |
+| TC-042 | In a clean environment, use the pinned WDK DevCon tool to create `ROOT\WinTapRust` and `ROOT\WinTapRust2`; verify exactly two adapters, MAC/control-endpoint mapping, service identity, and independent exclusive opens. Verify any pre-existing matching adapter causes a non-destructive failure. |
+| TC-043 | Assign the REQ-015 IPv4 and IPv6 test addresses, static peer neighbors, exact reciprocal `/32` and `/128` active-store routes, and run-scoped firewall rules. Verify no default route is created and the exact host routes select the opposite egress interface. |
+| TC-044 | Start an unbound IPv4 ICMP Echo to B. Verify the request is read from A, relayed to B, the reply is read from B, relayed to A, and the stack reports success with matching Ethernet/IP/ICMP identities, payload, and checksums. |
+| TC-045 | Start an unbound IPv6 ICMPv6 Echo to B. Verify the same A-to-B and B-to-A relay path, IPv6 endpoint identities, payload, and ICMPv6 pseudo-header checksum. |
+| TC-046 | Exercise malformed/truncated frames, write/read cancellation, route/neighbor/firewall/address failure, partial provisioning, timeout, and device removal. Verify both handles complete before release, only created state is removed, diagnostics persist, and primary failure is retained. |
+| TC-047 | Execute TC-042 through TC-046 using `tests\run-wintap-dual-adapter-harness.ps1` on a GitHub-hosted Windows job and a manual Hyper-V/WinDbg VM; verify shared assertions and no capability-only skip. |
+| TC-048 | Pre-post a TAP read on B, relay A's valid IPv4 Echo Request into B, and fail if B's reverse-direction read returns that byte-identical request. Record/rearm unrelated frames; require B's valid Echo Reply to be relayed to A and reported successful by the unbound Ping client. Repeat for ICMPv6. |
+| TC-049 | Exercise injection while RX polling is active and while receive notification is armed. Close and reopen the TAP owner while RX remains running, then verify a later write requests a new RX advance. Send enough valid routed frames to cross at least one RX-ring capacity handoff, then cancel/stop during queued injection. Under NetAdapterCx verifier, verify packet and fragment ownership remains synchronized, no ring entry is returned twice, and no frame leaks into the TAP read path. |
+| TC-050 | With static peer neighbors installed, present valid ARP, multicast Neighbor Solicitation, unicast Neighbor Unreachability Detection Solicitation without a source link-layer option, and Duplicate Address Detection frames to each relay direction. Verify the harness validates and counts them, performs no peer write, remains free of a reflection loop, and still completes the IPv4 and IPv6 Echo tests. |
 
 ## Functional tests
 
@@ -62,7 +73,8 @@
    contents.
 4. **Multiple outstanding requests:** issue concurrent reads and writes from
    the exclusive owner; verify ordering guarantees documented by the final
-   design and absence of cross-request data.
+   design, absence of cross-request data, and that a pending read cannot
+   consume a queued user-write frame.
 5. **Exclusive ownership:** open the adapter from one elevated process, reject
    a second open, then allow a new owner after clean close and after abnormal
    process termination.
@@ -72,17 +84,27 @@
    no-op; test undersized, oversized, malformed, and partially invalid
    requests; verify invalid nonzero write lengths complete with error 87,
    transfer no bytes, and cause no state damage.
+8. **Routed dual-adapter relay:** provision two clean root-enumerated
+   adapters, relay complete frames between their independent TAP handles, and
+   verify IPv4 and IPv6 stack round trips use the configured adapter routes
+   rather than loopback. With permanent neighbors, validate/count and suppress
+   ARP and IPv6 Neighbor Discovery rather than relaying those control frames.
 
 ## Lifecycle and concurrency tests
 
 - Cancel a pending read while a frame is arriving.
 - Cancel a pending write while the transmit queue is full.
+- Cancel a pending TAP read while an injection frame is awaiting RX queue
+  advance; verify the injection frame cannot be redirected into that read.
 - Close the owner handle with pending reads, pending writes, queued frames, and
   active framework callbacks.
 - Pause and restart with every queue state and with requests in flight.
 - Stop or remove the adapter during each allocation, enqueue, dequeue, copy,
   and completion stage.
 - Race second-open, close, cancellation, pause, restart, and removal operations.
+- Cancel one or both relay reads/writes while the paired topology is active,
+  then verify both handles and all route/neighbor/firewall/device state are
+  restored without affecting a pre-existing adapter.
 - Repeat stress cycles until Driver Verifier, pool tracking, and handle
   tracking remain clean.
 
@@ -120,14 +142,18 @@ The implementation validation package shall include:
 - ETW/WPP or equivalent diagnostics sufficient to correlate request, frame,
   queue, callback, and teardown transitions.
 
-The current harness is `tests/run-wintap-harness.ps1`. It requires an elevated
-administrator PowerShell session and an installed test-signed driver. It
-validates exclusive device open, malformed frame rejection, overlapped read
-cancellation, and successful overlapped writes. The REQ-008 implementation
-shall extend or compose this harness with interface discovery/address
-provisioning, Ethernet/IPv4/ICMP parsing and construction, stack-triggered
-request generation, reply verification, bounded timeouts, diagnostics, and
-idempotent cleanup.
+The existing harness is `tests/run-wintap-harness.ps1`. It requires an
+elevated administrator PowerShell session and an installed test-signed driver.
+It validates exclusive device open, malformed frame rejection, overlapped read
+cancellation, and successful overlapped writes. REQ-008 remains implemented
+through that harness.
+
+The dedicated REQ-015 entry point is
+`tests/run-wintap-dual-adapter-harness.ps1`. It shall resolve `devcon.exe`
+from the pinned WDK package, create both root devices, map their identities to
+the two control endpoints, configure the routed IPv4/IPv6 topology, run the
+bidirectional relay, preserve diagnostics, and clean up its devices and any
+driver package it added.
 
 The implementation shall use CMake 3.25 or later and a supported Visual
 Studio generator. The repository presets target Visual Studio 18 2026; hosted
@@ -149,16 +175,17 @@ query last-error state after a managed-boundary transition.
 
 Hosted CI shall continue to validate artifact presence, PowerShell syntax, WDK
 tool provisioning, CMake configure/build/package, and INF/driver package shape
-for x64 and ARM64. In addition, a privileged Windows job shall install/load
-the test-signed driver and execute the hosted-runner instance of VAL-008 and
-VAL-009 using the same test entry point as the manual VM path. The job must
-upload diagnostics and fail if driver installation, address configuration,
-ARP/ICMP packet exchange, or cleanup is blocked.
+for x64 and ARM64. In addition, a privileged Windows job shall execute the
+hosted-runner instances of VAL-008, VAL-009, and VAL-015 using the same entry
+points as the manual VM path. The job must upload diagnostics and fail if
+driver installation, two-device provisioning, address/route/neighbor/firewall
+configuration, IPv4/IPv6 relay, packet exchange, or cleanup is blocked.
 
-The elevated harness remains runnable manually in a Hyper-V-capable VM. It
-requires an installed test-signed driver and validates the existing I/O
-contract plus the complete REQ-008 round trip. Queue saturation, power,
-removal, and verifier scenarios remain additional privileged acceptance gates.
+The elevated harnesses remain runnable manually in a Hyper-V-capable WinDbg
+VM. They require a test-signed driver and validate the existing I/O contract,
+the complete REQ-008 round trip, and the REQ-015 routed dual-adapter IPv4/IPv6
+relay. Queue saturation, power, removal, and verifier scenarios remain
+additional privileged acceptance gates.
 
 The hosted job and VM procedure must report environment failures explicitly;
 they must not classify an unexecuted packet-path test as passed. VAL-009 is
@@ -171,3 +198,4 @@ It does not pass until cancellation is validated with adapter traffic quiesced
 at its source. TC-015, TC-016, TC-017, TC-018, TC-019, TC-020, and TC-022 are
 implementation and specification trace points for the approved maintenance corrections.
 TC-023 through TC-028 provide trace points for REQ-008 and REQ-009.
+TC-042 through TC-047 provide trace points for REQ-015.
