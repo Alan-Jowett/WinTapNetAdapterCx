@@ -451,6 +451,94 @@ mod windows_runtime {
             Ok((slot, generation, is_write))
         }
 
+        fn process_completion(
+            &mut self,
+            switch: &mut Switch,
+            completion: IoRingCompletion,
+        ) -> Result<(), String> {
+            let (slot, generation, is_write) = self.validate_completion(&completion)?;
+            let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
+            self.active[slot] = None;
+            if is_write {
+                self.pool
+                    .complete_write(slot_completion)
+                    .map_err(|error| format!("write completion: {error:?}"))?;
+                self.post_read(slot)?;
+            } else {
+                self.pool
+                    .begin_dispatch(slot_completion)
+                    .map_err(|error| format!("read completion: {error:?}"))?;
+                let source = self.endpoint_for_slot(slot).id;
+                let length = completion.information as usize;
+                if length <= FRAME_MAXIMUM {
+                    let recipients = match switch.forward(source, &self.buffers[slot][..length]) {
+                        Ok(recipients) => recipients,
+                        Err(ForwardingError::InvalidFrame(_)) => {
+                            self.pool
+                                .complete_dispatch(slot_completion)
+                                .map_err(|error| format!("invalid frame: {error:?}"))?;
+                            self.post_read(slot)?;
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            return Err(format!("forwarding failure: {error:?}"));
+                        }
+                    };
+                    if let Some(destination) = recipients.first() {
+                        let peer = if *destination == self.endpoints[0].id {
+                            self.endpoints[0].handle
+                        } else {
+                            self.endpoints[1].handle
+                        };
+                        self.pool
+                            .begin_writes(slot_completion, 1)
+                            .map_err(|error| format!("begin write: {error:?}"))?;
+                        check_hr(
+                            unsafe {
+                                BuildIoRingWriteFile(
+                                    self.ring,
+                                    handle_ref(peer),
+                                    buffer_ref(slot as Dword),
+                                    length as Dword,
+                                    0,
+                                    FILE_WRITE_FLAG_NONE,
+                                    encode_completion(
+                                        self.endpoint_index_for_slot(slot),
+                                        slot,
+                                        generation,
+                                        true,
+                                    )?,
+                                    IORING_SQE_FLAG_NONE,
+                                )
+                            },
+                            "BuildIoRingWriteFile",
+                        )?;
+                        self.active[slot] = Some((
+                            slot_completion,
+                            peer,
+                            encode_completion(
+                                self.endpoint_index_for_slot(slot),
+                                slot,
+                                generation,
+                                true,
+                            )?,
+                        ));
+                    } else {
+                        self.pool
+                            .complete_dispatch(slot_completion)
+                            .map_err(|error| format!("drop completion: {error:?}"))?;
+                        self.post_read(slot)?;
+                    }
+                } else {
+                    self.pool
+                        .complete_dispatch(slot_completion)
+                        .map_err(|error| format!("invalid frame completion: {error:?}"))?;
+                    self.post_read(slot)?;
+                }
+            }
+            Ok(())
+        }
+
         fn run(&mut self) -> Result<(), String> {
             let mut switch = Switch::static_pair();
             loop {
@@ -464,89 +552,18 @@ mod windows_runtime {
                     continue;
                 }
                 check_hr(status, "PopIoRingCompletion")?;
-                let completion = unsafe { completion.assume_init() };
-                let (slot, generation, is_write) = self.validate_completion(&completion)?;
-                let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
-                self.active[slot] = None;
-                if is_write {
-                    self.pool
-                        .complete_write(slot_completion)
-                        .map_err(|error| format!("write completion: {error:?}"))?;
-                    self.post_read(slot)?;
-                } else {
-                    self.pool
-                        .begin_dispatch(slot_completion)
-                        .map_err(|error| format!("read completion: {error:?}"))?;
-                    let source = self.endpoint_for_slot(slot).id;
-                    let length = completion.information as usize;
-                    if length <= FRAME_MAXIMUM {
-                        let recipients = match switch.forward(source, &self.buffers[slot][..length])
-                        {
-                            Ok(recipients) => recipients,
-                            Err(ForwardingError::InvalidFrame(_)) => {
-                                self.pool
-                                    .complete_dispatch(slot_completion)
-                                    .map_err(|error| format!("invalid frame: {error:?}"))?;
-                                self.post_read(slot)?;
-                                self.submit()?;
-                                continue;
-                            }
-                            Err(error) => {
-                                return Err(format!("forwarding failure: {error:?}"));
-                            }
-                        };
-                        if let Some(destination) = recipients.first() {
-                            let peer = if *destination == self.endpoints[0].id {
-                                self.endpoints[0].handle
-                            } else {
-                                self.endpoints[1].handle
-                            };
-                            self.pool
-                                .begin_writes(slot_completion, 1)
-                                .map_err(|error| format!("begin write: {error:?}"))?;
-                            check_hr(
-                                unsafe {
-                                    BuildIoRingWriteFile(
-                                        self.ring,
-                                        handle_ref(peer),
-                                        buffer_ref(slot as Dword),
-                                        length as Dword,
-                                        0,
-                                        FILE_WRITE_FLAG_NONE,
-                                        encode_completion(
-                                            self.endpoint_index_for_slot(slot),
-                                            slot,
-                                            generation,
-                                            true,
-                                        )?,
-                                        IORING_SQE_FLAG_NONE,
-                                    )
-                                },
-                                "BuildIoRingWriteFile",
-                            )?;
-                            self.active[slot] = Some((
-                                slot_completion,
-                                peer,
-                                encode_completion(
-                                    self.endpoint_index_for_slot(slot),
-                                    slot,
-                                    generation,
-                                    true,
-                                )?,
-                            ));
-                        } else {
-                            self.pool
-                                .complete_dispatch(slot_completion)
-                                .map_err(|error| format!("drop completion: {error:?}"))?;
-                            self.post_read(slot)?;
-                        }
-                    } else {
-                        self.pool
-                            .complete_dispatch(slot_completion)
-                            .map_err(|error| format!("invalid frame completion: {error:?}"))?;
-                        self.post_read(slot)?;
+                self.process_completion(&mut switch, unsafe { completion.assume_init() })?;
+
+                loop {
+                    let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
+                    let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
+                    if status == S_FALSE {
+                        break;
                     }
+                    check_hr(status, "PopIoRingCompletion")?;
+                    self.process_completion(&mut switch, unsafe { completion.assume_init() })?;
                 }
+
                 self.submit()?;
             }
         }
