@@ -312,6 +312,9 @@ mod windows_runtime {
             if total_depth == 0 || total_depth % ENDPOINT_COUNT != 0 {
                 return Err("read depth must be a positive even value".to_string());
             }
+            if total_depth > SLOT_MASK as usize + 1 {
+                return Err("read depth exceeds completion identity capacity".to_string());
+            }
             let reads_per_endpoint = total_depth / ENDPOINT_COUNT;
             let total_bytes = total_depth
                 .checked_mul(FRAME_MAXIMUM)
@@ -424,22 +427,22 @@ mod windows_runtime {
                 check_hr(completion.result_code, "I/O-ring registration")?;
             }
 
+            let pool = BufferPool::try_new(total_depth)
+                .map_err(|error| format!("buffer pool allocation failed: {error:?}"))?;
+            let mut active = Vec::new();
+            active
+                .try_reserve_exact(total_depth)
+                .map_err(|_| "active operation allocation failed".to_string())?;
+            active.resize(total_depth, None);
+            let ring = ring.into_inner();
             let mut runtime = Self {
-                ring: ring.into_inner(),
+                ring,
                 endpoints,
                 buffers,
                 _registered_files: files,
                 _registered_buffers: registrations,
-                pool: BufferPool::try_new(total_depth)
-                    .map_err(|error| format!("buffer pool allocation failed: {error:?}"))?,
-                active: {
-                    let mut active = Vec::new();
-                    active
-                        .try_reserve_exact(total_depth)
-                        .map_err(|_| "active operation allocation failed".to_string())?;
-                    active.resize(total_depth, None);
-                    active
-                },
+                pool,
+                active,
                 reads_per_endpoint,
                 stats: RuntimeStats::new(stats_enabled),
             };
@@ -678,12 +681,13 @@ mod windows_runtime {
                     if slot >= self.active.len() {
                         return Err(format!("cancellation references invalid slot {slot}"));
                     }
-                    let active = self.active[slot]
-                        .take()
-                        .ok_or_else(|| format!("cancellation references inactive slot {slot}"))?;
+                    let Some(active) = self.active[slot] else {
+                        continue;
+                    };
                     if active.2 != operation {
-                        return Err(format!("stale or unexpected cancellation for slot {slot}"));
+                        continue;
                     }
+                    self.active[slot] = None;
                     self.pool
                         .cancel(active.0)
                         .map_err(|error| format!("cancel completion: {error:?}"))?;

@@ -305,6 +305,7 @@ impl BufferPool {
         slot_ref.generation = slot_ref
             .generation
             .checked_add(1)
+            .filter(|generation| *generation <= u32::MAX as u64)
             .ok_or(SlotError::GenerationExhausted)?;
         slot_ref.state = SlotState::ReadPending;
         Ok(SlotCompletion {
@@ -386,6 +387,14 @@ mod tests {
         frame[..6].copy_from_slice(&destination);
         frame[6..12].copy_from_slice(&source);
         frame
+    }
+
+    #[test]
+    fn rejects_generation_beyond_completion_identity_width() {
+        let mut pool = BufferPool::try_new(1).unwrap();
+        pool.slots[0].generation = u32::MAX as u64;
+
+        assert_eq!(pool.begin_read(0), Err(SlotError::GenerationExhausted));
     }
 
     #[test]
