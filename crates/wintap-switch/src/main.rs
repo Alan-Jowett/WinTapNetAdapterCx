@@ -25,6 +25,7 @@ mod windows_runtime {
     const OPEN_EXISTING: Dword = 3;
     const S_OK: HResult = 0;
     const S_FALSE: HResult = 1;
+    const WAIT_TIMEOUT: HResult = 0x8007_05B4u32 as HResult;
     const IORING_OP_READ: Dword = 1;
     const IORING_OP_WRITE: Dword = 5;
     const IORING_SQE_FLAG_NONE: Dword = 0;
@@ -350,10 +351,13 @@ mod windows_runtime {
 
         fn wait_for_completion(&self) -> Result<(), String> {
             let mut submitted = 0;
-            check_hr(
-                unsafe { SubmitIoRing(self.ring, 1, COMPLETION_WAIT_MILLISECONDS, &mut submitted) },
-                "SubmitIoRing wait",
-            )
+            let status =
+                unsafe { SubmitIoRing(self.ring, 1, COMPLETION_WAIT_MILLISECONDS, &mut submitted) };
+            if status == WAIT_TIMEOUT {
+                Ok(())
+            } else {
+                check_hr(status, "SubmitIoRing wait")
+            }
         }
 
         fn validate_completion(
