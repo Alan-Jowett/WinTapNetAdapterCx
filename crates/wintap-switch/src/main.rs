@@ -9,8 +9,8 @@ mod windows_runtime {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use wintap_switch_core::{
-        select_io_ring_version, BufferPool, EndpointId, IoRingCapabilities, IoRingVersion, Switch,
-        FRAME_MAXIMUM,
+        select_io_ring_version, BufferPool, EndpointId, ForwardingError, IoRingCapabilities,
+        IoRingVersion, Switch, FRAME_MAXIMUM,
     };
 
     type Handle = *mut core::ffi::c_void;
@@ -410,9 +410,21 @@ mod windows_runtime {
                     let source = self.endpoints[slot].id;
                     let length = completion.information as usize;
                     if length <= FRAME_MAXIMUM {
-                        let recipients = switch
-                            .forward(source, &self.buffers[slot][..length])
-                            .map_err(|error| format!("forwarding failure: {error:?}"))?;
+                        let recipients = match switch.forward(source, &self.buffers[slot][..length])
+                        {
+                            Ok(recipients) => recipients,
+                            Err(ForwardingError::InvalidFrame(_)) => {
+                                self.pool
+                                    .complete_dispatch(slot_completion)
+                                    .map_err(|error| format!("invalid frame: {error:?}"))?;
+                                self.post_read(slot)?;
+                                self.submit()?;
+                                continue;
+                            }
+                            Err(error) => {
+                                return Err(format!("forwarding failure: {error:?}"));
+                            }
+                        };
                         if let Some(destination) = recipients.first() {
                             let peer = if *destination == self.endpoints[0].id {
                                 self.endpoints[0].handle
