@@ -2,8 +2,8 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 8 — Create Deliverable
-**Status:** Specification package approved; implementation and validation
-changes are being delivered
+**Status:** REQ-021 implementation and validation changes approved and
+delivered
 **Trace source:** `specs/requirements.md` and `specs/design.md`
 
 ## Acceptance criteria
@@ -30,6 +30,9 @@ changes are being delivered
 | VAL-018 | REQ-018 | On every target OS, record I/O-ring maximum version and read/write/scatter/gather support, require successful read/write capability probes before startup, verify bounded registered buffers and operation depths, and verify explicit startup failure when required support is absent. Exercise slot generations, terminal completions, cancellation, endpoint removal, and resource release ordering. |
 | VAL-019 | REQ-019 | Verify the first release discovers and opens exactly the two existing static endpoints through a collection-oriented endpoint model, and confirm the model has no dynamic provisioning or arbitrary-N behavior while preserving stable endpoint identity and teardown isolation. |
 | VAL-020 | REQ-020 | Verify one positive even shared depth is split equally between both endpoints, completion metadata uniquely represents every allocated slot and operation state, and startup fails explicitly for zero, odd, overflowed, unrepresentable, unallocatable, unsupported, or unregistered depths without silently reducing the request. |
+| VAL-021 | REQ-021 | Verify valid writes are captured and completed entirely in the write callback without entering a WDF write queue or scheduling a write work item; verify callback execution level, nonpaged allocation, queue ownership, notification reentrancy, teardown synchronization, and explicit initialization failure when the required inline contract is unavailable. |
+| VAL-022 | REQ-024 | Verify passive-level TX callbacks deliver complete frames directly to compatible pending READ IRPs before returning ring entries; verify elevated-level callbacks use nonpaged capture and passive deferred completion, no TX entry is held indefinitely, too-small reads preserve frame ownership, and cancellation/teardown complete each request exactly once. |
+| VAL-023 | REQ-025 | Verify passive READ delivery claims frame/request ownership under the state lock but performs WDF buffer access, copying, requeue, and completion only after releasing it; verify no duplicate claims across packet callbacks, `evt_io_read`, and the work item, including too-small-buffer, cancellation, stop, and teardown races. |
 
 | Test | Coverage |
 |---|---|
@@ -76,6 +79,11 @@ changes are being delivered
 | TC-059 | Force registered-buffer or operation-registration failure after partial progress; verify startup fails, every previously allocated resource is released exactly once, and no endpoint enters `Running`. |
 | TC-060 | Submit and complete operations using the highest allocated slot IDs, both directions, multiple generations, and cancellation markers; verify encode/decode round trips, rejection of truncation/collision/stale identities, and no release of a reused slot. |
 | TC-061 | Cancel, remove, and shut down with a depth above 256 and outstanding reads/writes on both endpoints; verify all original completions are consumed before deregistration or close and no buffer is reused early. |
+| TC-062 | Submit minimum, normal, and maximum valid frames under idle, full-injection-queue, notification-armed, notification-disarmed, stop, close, and concurrent RX-advance conditions; verify each write completes exactly once, no write enters a WDF manual queue, and accepted frames remain exclusively in the injection path. |
+| TC-063 | Instrument WDF callback execution level and allocation paths; verify every inline write operation is valid at the observed IRQL, uses nonpaged-safe state, and fails adapter initialization explicitly when the required callback contract is unavailable. |
+| TC-064 | Race inline writes with adapter stop, owner close, cancellation, surprise removal, injection-queue close, and notification enable/disable; verify no use-after-free, double completion, retained request, stale notification, or frame leak under NetAdapterCx verifier. |
+| TC-065 | Exercise TX capture with a pending compatible READ at `PASSIVE_LEVEL`; verify direct fragment-to-output-buffer delivery and ring advancement. Repeat at elevated IRQL and verify nonpaged capture, passive work-item delivery, bounded backpressure, no indefinite ring retention, too-small-buffer retry behavior, cancellation, and teardown. |
+| TC-066 | Instrument `evt_io_read` and passive completion paths while a captured frame and READ request are available; verify ownership is claimed under the state lock, the lock is released before WDF buffer retrieval/copy/completion, too-small or failed retrieval requeues the frame under the lock, and concurrent callback/work-item/cancellation/teardown races complete exactly once. |
 
 ## Functional tests
 
@@ -228,3 +236,5 @@ TC-023 through TC-028 provide trace points for REQ-008 and REQ-009.
 TC-042 through TC-047 provide trace points for REQ-015.
 TC-051 through TC-055 provide trace points for REQ-017 through REQ-019.
 TC-056 through TC-061 provide trace points for REQ-020.
+TC-062 through TC-064 provide trace points for REQ-021. TC-065 provides the
+trace point for REQ-024. TC-066 provides the trace point for REQ-025.

@@ -146,14 +146,14 @@ and stopped or deleted only through the verified NetAdapterCx/WDF lifecycle.
 ### User write to Windows networking stack
 
 1. A completed overlapped write request owns its input buffer until validation
-   and enqueueing finish.
+   and inline capture finish.
 2. The driver validates frame length and required Ethernet constraints before
    accepting the frame.
 3. A nonzero write shorter than 14 bytes or longer than 1514 bytes completes
    with `STATUS_INVALID_PARAMETER` before it enters a manual queue, consumes
    pending I/O capacity, or creates a frame object. A zero-byte `WriteFile`
    completes as a Win32 no-op before the request reaches this callback.
-4. Once queued, ownership transfers to a nonpaged frame object owned by the
+4. Once captured, ownership transfers to a nonpaged frame object owned by the
    adapter injection queue. The injection queue is distinct from the queue
    used for stack transmit capture and user reads.
 5. The user request completes only after the driver has copied or otherwise
@@ -180,9 +180,9 @@ and stopped or deleted only through the verified NetAdapterCx/WDF lifecycle.
 
 ### NetAdapterCx RX indication
 
-The injection queue is the software adapter's receive-completion source. A
-write worker captures a validated user frame into that queue, completes the
-write after capture, and never wakes the read-completion worker for that
+The injection queue is the software adapter's receive-completion source. The
+write I/O callback captures a validated user frame into that queue, completes
+the write after capture, and never wakes the read-completion worker for that
 frame. The transmit queue capture path is the only producer for the bounded
 queue consumed by TAP reads.
 
@@ -232,13 +232,67 @@ No separate NetAdapter pause/restart callback API was found in the installed
 headers, so pause/restart remains deferred rather than being represented by
 an invented callback.
 
+### TX capture and READ delivery
+
+TX capture shall preserve the NetAdapterCx ring ownership contract. A packet
+callback owns entries in `[BeginIndex, EndIndex)` and must finish any
+inspection and data copy before advancing `BeginIndex`. It shall not leave
+framework-owned entries indefinitely pending while waiting for a user READ
+IRP, because doing so can exhaust the TX ring and stall the networking stack.
+
+When the TX packet callback is executing at `PASSIVE_LEVEL`, it may match a
+compatible pending READ IRP, retrieve the output buffer, copy the complete
+frame directly from the framework TX fragment(s), complete the request, and
+then return the framework-owned entries. The callback must release any
+adapter/state lock before calling WDF routines that may access request
+buffers or complete requests.
+
+When the callback executes above `PASSIVE_LEVEL`, it must not access a user
+buffer or complete a request requiring user-buffer processing. It shall copy
+the frame into nonpaged driver-owned storage, advance the framework ring, and
+use the existing passive-level work item to drain captured frames into
+pending READ IRPs. A READ callback may opportunistically drain an already
+queued capture frame at passive level, but it shall not inspect or mutate TX
+ring indices.
+
+If no compatible READ IRP is available, the captured frame enters the bounded
+`capture_queue`. If the capture queue is full, the driver shall apply the
+documented deterministic backpressure/error behavior without retaining the
+framework TX entry indefinitely. If a pending READ output buffer is too
+small, the request completes with `STATUS_BUFFER_TOO_SMALL`; the driver
+stages the frame in `capture_queue`, advances the framework ring, and leaves
+the frame available for a later compatible read.
+
+The passive READ callback and completion work item shall use the state lock
+only to transition ownership. The sequence for a queued-frame/READ pair is:
+
+1. Under the state lock, dequeue or claim one captured frame and one READ
+   request, or leave both available if pairing is not possible.
+2. Release the state lock before retrieving the WDF output buffer, copying
+   bytes, requeueing a frame, or completing the request.
+3. If the output buffer is too small or cannot be retrieved, re-acquire the
+   state lock to requeue the still-owned frame, then complete the request
+   outside the lock with the documented error.
+
+Packet callbacks, the passive READ callback, and the work item must use the
+same ownership transitions so a frame or request cannot be claimed twice.
+Teardown closes the capture queue before draining it and prevents new claims;
+already claimed pairs finish through the outside-the-lock completion path.
+
 ## Queue state and backpressure
 
 The design shall maintain separate bounded queues for:
 
-- pending user writes awaiting injection into the networking stack;
 - received Ethernet frames awaiting user reads;
-- pending overlapped reads and writes.
+- pending overlapped reads.
+
+The state lock protects queue and ownership transitions, not WDF request
+buffer access or request completion. Any path that claims a frame or request
+under the lock shall release it before invoking WDF buffer APIs, copying to a
+user buffer, or completing the request.
+
+Write admission shall use a bounded counter and the bounded injection queue;
+valid writes shall not wait in a WDF manual queue.
 
 The injection and captured-frame queues each use the configured frame limit
 independently. They may share a lock when all queue operations use the same
@@ -261,27 +315,26 @@ Each queue shall have explicit states: `OPEN`, `CLOSING`, and `CLOSED`.
   cancelled according to the stop reason.
 - `CLOSED`: all queue references and requests are released; new work fails.
 
-When a frame queue is full, a request may wait only while the queue is `OPEN`.
-Waiting requests must be cancellable. Queue limits shall be finite for a given
-run and configuration shall reject zero, odd, overflowed, or unsupported
-sizes. A requested depth that cannot be represented, allocated, registered,
-or supported by the I/O-ring API shall fail explicitly rather than being
-clamped or wrapped.
-
-The implementation resumes blocked user writes from a passive WDF work item
-after RX ring capacity is consumed; this keeps request-buffer capture on a WDF
-I/O/work-item path rather than doing it from the packet callback.
+When the injection queue is full or closed, an inline write fails
+deterministically; it does not wait in a WDF queue. Queue limits shall be
+finite for a given run and configuration shall reject zero, odd, overflowed,
+or unsupported sizes. A requested depth that cannot be represented, allocated,
+registered, or supported by the I/O-ring API shall fail explicitly rather than
+being clamped or wrapped.
 
 Packet callbacks only manipulate nonpaged driver-owned state and schedule
-passive work for user-buffer access and request completion. RX ring mutation
-is confined to `EVT_PACKET_QUEUE_ADVANCE` for indication and
-`EVT_PACKET_QUEUE_CANCEL` for return; a notification callback may only
-arm/disarm notification and request a subsequent advance.
+passive work for packet-driven user-buffer access and request completion,
+except for the explicitly permitted passive-level direct READ delivery.
+The inline write callback performs its verified capture and request completion
+at its own WDF execution level. RX ring mutation is confined to
+`EVT_PACKET_QUEUE_ADVANCE` for indication and `EVT_PACKET_QUEUE_CANCEL` for
+return; a notification callback may only arm/disarm notification and request
+a subsequent advance.
 
-Pending reads and writes are held by WDF manual queues. WDF owns cancellation
-while a request is queued, and synchronous queue purge owns terminal
-completion during cleanup; the driver does not register a second cancellation
-owner for those requests.
+Pending reads are held by a WDF manual queue. WDF owns cancellation while a
+read request is queued, and synchronous queue purge owns terminal completion
+during cleanup. Valid writes are completed inline and therefore are not
+owned by a pending write queue.
 
 The installed NetAdapterCx ring guidance verifies that a client driver owns
 `[BeginIndex, EndIndex)` and returns completed RX entries by advancing
@@ -302,6 +355,11 @@ ring-capacity and cancellation boundary.
   completions.
 - No user buffer, framework packet, or queue node may be freed while a pending
   callback can still access it.
+- Adapter teardown shall wait for an executing inline write callback before
+  closing the injection queue, destroying its lock, or releasing adapter state.
+- Adapter teardown shall also wait for direct passive-level READ delivery and
+  passive capture-drain work before releasing pending requests, capture
+  frames, or packet-ring state.
 
 ## IRQL and pageability
 
@@ -311,6 +369,13 @@ ring-capacity and cancellation boundary.
 - Blocking queue waits and file-system/user-buffer operations shall run only
   at permitted IRQL and in a context that supports waiting.
 - Pageable code shall not be called from a high-IRQL callback.
+- The write callback's execution-level and allocation contract shall be
+  verified before the adapter is published; unsupported inline requirements
+  shall fail initialization explicitly.
+- The TX capture callback shall branch on its actual execution IRQL. Only a
+  passive-level callback may retrieve READ output buffers or complete a read
+  through direct delivery; elevated-level callbacks shall use nonpaged
+  capture and passive deferred completion.
 - The implementation shall use SAL annotations and verifier-friendly lock
   discipline for every public callback and asynchronous completion path.
 

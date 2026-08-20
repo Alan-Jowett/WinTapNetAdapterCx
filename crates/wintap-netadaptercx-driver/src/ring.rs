@@ -1,6 +1,8 @@
 use core::ffi::c_void;
 
-use netadaptercx_sys::{NET_EXTENSION, NET_FRAGMENT, NET_FRAGMENT_VIRTUAL_ADDRESS, NET_PACKET, NET_RING};
+use netadaptercx_sys::{
+    NET_EXTENSION, NET_FRAGMENT, NET_FRAGMENT_VIRTUAL_ADDRESS, NET_PACKET, NET_RING,
+};
 
 pub const PACKET_RING_INDEX: usize = 0;
 pub const FRAGMENT_RING_INDEX: usize = 1;
@@ -114,9 +116,8 @@ mod tests {
         };
 
         let address = unsafe { fragment_virtual_address(&extension, 2) }.unwrap();
-        assert_eq!(
-            address.cast::<u8>(),
-            unsafe { storage.as_mut_ptr().cast::<u8>().add(32) }
-        );
+        assert_eq!(address.cast::<u8>(), unsafe {
+            storage.as_mut_ptr().cast::<u8>().add(32)
+        });
     }
 }

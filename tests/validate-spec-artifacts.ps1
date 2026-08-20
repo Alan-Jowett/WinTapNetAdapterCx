@@ -71,7 +71,7 @@ if ($source -notmatch 'export_name = "DriverEntry"' -or
     $source -notmatch 'evt_set_receive_filter' -or
     $source -notmatch 'injection_queue' -or
     $source -notmatch 'capture_queue' -or
-    $source -notmatch 'resume_manual_queues' -or
+    $source -notmatch 'resume_manual_queue' -or
     $source -notmatch 'WdfIoQueueStart' -or
     $source -notmatch 'take_rx_notification' -or
     $source -notmatch 'set_Offset\(0\)' -or
