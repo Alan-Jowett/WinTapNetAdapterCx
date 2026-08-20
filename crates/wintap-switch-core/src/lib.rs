@@ -323,6 +323,15 @@ impl BufferPool {
         Ok(())
     }
 
+    pub fn complete_dispatch(&mut self, completion: SlotCompletion) -> Result<(), SlotError> {
+        let slot = self.current(completion)?;
+        if slot.state != SlotState::Dispatching {
+            return Err(SlotError::InvalidTransition);
+        }
+        slot.state = SlotState::Free;
+        Ok(())
+    }
+
     pub fn complete_write(&mut self, completion: SlotCompletion) -> Result<(), SlotError> {
         let slot = self.current(completion)?;
         match slot.state {

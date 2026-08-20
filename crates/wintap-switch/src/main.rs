@@ -34,6 +34,7 @@ mod windows_runtime {
     const CTRL_C_EVENT: Dword = 0;
     const CTRL_CLOSE_EVENT: Dword = 2;
     const CANCEL_COMPLETION_MARKER: Ulonglong = 1_u64 << 62;
+    const COMPLETION_WAIT_MILLISECONDS: Dword = 100;
 
     #[repr(C)]
     struct RawIoRingCapabilities {
@@ -292,6 +293,8 @@ mod windows_runtime {
                     unsafe { PopIoRingCompletion(ring, completion.as_mut_ptr()) },
                     "PopIoRingCompletion",
                 )?;
+                let completion = unsafe { completion.assume_init() };
+                check_hr(completion.result_code, "I/O-ring registration")?;
             }
 
             let mut runtime = Self {
@@ -345,6 +348,35 @@ mod windows_runtime {
             )
         }
 
+        fn wait_for_completion(&self) -> Result<(), String> {
+            let mut submitted = 0;
+            check_hr(
+                unsafe { SubmitIoRing(self.ring, 1, COMPLETION_WAIT_MILLISECONDS, &mut submitted) },
+                "SubmitIoRing wait",
+            )
+        }
+
+        fn validate_completion(
+            &self,
+            completion: &IoRingCompletion,
+        ) -> Result<(usize, u64, bool), String> {
+            let (slot, generation, is_write) = decode_completion(completion.user_data);
+            if slot >= self.active.len() {
+                return Err(format!("completion references invalid slot {slot}"));
+            }
+            let active = self.active[slot]
+                .as_ref()
+                .ok_or_else(|| format!("completion references inactive slot {slot}"))?;
+            if active.0.slot != slot
+                || active.0.generation != generation
+                || active.2 != completion.user_data
+            {
+                return Err(format!("stale or unexpected completion for slot {slot}"));
+            }
+            check_hr(completion.result_code, "I/O-ring operation")?;
+            Ok((slot, generation, is_write))
+        }
+
         fn run(&mut self) -> Result<(), String> {
             let mut switch = Switch::static_pair();
             loop {
@@ -354,12 +386,12 @@ mod windows_runtime {
                 let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
                 let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
                 if status == S_FALSE {
-                    self.submit()?;
+                    self.wait_for_completion()?;
                     continue;
                 }
                 check_hr(status, "PopIoRingCompletion")?;
                 let completion = unsafe { completion.assume_init() };
-                let (slot, generation, is_write) = decode_completion(completion.user_data);
+                let (slot, generation, is_write) = self.validate_completion(&completion)?;
                 let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
                 self.active[slot] = None;
                 if is_write {
@@ -407,9 +439,15 @@ mod windows_runtime {
                                 encode_completion(slot, generation, true),
                             ));
                         } else {
+                            self.pool
+                                .complete_dispatch(slot_completion)
+                                .map_err(|error| format!("drop completion: {error:?}"))?;
                             self.post_read(slot)?;
                         }
                     } else {
+                        self.pool
+                            .complete_dispatch(slot_completion)
+                            .map_err(|error| format!("invalid frame completion: {error:?}"))?;
                         self.post_read(slot)?;
                     }
                 }
@@ -440,14 +478,24 @@ mod windows_runtime {
                 let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
                 let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
                 if status == S_FALSE {
+                    self.wait_for_completion()?;
                     continue;
                 }
                 check_hr(status, "PopIoRingCompletion")?;
                 let completion = unsafe { completion.assume_init() };
                 if completion.user_data & CANCEL_COMPLETION_MARKER != 0 {
+                    let slot = (completion.user_data & 0xff) as usize;
+                    if slot >= self.active.len() {
+                        return Err(format!("cancellation references invalid slot {slot}"));
+                    }
+                    if let Some(active) = self.active[slot].take() {
+                        self.pool
+                            .cancel(active.0)
+                            .map_err(|error| format!("cancel completion: {error:?}"))?;
+                    }
                     continue;
                 }
-                let (slot, generation, _) = decode_completion(completion.user_data);
+                let (slot, generation, _) = self.validate_completion(&completion)?;
                 let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
                 self.pool
                     .cancel(slot_completion)
