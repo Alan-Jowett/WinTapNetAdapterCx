@@ -36,6 +36,10 @@ mod windows_runtime {
     const CTRL_CLOSE_EVENT: Dword = 2;
     const CANCEL_COMPLETION_MARKER: Ulonglong = 1_u64 << 62;
     const COMPLETION_WAIT_MILLISECONDS: Dword = 100;
+    const PENDING_READS_TOTAL: usize = 128;
+    const ENDPOINT_COUNT: usize = 2;
+    const PENDING_READS_PER_ENDPOINT: usize = PENDING_READS_TOTAL / ENDPOINT_COUNT;
+    const IORING_QUEUE_SIZE: Dword = PENDING_READS_TOTAL as Dword;
 
     #[repr(C)]
     struct RawIoRingCapabilities {
@@ -188,9 +192,9 @@ mod windows_runtime {
         endpoints: [Endpoint; 2],
         buffers: Vec<Box<[u8; FRAME_MAXIMUM]>>,
         _registered_files: [Handle; 2],
-        _registered_buffers: [IoRingBufferInfo; 2],
+        _registered_buffers: Vec<IoRingBufferInfo>,
         pool: BufferPool,
-        active: [Option<(wintap_switch_core::SlotCompletion, Handle, Ulonglong)>; 2],
+        active: Vec<Option<(wintap_switch_core::SlotCompletion, Handle, Ulonglong)>>,
     }
 
     impl Drop for Runtime {
@@ -221,7 +225,15 @@ mod windows_runtime {
             };
             let mut ring = null_mut();
             check_hr(
-                unsafe { CreateIoRing(IORING_VERSION_3, flags, 8, 8, &mut ring) },
+                unsafe {
+                    CreateIoRing(
+                        IORING_VERSION_3,
+                        flags,
+                        IORING_QUEUE_SIZE,
+                        IORING_QUEUE_SIZE,
+                        &mut ring,
+                    )
+                },
                 "CreateIoRing",
             )?;
             let capabilities = IoRingCapabilities {
@@ -251,20 +263,18 @@ mod windows_runtime {
 
             let mut buffers = Vec::new();
             buffers
-                .try_reserve_exact(2)
+                .try_reserve_exact(PENDING_READS_TOTAL)
                 .map_err(|_| "buffer pool allocation failed".to_string())?;
-            buffers.push(Box::new([0; FRAME_MAXIMUM]));
-            buffers.push(Box::new([0; FRAME_MAXIMUM]));
-            let registrations = [
-                IoRingBufferInfo {
-                    address: buffers[0].as_ptr() as *mut u8,
+            for _ in 0..PENDING_READS_TOTAL {
+                buffers.push(Box::new([0; FRAME_MAXIMUM]));
+            }
+            let registrations: Vec<_> = buffers
+                .iter()
+                .map(|buffer| IoRingBufferInfo {
+                    address: buffer.as_ptr() as *mut u8,
                     length: FRAME_MAXIMUM as Dword,
-                },
-                IoRingBufferInfo {
-                    address: buffers[1].as_ptr() as *mut u8,
-                    length: FRAME_MAXIMUM as Dword,
-                },
-            ];
+                })
+                .collect();
             let files = [endpoints[0].handle, endpoints[1].handle];
             check_hr(
                 unsafe {
@@ -304,13 +314,18 @@ mod windows_runtime {
                 buffers,
                 _registered_files: files,
                 _registered_buffers: registrations,
-                pool: BufferPool::new(2),
-                active: [None, None],
+                pool: BufferPool::new(PENDING_READS_TOTAL),
+                active: (0..PENDING_READS_TOTAL).map(|_| None).collect(),
             };
-            runtime.post_read(0)?;
-            runtime.post_read(1)?;
+            for slot in 0..PENDING_READS_TOTAL {
+                runtime.post_read(slot)?;
+            }
             runtime.submit()?;
             Ok(runtime)
+        }
+
+        fn endpoint_for_slot(&self, slot: usize) -> &Endpoint {
+            &self.endpoints[slot / PENDING_READS_PER_ENDPOINT]
         }
 
         fn post_read(&mut self, slot: usize) -> Result<(), String> {
@@ -318,7 +333,7 @@ mod windows_runtime {
                 .pool
                 .begin_read(slot)
                 .map_err(|error| format!("begin read: {error:?}"))?;
-            let endpoint = &self.endpoints[slot];
+            let endpoint = self.endpoint_for_slot(slot);
             check_hr(
                 unsafe {
                     BuildIoRingReadFile(
@@ -407,7 +422,7 @@ mod windows_runtime {
                     self.pool
                         .begin_dispatch(slot_completion)
                         .map_err(|error| format!("read completion: {error:?}"))?;
-                    let source = self.endpoints[slot].id;
+                    let source = self.endpoint_for_slot(slot).id;
                     let length = completion.information as usize;
                     if length <= FRAME_MAXIMUM {
                         let recipients = match switch.forward(source, &self.buffers[slot][..length])
