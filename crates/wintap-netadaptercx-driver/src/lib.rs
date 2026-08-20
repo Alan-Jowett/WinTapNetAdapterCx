@@ -1293,6 +1293,36 @@ fn at_passive_level() -> bool {
     unsafe { wdk_sys::ntddk::KeGetCurrentIrql() == 0 }
 }
 
+fn complete_captured_frame_to_read(request: WDFREQUEST, frame: &Frame) -> NTSTATUS {
+    let mut output = core::ptr::null_mut::<c_void>();
+    let mut output_length = 0usize;
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestRetrieveOutputBuffer,
+            request,
+            frame.as_bytes().len(),
+            &mut output,
+            &mut output_length,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+    if output_length < frame.as_bytes().len() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            frame.as_bytes().as_ptr(),
+            output.cast::<u8>(),
+            frame.as_bytes().len(),
+        );
+    }
+    complete_request_with_information(request, STATUS_SUCCESS, frame.as_bytes().len());
+    STATUS_SUCCESS
+}
+
 fn deliver_transmit_packet_to_read(
     state: *mut InstanceState,
     read_queue: WDFQUEUE,
@@ -2165,20 +2195,33 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
-    let state = &mut *state_guard;
-    if state.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+    if state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     }
-    if !try_admit(&state.pending_reads, PENDING_READ_LIMIT) {
+    if !try_admit(&state_guard.pending_reads, PENDING_READ_LIMIT) {
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
     }
-    let target = state.read_queue;
+    let frame = dequeue_capture_frame(&mut *state_guard);
+    if let Some(frame) = frame {
+        release_request(&state_guard.pending_reads);
+        drop(state_guard);
+
+        let status = complete_captured_frame_to_read(request, &frame);
+        if status != STATUS_SUCCESS {
+            if let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) {
+                let state = &mut *state_guard;
+                let _ = enqueue_existing_capture_frame(state, frame);
+                drop(state_guard);
+            }
+            complete_request(request, status);
+        }
+        return;
+    }
+    let target = state_guard.read_queue;
     if !forward_request(request, target) {
-        release_request(&state.pending_reads);
-    } else if has_queued_capture_frame(state) {
-        enqueue_work_item(state.read_work_item);
+        release_request(&state_guard.pending_reads);
     }
 }
 
@@ -2391,60 +2434,44 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
     let Some(state) = (unsafe { instance_from_work_item(work_item) }) else {
         return;
     };
-    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-        return;
-    };
-    let state = &mut *state_guard;
     loop {
         let mut request = core::ptr::null_mut();
-        let status = unsafe {
-            call_unsafe_wdf_function_binding!(
-                WdfIoQueueRetrieveNextRequest,
-                state.read_queue,
-                &mut request,
-            )
-        };
-        if status != STATUS_SUCCESS {
-            return;
-        }
-        let frame = match dequeue_capture_frame(state) {
-            Some(frame) => frame,
-            None => {
-                let target = state.read_queue;
-                if forward_request(request, target) {
-                    return;
-                } else {
-                    release_request(&state.pending_reads);
-                }
+        let frame = {
+            let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+                return;
+            };
+            let state = &mut *state_guard;
+            let status = unsafe {
+                call_unsafe_wdf_function_binding!(
+                    WdfIoQueueRetrieveNextRequest,
+                    state.read_queue,
+                    &mut request,
+                )
+            };
+            if status != STATUS_SUCCESS {
                 return;
             }
+            let frame = match dequeue_capture_frame(state) {
+                Some(frame) => frame,
+                None => {
+                    let target = state.read_queue;
+                    if !forward_request(request, target) {
+                        release_request(&state.pending_reads);
+                    }
+                    return;
+                }
+            };
+            release_request(&state.pending_reads);
+            frame
         };
-        release_request(&state.pending_reads);
-
-        let mut output = core::ptr::null_mut::<c_void>();
-        let mut output_length = 0usize;
-        let status = unsafe {
-            call_unsafe_wdf_function_binding!(
-                WdfRequestRetrieveOutputBuffer,
-                request,
-                frame.as_bytes().len(),
-                &mut output,
-                &mut output_length,
-            )
-        };
+        let status = complete_captured_frame_to_read(request, &frame);
         if status != STATUS_SUCCESS {
-            let _ = enqueue_existing_capture_frame(state, frame);
+            if let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) {
+                let state = &mut *state_guard;
+                let _ = enqueue_existing_capture_frame(state, frame);
+            }
             complete_request(request, status);
-            continue;
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                frame.as_bytes().as_ptr(),
-                output.cast::<u8>(),
-                frame.as_bytes().len(),
-            );
-        }
-        complete_request_with_information(request, STATUS_SUCCESS, frame.as_bytes().len());
     }
 }
 

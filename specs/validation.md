@@ -32,6 +32,7 @@ delivered
 | VAL-020 | REQ-020 | Verify one positive even shared depth is split equally between both endpoints, completion metadata uniquely represents every allocated slot and operation state, and startup fails explicitly for zero, odd, overflowed, unrepresentable, unallocatable, unsupported, or unregistered depths without silently reducing the request. |
 | VAL-021 | REQ-021 | Verify valid writes are captured and completed entirely in the write callback without entering a WDF write queue or scheduling a write work item; verify callback execution level, nonpaged allocation, queue ownership, notification reentrancy, teardown synchronization, and explicit initialization failure when the required inline contract is unavailable. |
 | VAL-022 | REQ-024 | Verify passive-level TX callbacks deliver complete frames directly to compatible pending READ IRPs before returning ring entries; verify elevated-level callbacks use nonpaged capture and passive deferred completion, no TX entry is held indefinitely, too-small reads preserve frame ownership, and cancellation/teardown complete each request exactly once. |
+| VAL-023 | REQ-025 | Verify passive READ delivery claims frame/request ownership under the state lock but performs WDF buffer access, copying, requeue, and completion only after releasing it; verify no duplicate claims across packet callbacks, `evt_io_read`, and the work item, including too-small-buffer, cancellation, stop, and teardown races. |
 
 | Test | Coverage |
 |---|---|
@@ -82,6 +83,7 @@ delivered
 | TC-063 | Instrument WDF callback execution level and allocation paths; verify every inline write operation is valid at the observed IRQL, uses nonpaged-safe state, and fails adapter initialization explicitly when the required callback contract is unavailable. |
 | TC-064 | Race inline writes with adapter stop, owner close, cancellation, surprise removal, injection-queue close, and notification enable/disable; verify no use-after-free, double completion, retained request, stale notification, or frame leak under NetAdapterCx verifier. |
 | TC-065 | Exercise TX capture with a pending compatible READ at `PASSIVE_LEVEL`; verify direct fragment-to-output-buffer delivery and ring advancement. Repeat at elevated IRQL and verify nonpaged capture, passive work-item delivery, bounded backpressure, no indefinite ring retention, too-small-buffer retry behavior, cancellation, and teardown. |
+| TC-066 | Instrument `evt_io_read` and passive completion paths while a captured frame and READ request are available; verify ownership is claimed under the state lock, the lock is released before WDF buffer retrieval/copy/completion, too-small or failed retrieval requeues the frame under the lock, and concurrent callback/work-item/cancellation/teardown races complete exactly once. |
 
 ## Functional tests
 
@@ -235,4 +237,4 @@ TC-042 through TC-047 provide trace points for REQ-015.
 TC-051 through TC-055 provide trace points for REQ-017 through REQ-019.
 TC-056 through TC-061 provide trace points for REQ-020.
 TC-062 through TC-064 provide trace points for REQ-021. TC-065 provides the
-trace point for REQ-024.
+trace point for REQ-024. TC-066 provides the trace point for REQ-025.

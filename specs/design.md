@@ -263,12 +263,33 @@ small, the request completes with `STATUS_BUFFER_TOO_SMALL`; the driver
 stages the frame in `capture_queue`, advances the framework ring, and leaves
 the frame available for a later compatible read.
 
+The passive READ callback and completion work item shall use the state lock
+only to transition ownership. The sequence for a queued-frame/READ pair is:
+
+1. Under the state lock, dequeue or claim one captured frame and one READ
+   request, or leave both available if pairing is not possible.
+2. Release the state lock before retrieving the WDF output buffer, copying
+   bytes, requeueing a frame, or completing the request.
+3. If the output buffer is too small or cannot be retrieved, re-acquire the
+   state lock to requeue the still-owned frame, then complete the request
+   outside the lock with the documented error.
+
+Packet callbacks, the passive READ callback, and the work item must use the
+same ownership transitions so a frame or request cannot be claimed twice.
+Teardown closes the capture queue before draining it and prevents new claims;
+already claimed pairs finish through the outside-the-lock completion path.
+
 ## Queue state and backpressure
 
 The design shall maintain separate bounded queues for:
 
 - received Ethernet frames awaiting user reads;
 - pending overlapped reads.
+
+The state lock protects queue and ownership transitions, not WDF request
+buffer access or request completion. Any path that claims a frame or request
+under the lock shall release it before invoking WDF buffer APIs, copying to a
+user buffer, or completing the request.
 
 Write admission shall use a bounded counter and the bounded injection queue;
 valid writes shall not wait in a WDF manual queue.

@@ -602,6 +602,37 @@ capture queue and the packet ring entry returned rather than held pending.
 Request cancellation, queue exhaustion, callback reentrancy, adapter stop,
 and owner teardown must retain exactly-once completion and frame ownership.
 
+### REQ-025 — Lock-bounded passive READ drain
+
+**Before:** A passive `evt_io_read` callback may retain the state lock while
+claiming a captured frame and READ request, accessing the request buffer, and
+completing or requeueing the operation through the passive work-item path.
+
+**After:** When `evt_io_read` can pair a queued captured frame with a pending
+READ at `PASSIVE_LEVEL`, it shall claim the frame and request while holding
+the state lock, release the lock, and only then retrieve/access the output
+buffer, copy the frame, and complete the request. If the output buffer is
+too small or retrieval fails, it shall preserve frame ownership by requeueing
+the frame under the state lock and complete the request outside the lock.
+The passive work item shall remain available for elevated-IRQL capture and
+for work that cannot be completed by direct pairing.
+
+The implementation shall ensure that packet callbacks, `evt_io_read`, and
+the passive work item cannot claim the same frame or request concurrently.
+Cancellation, adapter stop, surprise removal, queue closure, and teardown
+shall preserve exactly-once request completion and frame ownership.
+
+**Trace:** User request to release the state lock before WDF buffer access and
+request completion; repository evidence in `InstanceStateGuard`,
+`evt_io_read`, `deliver_transmit_packet_to_read`, and
+`evt_read_completion_work_item`; refines REQ-024.
+
+**Invariant impact:** The state lock protects ownership transitions only.
+No WDF buffer retrieval, user-buffer access, frame copy, or request
+completion may occur while that lock is held. Every claimed frame and
+request must have one owner, and all failure paths must either complete the
+request or return the frame to the bounded capture queue.
+
 ## Scope boundaries
 
 - **In scope:** A NetAdapterCx software Ethernet adapter and a TAP-style
@@ -624,7 +655,8 @@ and owner teardown must retain exactly-once completion and frame ownership.
   unambiguous Rust-only driver package.
 - **In scope:** Opportunistic passive-level direct delivery from NetAdapterCx
   TX fragments to pending READ IRPs, with bounded nonpaged capture and
-  passive deferred completion when direct delivery is unavailable.
+  passive deferred completion when direct delivery is unavailable, including
+  lock-bounded pairing and completion outside the state lock.
 - **Out of scope unless explicitly added:** IP/TUN mode (decision: excluded
   from the initial milestone), protocol-specific
   user-mode libraries, packet capture beyond the virtual adapter contract,
@@ -684,9 +716,13 @@ and owner teardown must retain exactly-once completion and frame ownership.
     callbacks use bounded nonpaged capture followed by passive deferred
     completion, and TX ring entries are not held indefinitely waiting for a
     read.
+25. **Resolved:** Passive READ delivery claims frame/request ownership under
+    the state lock but performs WDF buffer access, copying, requeue, and
+    request completion only after releasing that lock.
 
 ## Specification approval gate
 
 REQ-020, REQ-021, and REQ-024 were propagated to the requirements, design,
 and validation specifications and explicitly approved before implementation.
-The package is now carried forward as part of the implementation deliverable.
+REQ-025 is the current specification change and requires approval before
+implementation.
