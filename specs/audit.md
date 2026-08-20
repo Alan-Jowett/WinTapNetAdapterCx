@@ -213,7 +213,7 @@ post-owner-reopen RX-notification path.
 - **Error masking:** PASS. The `WdfRequestForwardToIoQueue` diagnostic
   remains failure-only; CHG-033 adds no retry or success-shaped fallback.
 - **Regression guard:** PASS. The static artifact validator requires
-  `resume_manual_queues` and `WdfIoQueueStart`; TC-049's owner-reopen relay
+  `resume_manual_queue` and `WdfIoQueueStart`; TC-049's owner-reopen relay
   exercises the resulting post-reopen reads and writes.
 
 ### Runtime verification
