@@ -10,8 +10,8 @@ mod windows_runtime {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use wintap_switch_core::{
-        select_io_ring_version, BufferPool, EndpointId, ForwardingError, IoRingCapabilities,
-        IoRingVersion, Switch, FRAME_MAXIMUM,
+        BufferPool, EndpointId, FRAME_MAXIMUM, ForwardingError, IoRingCapabilities, IoRingVersion,
+        Switch, select_io_ring_version,
     };
 
     type Handle = *mut core::ffi::c_void;
@@ -39,7 +39,11 @@ mod windows_runtime {
     const COMPLETION_WAIT_MILLISECONDS: Dword = 100;
     const ENDPOINT_COUNT: usize = 2;
     const DEFAULT_READ_DEPTH: usize = 128;
-    const MAX_READ_DEPTH: usize = 256;
+    const SLOT_BITS: u32 = 31;
+    const ENDPOINT_BIT: u32 = 31;
+    const GENERATION_BITS: u32 = 30;
+    const SLOT_MASK: Ulonglong = (1_u64 << SLOT_BITS) - 1;
+    const GENERATION_MASK: Ulonglong = (1_u64 << GENERATION_BITS) - 1;
 
     #[repr(C)]
     struct RawIoRingCapabilities {
@@ -187,10 +191,28 @@ mod windows_runtime {
         }
     }
 
+    struct IoRingGuard(Handle);
+
+    impl Drop for IoRingGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseIoRing(self.0);
+            }
+        }
+    }
+
+    impl IoRingGuard {
+        fn into_inner(self) -> Handle {
+            let ring = self.0;
+            std::mem::forget(self);
+            ring
+        }
+    }
+
     struct Runtime {
         ring: Handle,
         endpoints: [Endpoint; 2],
-        buffers: Vec<Box<[u8; FRAME_MAXIMUM]>>,
+        buffers: Vec<Vec<u8>>,
         _registered_files: [Handle; 2],
         _registered_buffers: Vec<IoRingBufferInfo>,
         pool: BufferPool,
@@ -207,15 +229,16 @@ mod windows_runtime {
     }
 
     impl Runtime {
-        fn start(read_depth: usize) -> Result<Self, String> {
-            if read_depth == 0 || read_depth > MAX_READ_DEPTH || read_depth % ENDPOINT_COUNT != 0 {
-                return Err(format!(
-                    "read depth must be an even value between 2 and {MAX_READ_DEPTH}"
-                ));
+        fn start(total_depth: usize) -> Result<Self, String> {
+            if total_depth == 0 || total_depth % ENDPOINT_COUNT != 0 {
+                return Err("read depth must be a positive even value".to_string());
             }
-            let reads_per_endpoint = read_depth / ENDPOINT_COUNT;
-            let queue_size =
-                Dword::try_from(read_depth).map_err(|_| "read depth is too large".to_string())?;
+            let reads_per_endpoint = total_depth / ENDPOINT_COUNT;
+            let total_bytes = total_depth
+                .checked_mul(FRAME_MAXIMUM)
+                .ok_or_else(|| "read depth buffer-size calculation overflowed".to_string())?;
+            let queue_size = Dword::try_from(total_depth)
+                .map_err(|_| "read depth exceeds I/O-ring limits".to_string())?;
             let maximum_version = query_capabilities()?;
 
             let endpoints = [
@@ -237,37 +260,40 @@ mod windows_runtime {
                 unsafe { CreateIoRing(IORING_VERSION_3, flags, queue_size, queue_size, &mut ring) },
                 "CreateIoRing",
             )?;
+            let ring = IoRingGuard(ring);
             let capabilities = IoRingCapabilities {
                 maximum_version,
-                supports_read: unsafe { IsIoRingOpSupported(ring, IORING_OP_READ) != 0 },
-                supports_write: unsafe { IsIoRingOpSupported(ring, IORING_OP_WRITE) != 0 },
+                supports_read: unsafe { IsIoRingOpSupported(ring.0, IORING_OP_READ) != 0 },
+                supports_write: unsafe { IsIoRingOpSupported(ring.0, IORING_OP_WRITE) != 0 },
                 supports_read_scatter: false,
                 supports_write_gather: false,
             };
             let version = match select_io_ring_version(capabilities) {
                 Ok(version) => version,
                 Err(error) => {
-                    unsafe {
-                        CloseIoRing(ring);
-                    }
                     return Err(format!(
                         "required I/O-ring capability unavailable: {error:?}"
                     ));
                 }
             };
             if version != IoRingVersion::V3 {
-                unsafe {
-                    CloseIoRing(ring);
-                }
                 return Err("v4 scatter/gather requires dedicated validation".to_string());
             }
 
             let mut buffers = Vec::new();
             buffers
-                .try_reserve_exact(read_depth)
+                .try_reserve_exact(total_depth)
                 .map_err(|_| "buffer pool allocation failed".to_string())?;
-            for _ in 0..read_depth {
-                buffers.push(Box::new([0; FRAME_MAXIMUM]));
+            if total_bytes < FRAME_MAXIMUM {
+                return Err("read depth buffer-size calculation was invalid".to_string());
+            }
+            for _ in 0..total_depth {
+                let mut buffer = Vec::new();
+                buffer
+                    .try_reserve_exact(FRAME_MAXIMUM)
+                    .map_err(|_| "buffer pool allocation failed".to_string())?;
+                buffer.resize(FRAME_MAXIMUM, 0);
+                buffers.push(buffer);
             }
             let registrations: Vec<_> = buffers
                 .iter()
@@ -276,18 +302,25 @@ mod windows_runtime {
                     length: FRAME_MAXIMUM as Dword,
                 })
                 .collect();
+            let registration_count = Dword::try_from(registrations.len())
+                .map_err(|_| "registered buffer count exceeds I/O-ring limits".to_string())?;
             let files = [endpoints[0].handle, endpoints[1].handle];
             check_hr(
                 unsafe {
-                    BuildIoRingRegisterFileHandles(ring, files.len() as Dword, files.as_ptr(), 0)
+                    BuildIoRingRegisterFileHandles(
+                        ring.0,
+                        Dword::try_from(files.len()).expect("static endpoint count fits Dword"),
+                        files.as_ptr(),
+                        0,
+                    )
                 },
                 "BuildIoRingRegisterFileHandles",
             )?;
             check_hr(
                 unsafe {
                     BuildIoRingRegisterBuffers(
-                        ring,
-                        registrations.len() as Dword,
+                        ring.0,
+                        registration_count,
                         registrations.as_ptr(),
                         0,
                     )
@@ -296,13 +329,13 @@ mod windows_runtime {
             )?;
             let mut submitted = 0;
             check_hr(
-                unsafe { SubmitIoRing(ring, 2, 0, &mut submitted) },
+                unsafe { SubmitIoRing(ring.0, 2, 0, &mut submitted) },
                 "SubmitIoRing",
             )?;
             for _ in 0..2 {
                 let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
                 check_hr(
-                    unsafe { PopIoRingCompletion(ring, completion.as_mut_ptr()) },
+                    unsafe { PopIoRingCompletion(ring.0, completion.as_mut_ptr()) },
                     "PopIoRingCompletion",
                 )?;
                 let completion = unsafe { completion.assume_init() };
@@ -310,16 +343,16 @@ mod windows_runtime {
             }
 
             let mut runtime = Self {
-                ring,
+                ring: ring.into_inner(),
                 endpoints,
                 buffers,
                 _registered_files: files,
                 _registered_buffers: registrations,
-                pool: BufferPool::new(read_depth),
-                active: (0..read_depth).map(|_| None).collect(),
+                pool: BufferPool::new(total_depth),
+                active: (0..total_depth).map(|_| None).collect(),
                 reads_per_endpoint,
             };
-            for slot in 0..read_depth {
+            for slot in 0..total_depth {
                 runtime.post_read(slot)?;
             }
             runtime.submit()?;
@@ -328,6 +361,10 @@ mod windows_runtime {
 
         fn endpoint_for_slot(&self, slot: usize) -> &Endpoint {
             &self.endpoints[slot / self.reads_per_endpoint]
+        }
+
+        fn endpoint_index_for_slot(&self, slot: usize) -> usize {
+            slot / self.reads_per_endpoint
         }
 
         fn post_read(&mut self, slot: usize) -> Result<(), String> {
@@ -344,7 +381,12 @@ mod windows_runtime {
                         buffer_ref(slot as Dword),
                         FRAME_MAXIMUM as Dword,
                         0,
-                        encode_completion(slot, completion.generation, false),
+                        encode_completion(
+                            self.endpoint_index_for_slot(slot),
+                            slot,
+                            completion.generation,
+                            false,
+                        )?,
                         IORING_SQE_FLAG_NONE,
                     )
                 },
@@ -353,7 +395,12 @@ mod windows_runtime {
             self.active[slot] = Some((
                 completion,
                 endpoint.handle,
-                encode_completion(slot, completion.generation, false),
+                encode_completion(
+                    self.endpoint_index_for_slot(slot),
+                    slot,
+                    completion.generation,
+                    false,
+                )?,
             ));
             Ok(())
         }
@@ -381,9 +428,15 @@ mod windows_runtime {
             &self,
             completion: &IoRingCompletion,
         ) -> Result<(usize, u64, bool), String> {
-            let (slot, generation, is_write) = decode_completion(completion.user_data);
+            let (endpoint_index, slot, generation, is_write) =
+                decode_completion(completion.user_data)?;
             if slot >= self.active.len() {
                 return Err(format!("completion references invalid slot {slot}"));
+            }
+            if endpoint_index != self.endpoint_index_for_slot(slot) {
+                return Err(format!(
+                    "completion references endpoint {endpoint_index} for slot {slot}"
+                ));
             }
             let active = self.active[slot]
                 .as_ref()
@@ -460,7 +513,12 @@ mod windows_runtime {
                                         length as Dword,
                                         0,
                                         FILE_WRITE_FLAG_NONE,
-                                        encode_completion(slot, generation, true),
+                                        encode_completion(
+                                            self.endpoint_index_for_slot(slot),
+                                            slot,
+                                            generation,
+                                            true,
+                                        )?,
                                         IORING_SQE_FLAG_NONE,
                                     )
                                 },
@@ -469,7 +527,12 @@ mod windows_runtime {
                             self.active[slot] = Some((
                                 slot_completion,
                                 peer,
-                                encode_completion(slot, generation, true),
+                                encode_completion(
+                                    self.endpoint_index_for_slot(slot),
+                                    slot,
+                                    generation,
+                                    true,
+                                )?,
                             ));
                         } else {
                             self.pool
@@ -496,7 +559,7 @@ mod windows_runtime {
                             self.ring,
                             handle_ref(active.1),
                             active.2,
-                            CANCEL_COMPLETION_MARKER | active.0.slot as Ulonglong,
+                            CANCEL_COMPLETION_MARKER | active.2,
                         )
                     },
                     "BuildIoRingCancelRequest",
@@ -517,15 +580,20 @@ mod windows_runtime {
                 check_hr(status, "PopIoRingCompletion")?;
                 let completion = unsafe { completion.assume_init() };
                 if completion.user_data & CANCEL_COMPLETION_MARKER != 0 {
-                    let slot = (completion.user_data & 0xff) as usize;
+                    let operation = completion.user_data & !CANCEL_COMPLETION_MARKER;
+                    let (_, slot, _, _) = decode_completion(operation)?;
                     if slot >= self.active.len() {
                         return Err(format!("cancellation references invalid slot {slot}"));
                     }
-                    if let Some(active) = self.active[slot].take() {
-                        self.pool
-                            .cancel(active.0)
-                            .map_err(|error| format!("cancel completion: {error:?}"))?;
+                    let active = self.active[slot]
+                        .take()
+                        .ok_or_else(|| format!("cancellation references inactive slot {slot}"))?;
+                    if active.2 != operation {
+                        return Err(format!("stale or unexpected cancellation for slot {slot}"));
                     }
+                    self.pool
+                        .cancel(active.0)
+                        .map_err(|error| format!("cancel completion: {error:?}"))?;
                     continue;
                 }
                 let (slot, generation, _) = self.validate_completion(&completion)?;
@@ -590,16 +658,39 @@ mod windows_runtime {
         }
     }
 
-    fn encode_completion(slot: usize, generation: u64, write: bool) -> Ulonglong {
-        (slot as Ulonglong) | (generation << 8) | ((write as Ulonglong) << 63)
+    fn encode_completion(
+        endpoint_index: usize,
+        slot: usize,
+        generation: u64,
+        write: bool,
+    ) -> Result<Ulonglong, String> {
+        let endpoint = Ulonglong::try_from(endpoint_index)
+            .map_err(|_| "endpoint index does not fit completion identity".to_string())?;
+        let slot = Ulonglong::try_from(slot)
+            .map_err(|_| "slot does not fit completion identity".to_string())?;
+        if endpoint > 1 {
+            return Err("endpoint index does not fit completion identity".to_string());
+        }
+        if slot > SLOT_MASK {
+            return Err("slot count exceeds completion identity capacity".to_string());
+        }
+        if generation == 0 || generation > GENERATION_MASK {
+            return Err("slot generation exceeds completion identity capacity".to_string());
+        }
+        Ok(slot | (endpoint << ENDPOINT_BIT) | (generation << 32) | ((write as Ulonglong) << 63))
     }
 
-    fn decode_completion(value: Ulonglong) -> (usize, u64, bool) {
-        (
-            (value & 0xff) as usize,
-            (value >> 8) & 0x007f_ffff_ffff_ffff,
-            value >> 63 != 0,
-        )
+    fn decode_completion(value: Ulonglong) -> Result<(usize, usize, u64, bool), String> {
+        if value & CANCEL_COMPLETION_MARKER != 0 {
+            return Err("completion identity contains cancellation marker".to_string());
+        }
+        let endpoint_index = ((value >> ENDPOINT_BIT) & 1) as usize;
+        let slot = (value & SLOT_MASK) as usize;
+        let generation = (value >> 32) & GENERATION_MASK;
+        if generation == 0 {
+            return Err("completion identity contains invalid generation".to_string());
+        }
+        Ok((endpoint_index, slot, generation, value >> 63 != 0))
     }
 
     fn check_hr(status: HResult, operation: &str) -> Result<(), String> {
@@ -622,9 +713,7 @@ mod windows_runtime {
                     .parse()
                     .map_err(|_| format!("invalid read depth '{value}'"))?;
             } else if argument == "--help" || argument == "-h" {
-                println!(
-                    "Usage: wintap-switch.exe [--read-depth <even count from 2 to {MAX_READ_DEPTH}>]"
-                );
+                println!("Usage: wintap-switch.exe [--read-depth <positive even total>]");
                 println!("Default read depth: {DEFAULT_READ_DEPTH}");
                 std::process::exit(0);
             } else {

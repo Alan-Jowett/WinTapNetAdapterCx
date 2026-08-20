@@ -263,6 +263,7 @@ pub enum SlotError {
     NotFree,
     StaleCompletion,
     InvalidTransition,
+    GenerationExhausted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -293,7 +294,10 @@ impl BufferPool {
         if slot_ref.state != SlotState::Free {
             return Err(SlotError::NotFree);
         }
-        slot_ref.generation = slot_ref.generation.wrapping_add(1);
+        slot_ref.generation = slot_ref
+            .generation
+            .checked_add(1)
+            .ok_or(SlotError::GenerationExhausted)?;
         slot_ref.state = SlotState::ReadPending;
         Ok(SlotCompletion {
             slot,
@@ -464,5 +468,17 @@ mod tests {
         let second = pool.begin_read(0).unwrap();
         assert_eq!(pool.begin_dispatch(first), Err(SlotError::StaleCompletion));
         pool.begin_dispatch(second).unwrap();
+    }
+
+    #[test]
+    fn buffer_pool_supports_slots_above_256() {
+        let mut pool = BufferPool::new(512);
+        let completion = pool.begin_read(511).unwrap();
+        pool.begin_dispatch(completion).unwrap();
+        pool.begin_writes(completion, 1).unwrap();
+        pool.complete_write(completion).unwrap();
+
+        let reused = pool.begin_read(511).unwrap();
+        assert!(reused.generation > completion.generation);
     }
 }

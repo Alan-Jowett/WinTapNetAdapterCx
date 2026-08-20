@@ -2,7 +2,8 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 2 — Specification Changes  
-**Status:** CHG-032 audit revision approved for specification audit
+**Status:** Phase 2 specification changes in progress; REQ-020 propagated
+pending user approval
 **Trace source:** `specs/requirements.md` and `specs/design.md`
 
 ## Acceptance criteria
@@ -28,6 +29,7 @@
 | VAL-017 | REQ-017 | Run the two-TAP switch with the two existing static endpoints; verify source MAC/VLAN learning, known-unicast forwarding, unknown-unicast/broadcast/multicast flooding to only the peer, immediate source movement, no source reflection, and fixed 4,096-entry full-table preservation behavior. |
 | VAL-018 | REQ-018 | On every target OS, record I/O-ring maximum version and read/write/scatter/gather support, require successful read/write capability probes before startup, verify bounded registered buffers and operation depths, and verify explicit startup failure when required support is absent. Exercise slot generations, terminal completions, cancellation, endpoint removal, and resource release ordering. |
 | VAL-019 | REQ-019 | Verify the first release discovers and opens exactly the two existing static endpoints through a collection-oriented endpoint model, and confirm the model has no dynamic provisioning or arbitrary-N behavior while preserving stable endpoint identity and teardown isolation. |
+| VAL-020 | REQ-020 | Verify one positive even shared depth is split equally between both endpoints, completion metadata uniquely represents every allocated slot and operation state, and startup fails explicitly for zero, odd, overflowed, unrepresentable, unallocatable, unsupported, or unregistered depths without silently reducing the request. |
 
 | Test | Coverage |
 |---|---|
@@ -68,6 +70,12 @@
 | TC-053 | Saturate configured read/write slots and the 4,096-entry FDB; verify deterministic bounded backpressure or rejection, slot-generation protection, no cross-frame corruption, and recovery after terminal completions. |
 | TC-054 | Cancel and remove either endpoint during pending reads and peer writes; verify no new reads are posted, every original completion is consumed before deregistration/close, stale generations cannot free reused slots, and cleanup preserves the primary failure. |
 | TC-055 | Verify the endpoint collection accepts the two existing static identities without provisioning additional devices, and inspect the endpoint-selection path for collection-based identity lookup rather than a two-branch-only contract. |
+| TC-056 | Configure several positive even shared depths, including a value greater than 256, and verify equal per-endpoint capacity, successful allocation/registration, saturation behavior, and recovery after terminal completions. |
+| TC-057 | Exercise zero, odd, maximum-integer, arithmetic-overflow, and otherwise unrepresentable depth values; verify deterministic explicit startup errors and no partially published ring, endpoint, or buffer state. |
+| TC-058 | Force buffer allocation failure and I/O-ring depth/resource-limit failure; verify the requested depth is not clamped or wrapped, all partial resources unwind, and the primary failure is preserved. |
+| TC-059 | Force registered-buffer or operation-registration failure after partial progress; verify startup fails, every previously allocated resource is released exactly once, and no endpoint enters `Running`. |
+| TC-060 | Submit and complete operations using the highest allocated slot IDs, both directions, multiple generations, and cancellation markers; verify encode/decode round trips, rejection of truncation/collision/stale identities, and no release of a reused slot. |
+| TC-061 | Cancel, remove, and shut down with a depth above 256 and outstanding reads/writes on both endpoints; verify all original completions are consumed before deregistration or close and no buffer is reused early. |
 
 ## Functional tests
 
@@ -219,3 +227,4 @@ implementation and specification trace points for the approved maintenance corre
 TC-023 through TC-028 provide trace points for REQ-008 and REQ-009.
 TC-042 through TC-047 provide trace points for REQ-015.
 TC-051 through TC-055 provide trace points for REQ-017 through REQ-019.
+TC-056 through TC-061 provide trace points for REQ-020.
