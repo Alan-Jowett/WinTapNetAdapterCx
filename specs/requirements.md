@@ -388,12 +388,12 @@ that destination.
    may be indicated through the receive queue. The queues may share
    synchronization but shall not share storage, dequeue operations, capacity,
    or teardown ownership.
-4. A write worker shall notify NetAdapterCx of queued injection work only
-   when receive notification is enabled, at most once for each enable cycle,
-   and without invoking a user-read completion path. Owner-only cleanup that
-   leaves the RX queue running shall preserve an armed notification cycle so a
-   later owner write can request RX polling; queue stop, cancellation, D0
-   exit, and release may disarm it.
+4. The inline write callback shall notify NetAdapterCx of queued injection
+   work only when receive notification is enabled, at most once for each
+   enable cycle, and without invoking a user-read completion path. Owner-only
+   cleanup that leaves the RX queue running shall preserve an armed
+   notification cycle so a later owner write can request RX polling; queue
+   stop, cancellation, D0 exit, and release may disarm it.
 5. `EVT_PACKET_QUEUE_ADVANCE` is the only callback that may populate an RX
    frame or advance ring entries to indicate a new frame. It shall populate
    only driver-owned entries from `BeginIndex` up to, but not including,
@@ -530,6 +530,41 @@ memory and runtime resources; extends REQ-018 and REQ-019.
 total. Completion identity remains unique for every live operation, and
 resource exhaustion fails before partial publication of the data plane.
 
+### REQ-021 — Inline TAP write processing
+
+**Before:** A valid TAP write is admitted to a pending-write counter,
+forwarded to a WDF manual queue, and later processed by
+`evt_write_drain_work_item`. The worker retrieves the request, copies the
+frame into driver-owned storage, completes the request, and may notify
+NetAdapterCx.
+
+**After:** A valid TAP write shall be processed synchronously by the write
+I/O callback. The callback shall validate the request, capture the frame into
+driver-owned storage, enqueue it into the bounded injection queue, complete
+the request exactly once, and issue at most one receive notification outside
+the state/frame lock. Valid writes shall not be forwarded to a WDF manual
+queue or require a write work item.
+
+The implementation shall verify that the WDF callback execution-level and
+memory-allocation contracts permit every inline operation. If the required
+contract is unavailable, driver initialization shall fail explicitly rather
+than restoring deferred write processing.
+
+The request input buffer shall not be retained after request completion.
+Injection-queue ownership, queue-full and closed-queue rejection, allocation
+failure, adapter stop, owner teardown, and notification state transitions
+shall remain deterministic and exactly-once.
+
+**Trace:** User request to eliminate write-path work-item queueing; repository
+evidence in `evt_io_write`, `evt_write_drain_work_item`,
+`enqueue_injection_frame`, and `notify_more_received_packets`; extends
+REQ-002, REQ-003, REQ-006, and REQ-016.
+
+**Invariant impact:** Inline execution must not race adapter teardown, queue
+closure, cancellation, or notification reentrancy. A request is completed
+only after its frame has been safely captured or rejected, and no user buffer
+or request may remain reachable after completion.
+
 ## Scope boundaries
 
 - **In scope:** A NetAdapterCx software Ethernet adapter and a TAP-style
@@ -601,9 +636,12 @@ resource exhaustion fails before partial publication of the data plane.
     depth across both endpoints, with equal per-endpoint capacity. There is no
     artificial fixed maximum; available memory, checked arithmetic, and
     I/O-ring resource limits determine the effective maximum.
+23. **Resolved:** Valid TAP writes are captured and completed inline by the
+    passive WDF I/O callback; no write manual queue or write work item is
+    required.
 
 ## Specification approval gate
 
-REQ-020 was propagated to the requirements, design, and validation
-specifications and explicitly approved before implementation. The package is
-now carried forward as part of the implementation deliverable.
+REQ-020 and REQ-021 were propagated to the requirements, design, and
+validation specifications and explicitly approved before implementation. The
+package is now carried forward as part of the implementation deliverable.
