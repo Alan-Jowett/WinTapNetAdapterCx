@@ -88,6 +88,159 @@ endpoint identities, MAC/VLAN learning with a bounded 4,096-entry FDB,
 peer-only forwarding decisions, and generation-protected bounded buffer-slot
 state. Dynamic PnP provisioning and arbitrary-N forwarding remain deferred.
 
+## Deploying to a test VM
+
+The following procedure deploys the x64 Rust package and the `wintap-switch`
+executable to a clean, test-signed Windows VM over SSH. The example VM is
+`alanjo-ssp`; replace the VM name, address, and user as needed. Run the local
+PowerShell commands from an elevated 64-bit PowerShell session.
+
+### 1. Build the driver package and switch
+
+Restore the pinned WDK/SDK packages and build the x64 Release package:
+
+```powershell
+cmake --preset vs18-x64-debug
+cmake --build .\out\build\vs2022-x64-debug --config Release --target wintap_package
+cargo build -p wintap-switch --release
+```
+
+The driver package is normally under
+`out\rust-target\x86_64-pc-windows-msvc\release\wintap_netadaptercx_driver_package`.
+The switch executable is under
+`target\release\wintap-switch.exe` unless the WDK build configuration redirects
+Cargo output to `out\rust-target`.
+
+Resolve the pinned x64 DevCon tool:
+
+```powershell
+$DevCon = (Get-ChildItem .\out\packages -Recurse -Filter devcon.exe |
+    Where-Object FullName -Match 'WDK\.x64.*\\x64\\devcon\.exe' |
+    Select-Object -First 1 -ExpandProperty FullName)
+if (-not $DevCon) { throw "Pinned x64 devcon.exe was not found." }
+```
+
+### 2. Resolve the VM address and verify SSH
+
+For a local Hyper-V VM:
+
+```powershell
+$VmName = 'alanjo-ssp'
+$VmIp = Get-VMNetworkAdapter -VMName $VmName |
+    Select-Object -ExpandProperty IPAddresses |
+    Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } |
+    Select-Object -First 1
+if (-not $VmIp) { throw "No IPv4 address was reported for $VmName." }
+
+$VmUser = 'administrator'
+ssh -o StrictHostKeyChecking=accept-new "$VmUser@$VmIp" hostname
+```
+
+SSH must authenticate as an administrator. The VM must be test-signed and
+configured to permit driver installation. Do not use a production machine for
+this procedure.
+
+### 3. Copy the package, DevCon, and switch
+
+```powershell
+$RemoteRoot = 'C:/Temp/WinTapSwitch'
+ssh "$VmUser@$VmIp" "cmd /c if not exist C:\Temp\WinTapSwitch\package mkdir C:\Temp\WinTapSwitch\package"
+
+scp -r .\out\rust-target\x86_64-pc-windows-msvc\release\wintap_netadaptercx_driver_package\* `
+    "$VmUser@${VmIp}:$RemoteRoot/package/"
+scp $DevCon "$VmUser@${VmIp}:$RemoteRoot/devcon.exe"
+
+$SwitchExe = '.\target\release\wintap-switch.exe'
+if (-not (Test-Path $SwitchExe)) {
+    $SwitchExe = '.\out\rust-target\release\wintap-switch.exe'
+}
+if (-not (Test-Path $SwitchExe)) { throw "wintap-switch.exe was not found." }
+scp $SwitchExe "$VmUser@${VmIp}:$RemoteRoot/wintap-switch.exe"
+```
+
+Verify the transfer before running it:
+
+```powershell
+Get-FileHash $SwitchExe -Algorithm SHA256
+ssh "$VmUser@$VmIp" `
+    "powershell -NoProfile -Command Get-FileHash -LiteralPath C:\Temp\WinTapSwitch\wintap-switch.exe -Algorithm SHA256"
+```
+
+### 4. Provision the two static adapters
+
+The first release intentionally provisions exactly `ROOT\WinTapRust` and
+`ROOT\WinTapRust2`; it does not dynamically create arbitrary adapters:
+
+```powershell
+ssh "$VmUser@$VmIp" `
+    "C:\Temp\WinTapSwitch\devcon.exe install C:\Temp\WinTapSwitch\package\wintap_netadaptercx_driver.inf ROOT\WinTapRust"
+ssh "$VmUser@$VmIp" `
+    "C:\Temp\WinTapSwitch\devcon.exe install C:\Temp\WinTapSwitch\package\wintap_netadaptercx_driver.inf ROOT\WinTapRust2"
+```
+
+If either device already exists, stop and use the cleanup commands below
+instead of replacing an unrelated test instance.
+
+### 5. Run the switch startup and shutdown smoke test
+
+The switch opens both TAP endpoints exclusively, probes the required I/O-ring
+read/write operations, registers its handles and buffers, and remains in its
+completion loop until Ctrl+C or console close. Start it in the VM:
+
+```powershell
+ssh "$VmUser@$VmIp" C:\Temp\WinTapSwitch\wintap-switch.exe
+```
+
+Leave it running long enough to confirm it remains alive, then press Ctrl+C.
+A missing endpoint, unavailable I/O-ring capability, registration failure, or
+stale completion is reported as a nonzero startup/termination error. The
+switch currently uses the contiguous v3 path; v4 scatter/gather remains
+disabled until its dedicated validation is complete.
+
+### 6. Run the routed driver relay validation
+
+The existing harness validates the provisioned driver, TAP ownership, routed
+IPv4/IPv6 traffic, cleanup, and Driver Verifier-facing ownership assertions.
+It owns the TAP handles itself, so stop `wintap-switch.exe` before running it:
+
+```powershell
+scp .\tests\run-wintap-dual-adapter-harness.ps1 `
+    "$VmUser@$VmIp:$RemoteRoot/run-wintap-dual-adapter-harness.ps1"
+
+ssh "$VmUser@$VmIp" `
+    "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Temp\WinTapSwitch\run-wintap-dual-adapter-harness.ps1 -PackageDirectory C:\Temp\WinTapSwitch\package -Architecture x64 -DevConPath C:\Temp\WinTapSwitch\devcon.exe -DiagnosticsPath C:\Temp\WinTapSwitch\diagnostics -RelayIterations 257"
+```
+
+The harness uses documentation-only IPv4/IPv6 addresses, exact host routes,
+static neighbors, and run-scoped firewall rules. It refuses to modify
+pre-existing matching adapters and removes only state created by that run.
+Inspect `C:\Temp\WinTapSwitch\diagnostics` after a failure and copy it back
+with `scp -r` before cleaning the VM.
+
+### 7. Clean up the VM
+
+If the harness was not used, remove only the two devices created for this
+test:
+
+```powershell
+ssh "$VmUser@$VmIp" `
+    "C:\Temp\WinTapSwitch\devcon.exe remove ROOT\WinTapRust"
+ssh "$VmUser@$VmIp" `
+    "C:\Temp\WinTapSwitch\devcon.exe remove ROOT\WinTapRust2"
+```
+
+Confirm both identities are gone:
+
+```powershell
+ssh "$VmUser@$VmIp" "C:\Temp\WinTapSwitch\devcon.exe find ROOT\WinTapRust"
+ssh "$VmUser@$VmIp" "C:\Temp\WinTapSwitch\devcon.exe find ROOT\WinTapRust2"
+```
+
+The harness performs this cleanup automatically, including addresses, routes,
+neighbors, firewall rules, PnP instances, and any driver-store package added
+by that invocation. Do not remove a pre-existing Driver Store package by
+hand.
+
 ## Intended platform
 
 - Windows 10 and later
