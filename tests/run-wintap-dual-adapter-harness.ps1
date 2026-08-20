@@ -1032,11 +1032,14 @@ function Increment-RelayControlFrame($Relay, [string]$Kind, [string]$Direction) 
     $Relay.ControlFrames[$Kind][$Direction] = [int]$Relay.ControlFrames[$Kind][$Direction] + 1
 }
 
+function Convert-FrameToKey([byte[]]$Frame) {
+    return [Convert]::ToBase64String($Frame)
+}
+
 function Assert-NoReflectedInjection($Relay, [string]$Direction, [byte[]]$Frame) {
-    foreach ($injectedFrame in $Relay.InjectedFrames[$Direction]) {
-        if (Test-BytesEqual $Frame $injectedFrame) {
-            throw "The $Direction TAP read returned a byte-identical frame injected into that endpoint."
-        }
+    $frameKey = Convert-FrameToKey $Frame
+    if ($Relay.InjectedFrameKeys[$Direction].Contains($frameKey)) {
+        throw "The $Direction TAP read returned a byte-identical frame injected into that endpoint."
     }
 }
 
@@ -1347,9 +1350,13 @@ function Start-Relay([IntPtr]$HandleA, [IntPtr]$HandleB, $Adapters) {
         Adapters = $Adapters
         Reads = @{}
         Writes = @{}
-        InjectedFrames = @{
-            AtoB = [System.Collections.Generic.List[byte[]]]::new()
-            BtoA = [System.Collections.Generic.List[byte[]]]::new()
+        InjectedFrameKeys = @{
+            AtoB = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            BtoA = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        }
+        InjectionFrameCounts = @{
+            AtoB = 0
+            BtoA = 0
         }
         ControlFrames = @{
             Arp = @{ AtoB = 0; BtoA = 0 }
@@ -1393,7 +1400,8 @@ function Complete-RelayRead($Relay, [string]$Direction) {
     }
     $write | Add-Member -NotePropertyName Direction -NotePropertyValue $Direction
     $targetReadDirection = if ($Direction -eq "AtoB") { "BtoA" } else { "AtoB" }
-    $Relay.InjectedFrames[$targetReadDirection].Add([byte[]]$frame.Clone())
+    [void]$Relay.InjectedFrameKeys[$targetReadDirection].Add((Convert-FrameToKey $frame))
+    $Relay.InjectionFrameCounts[$targetReadDirection]++
     $Relay.Reads[$Direction] = $null
     $Relay.Writes[$Direction] = $write
 }
@@ -1725,8 +1733,8 @@ try {
                 ControlFrames = $script:Relay.ControlFrames
                 OwnerReopenValidated = $script:Relay.OwnerReopenValidated
                 InjectionFrameCounts = @{
-                    AtoB = $script:Relay.InjectedFrames["AtoB"].Count
-                    BtoA = $script:Relay.InjectedFrames["BtoA"].Count
+                    AtoB = $script:Relay.InjectionFrameCounts["AtoB"]
+                    BtoA = $script:Relay.InjectionFrameCounts["BtoA"]
                 }
             } | ConvertTo-Json -Depth 5
         }

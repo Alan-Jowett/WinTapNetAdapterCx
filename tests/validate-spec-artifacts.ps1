@@ -50,6 +50,8 @@ if ($dualHarness -notmatch 'devcon.exe' -or
     $dualHarness -notmatch 'Assert-ArpFrame' -or
     $dualHarness -notmatch 'Assert-IPv6Icmpv6Structure' -or
     $dualHarness -notmatch 'Assert-NoReflectedInjection' -or
+    $dualHarness -notmatch 'InjectedFrameKeys' -or
+    $dualHarness -notmatch 'Convert-FrameToKey' -or
     $dualHarness -notmatch 'Test-IPv6NeighborDiscoveryFrame' -or
     $dualHarness -notmatch 'New-RelayUnicastNeighborSolicitationFrame' -or
     $dualHarness -notmatch 'Assert-OwnerReopen' -or
