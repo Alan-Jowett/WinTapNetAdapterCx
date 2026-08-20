@@ -1,9 +1,9 @@
 # WinTapNetAdapterCx Validation Specification
 
 **Workflow:** `/evolve`  
-**Phase:** Phase 2 — Specification Changes  
-**Status:** Phase 2 specification changes in progress; REQ-020 propagated
-pending user approval
+**Phase:** Phase 8 — Create Deliverable
+**Status:** Specification package approved; implementation and validation
+changes are being delivered
 **Trace source:** `specs/requirements.md` and `specs/design.md`
 
 ## Acceptance criteria

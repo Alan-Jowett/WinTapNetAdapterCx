@@ -1,9 +1,9 @@
 # WinTapNetAdapterCx Requirements
 
 **Workflow:** `/evolve`  
-**Phase:** Phase 2 — Specification Changes  
-**Status:** Phase 2 specification changes in progress; REQ-020 propagated
-pending user approval
+**Phase:** Phase 8 — Create Deliverable
+**Status:** Specification package approved; implementation and validation
+changes are being delivered
 **Evidence scope:** `README.md`, repository layout, and user-provided project purpose
 
 ## Change manifest
@@ -604,6 +604,6 @@ resource exhaustion fails before partial publication of the data plane.
 
 ## Specification approval gate
 
-REQ-020 has been propagated to the requirements, design, and validation
-specifications. Phase 3 remains blocked until the user explicitly approves
-the complete specification package.
+REQ-020 was propagated to the requirements, design, and validation
+specifications and explicitly approved before implementation. The package is
+now carried forward as part of the implementation deliverable.

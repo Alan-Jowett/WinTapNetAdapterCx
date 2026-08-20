@@ -1,9 +1,9 @@
 # WinTapNetAdapterCx Design Specification
 
 **Workflow:** `/evolve`  
-**Phase:** Phase 2 — Specification Changes  
-**Status:** Phase 2 specification changes in progress; REQ-020 propagated
-pending user approval
+**Phase:** Phase 8 — Create Deliverable
+**Status:** Specification package approved; implementation and validation
+changes are being delivered
 **Trace source:** `specs/requirements.md`
 
 ## Design principles
@@ -582,12 +582,14 @@ the validated shared total. The total is split equally between the two
 endpoints, with checked multiplication and allocation before ring
 registration. FDB capacity remains 4,096 entries. Each buffer slot has the
 states `Free`, `ReadPending`, `Dispatching`, `WritePending`, and `Free`, with a
-generation counter incremented on reuse. Completion `userData` uses a
-representation wide enough to encode endpoint, every allocated slot, the
-operation direction, cancellation markers, and generation without truncation
-or collision. Encoding and decoding shall use checked operations and reject
-unknown or out-of-range values. A source slot remains unavailable for repost
-until its read and every peer write using that slot have terminal completions.
+generation counter incremented on reuse. Completion `userData` uses bits
+0-30 for the slot, bits 31-62 for the generation, and bit 63 for cancellation.
+The endpoint is derived from the slot partition and the operation direction is
+retained with the active slot, so every live operation remains uniquely
+identified without truncation or collision. Encoding and decoding shall use
+checked operations and reject unknown or out-of-range values. A source slot
+remains unavailable for repost until its read and every peer write using that
+slot have terminal completions.
 
 Startup validates the positive even total, derives equal endpoint capacity,
 checks all size calculations, allocates the complete pool, configures ring
@@ -596,9 +598,9 @@ unwinds all allocated resources and reports the primary error explicitly.
 
 Shutdown, endpoint removal, and cancellation stop new reads, submit operation
 cancellation, drain each original completion, and only then deregister buffers
-and handles or close the ring. A completion with an unknown endpoint, slot,
-direction, or generation is rejected as stale and cannot release a current
-slot. Cancellation markers must identify the same live operation as normal
+and handles or close the ring. A completion with an unknown slot, direction,
+or generation is rejected as stale and cannot release a current slot.
+Cancellation markers must identify the same live operation as normal
 completion metadata. No completion path may free a buffer before all
 operations referencing it have terminated.
 

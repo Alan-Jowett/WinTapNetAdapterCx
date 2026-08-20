@@ -264,6 +264,7 @@ pub enum SlotError {
     StaleCompletion,
     InvalidTransition,
     GenerationExhausted,
+    AllocationFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,15 +279,22 @@ pub struct BufferPool {
 
 impl BufferPool {
     pub fn new(count: usize) -> Self {
-        Self {
-            slots: vec![
-                BufferSlot {
-                    generation: 0,
-                    state: SlotState::Free
-                };
-                count
-            ],
-        }
+        Self::try_new(count).expect("buffer pool allocation failed")
+    }
+
+    pub fn try_new(count: usize) -> Result<Self, SlotError> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(count)
+            .map_err(|_| SlotError::AllocationFailed)?;
+        slots.resize(
+            count,
+            BufferSlot {
+                generation: 0,
+                state: SlotState::Free,
+            },
+        );
+        Ok(Self { slots })
     }
 
     pub fn begin_read(&mut self, slot: usize) -> Result<SlotCompletion, SlotError> {

@@ -36,14 +36,14 @@ mod windows_runtime {
     const FILE_WRITE_FLAG_NONE: Dword = 0;
     const CTRL_C_EVENT: Dword = 0;
     const CTRL_CLOSE_EVENT: Dword = 2;
-    const CANCEL_COMPLETION_MARKER: Ulonglong = 1_u64 << 62;
+    const CANCEL_COMPLETION_MARKER: Ulonglong = 1_u64 << 63;
     const COMPLETION_WAIT_MILLISECONDS: Dword = 100;
     const ENDPOINT_COUNT: usize = 2;
     const DEFAULT_READ_DEPTH: usize = 128;
     const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
     const SLOT_BITS: u32 = 31;
-    const ENDPOINT_BIT: u32 = 31;
-    const GENERATION_BITS: u32 = 30;
+    const GENERATION_SHIFT: u32 = SLOT_BITS;
+    const GENERATION_BITS: u32 = 32;
     const SLOT_MASK: Ulonglong = (1_u64 << SLOT_BITS) - 1;
     const GENERATION_MASK: Ulonglong = (1_u64 << GENERATION_BITS) - 1;
 
@@ -218,7 +218,7 @@ mod windows_runtime {
         _registered_files: [Handle; 2],
         _registered_buffers: Vec<IoRingBufferInfo>,
         pool: BufferPool,
-        active: Vec<Option<(wintap_switch_core::SlotCompletion, Handle, Ulonglong)>>,
+        active: Vec<Option<(wintap_switch_core::SlotCompletion, Handle, Ulonglong, bool)>>,
         reads_per_endpoint: usize,
         stats: RuntimeStats,
     }
@@ -374,13 +374,16 @@ mod windows_runtime {
                 buffer.resize(FRAME_MAXIMUM, 0);
                 buffers.push(buffer);
             }
-            let registrations: Vec<_> = buffers
-                .iter()
-                .map(|buffer| IoRingBufferInfo {
+            let mut registrations = Vec::new();
+            registrations
+                .try_reserve_exact(buffers.len())
+                .map_err(|_| "buffer registration allocation failed".to_string())?;
+            for buffer in &buffers {
+                registrations.push(IoRingBufferInfo {
                     address: buffer.as_ptr() as *mut u8,
                     length: FRAME_MAXIMUM as Dword,
-                })
-                .collect();
+                });
+            }
             let registration_count = Dword::try_from(registrations.len())
                 .map_err(|_| "registered buffer count exceeds I/O-ring limits".to_string())?;
             let files = [endpoints[0].handle, endpoints[1].handle];
@@ -427,8 +430,16 @@ mod windows_runtime {
                 buffers,
                 _registered_files: files,
                 _registered_buffers: registrations,
-                pool: BufferPool::new(total_depth),
-                active: (0..total_depth).map(|_| None).collect(),
+                pool: BufferPool::try_new(total_depth)
+                    .map_err(|error| format!("buffer pool allocation failed: {error:?}"))?,
+                active: {
+                    let mut active = Vec::new();
+                    active
+                        .try_reserve_exact(total_depth)
+                        .map_err(|_| "active operation allocation failed".to_string())?;
+                    active.resize(total_depth, None);
+                    active
+                },
                 reads_per_endpoint,
                 stats: RuntimeStats::new(stats_enabled),
             };
@@ -441,10 +452,6 @@ mod windows_runtime {
 
         fn endpoint_for_slot(&self, slot: usize) -> &Endpoint {
             &self.endpoints[slot / self.reads_per_endpoint]
-        }
-
-        fn endpoint_index_for_slot(&self, slot: usize) -> usize {
-            slot / self.reads_per_endpoint
         }
 
         fn post_read(&mut self, slot: usize) -> Result<(), String> {
@@ -461,12 +468,7 @@ mod windows_runtime {
                         buffer_ref(slot as Dword),
                         FRAME_MAXIMUM as Dword,
                         0,
-                        encode_completion(
-                            self.endpoint_index_for_slot(slot),
-                            slot,
-                            completion.generation,
-                            false,
-                        )?,
+                        encode_completion(slot, completion.generation)?,
                         IORING_SQE_FLAG_NONE,
                     )
                 },
@@ -475,12 +477,8 @@ mod windows_runtime {
             self.active[slot] = Some((
                 completion,
                 endpoint.handle,
-                encode_completion(
-                    self.endpoint_index_for_slot(slot),
-                    slot,
-                    completion.generation,
-                    false,
-                )?,
+                encode_completion(slot, completion.generation)?,
+                false,
             ));
             Ok(())
         }
@@ -508,15 +506,9 @@ mod windows_runtime {
             &self,
             completion: &IoRingCompletion,
         ) -> Result<(usize, u64, bool), String> {
-            let (endpoint_index, slot, generation, is_write) =
-                decode_completion(completion.user_data)?;
+            let (slot, generation) = decode_completion(completion.user_data)?;
             if slot >= self.active.len() {
                 return Err(format!("completion references invalid slot {slot}"));
-            }
-            if endpoint_index != self.endpoint_index_for_slot(slot) {
-                return Err(format!(
-                    "completion references endpoint {endpoint_index} for slot {slot}"
-                ));
             }
             let active = self.active[slot]
                 .as_ref()
@@ -528,7 +520,7 @@ mod windows_runtime {
                 return Err(format!("stale or unexpected completion for slot {slot}"));
             }
             check_hr(completion.result_code, "I/O-ring operation")?;
-            Ok((slot, generation, is_write))
+            Ok((slot, generation, active.3))
         }
 
         fn process_completion(
@@ -582,12 +574,7 @@ mod windows_runtime {
                                     length as Dword,
                                     0,
                                     FILE_WRITE_FLAG_NONE,
-                                    encode_completion(
-                                        self.endpoint_index_for_slot(slot),
-                                        slot,
-                                        generation,
-                                        true,
-                                    )?,
+                                    encode_completion(slot, generation)?,
                                     IORING_SQE_FLAG_NONE,
                                 )
                             },
@@ -596,12 +583,8 @@ mod windows_runtime {
                         self.active[slot] = Some((
                             slot_completion,
                             peer,
-                            encode_completion(
-                                self.endpoint_index_for_slot(slot),
-                                slot,
-                                generation,
-                                true,
-                            )?,
+                            encode_completion(slot, generation)?,
+                            true,
                         ));
                     } else {
                         self.pool
@@ -691,7 +674,7 @@ mod windows_runtime {
                 let completion = unsafe { completion.assume_init() };
                 if completion.user_data & CANCEL_COMPLETION_MARKER != 0 {
                     let operation = completion.user_data & !CANCEL_COMPLETION_MARKER;
-                    let (_, slot, _, _) = decode_completion(operation)?;
+                    let (slot, _) = decode_completion(operation)?;
                     if slot >= self.active.len() {
                         return Err(format!("cancellation references invalid slot {slot}"));
                     }
@@ -768,39 +751,28 @@ mod windows_runtime {
         }
     }
 
-    fn encode_completion(
-        endpoint_index: usize,
-        slot: usize,
-        generation: u64,
-        write: bool,
-    ) -> Result<Ulonglong, String> {
-        let endpoint = Ulonglong::try_from(endpoint_index)
-            .map_err(|_| "endpoint index does not fit completion identity".to_string())?;
+    fn encode_completion(slot: usize, generation: u64) -> Result<Ulonglong, String> {
         let slot = Ulonglong::try_from(slot)
             .map_err(|_| "slot does not fit completion identity".to_string())?;
-        if endpoint > 1 {
-            return Err("endpoint index does not fit completion identity".to_string());
-        }
         if slot > SLOT_MASK {
             return Err("slot count exceeds completion identity capacity".to_string());
         }
         if generation == 0 || generation > GENERATION_MASK {
             return Err("slot generation exceeds completion identity capacity".to_string());
         }
-        Ok(slot | (endpoint << ENDPOINT_BIT) | (generation << 32) | ((write as Ulonglong) << 63))
+        Ok(slot | (generation << GENERATION_SHIFT))
     }
 
-    fn decode_completion(value: Ulonglong) -> Result<(usize, usize, u64, bool), String> {
+    fn decode_completion(value: Ulonglong) -> Result<(usize, u64), String> {
         if value & CANCEL_COMPLETION_MARKER != 0 {
             return Err("completion identity contains cancellation marker".to_string());
         }
-        let endpoint_index = ((value >> ENDPOINT_BIT) & 1) as usize;
         let slot = (value & SLOT_MASK) as usize;
-        let generation = (value >> 32) & GENERATION_MASK;
+        let generation = (value >> GENERATION_SHIFT) & GENERATION_MASK;
         if generation == 0 {
             return Err("completion identity contains invalid generation".to_string());
         }
-        Ok((endpoint_index, slot, generation, value >> 63 != 0))
+        Ok((slot, generation))
     }
 
     fn check_hr(status: HResult, operation: &str) -> Result<(), String> {
