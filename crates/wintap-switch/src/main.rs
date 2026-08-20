@@ -8,6 +8,7 @@ mod windows_runtime {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use wintap_switch_core::{
         BufferPool, EndpointId, FRAME_MAXIMUM, ForwardingError, IoRingCapabilities, IoRingVersion,
@@ -39,6 +40,7 @@ mod windows_runtime {
     const COMPLETION_WAIT_MILLISECONDS: Dword = 100;
     const ENDPOINT_COUNT: usize = 2;
     const DEFAULT_READ_DEPTH: usize = 128;
+    const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
     const SLOT_BITS: u32 = 31;
     const ENDPOINT_BIT: u32 = 31;
     const GENERATION_BITS: u32 = 30;
@@ -218,6 +220,83 @@ mod windows_runtime {
         pool: BufferPool,
         active: Vec<Option<(wintap_switch_core::SlotCompletion, Handle, Ulonglong)>>,
         reads_per_endpoint: usize,
+        stats: RuntimeStats,
+    }
+
+    struct RuntimeStats {
+        enabled: bool,
+        started: Instant,
+        last_report: Instant,
+        wait_calls: u64,
+        signaled_wakes: u64,
+        batches: u64,
+        completions: u64,
+        reads: u64,
+        writes: u64,
+        max_batch: u64,
+    }
+
+    impl RuntimeStats {
+        fn new(enabled: bool) -> Self {
+            let now = Instant::now();
+            Self {
+                enabled,
+                started: now,
+                last_report: now,
+                wait_calls: 0,
+                signaled_wakes: 0,
+                batches: 0,
+                completions: 0,
+                reads: 0,
+                writes: 0,
+                max_batch: 0,
+            }
+        }
+
+        fn record_wait(&mut self, signaled: bool) {
+            self.wait_calls += 1;
+            if signaled {
+                self.signaled_wakes += 1;
+            }
+        }
+
+        fn record_batch(&mut self, reads: u64, writes: u64) {
+            let completions = reads + writes;
+            self.batches += 1;
+            self.completions += completions;
+            self.reads += reads;
+            self.writes += writes;
+            self.max_batch = self.max_batch.max(completions);
+            self.report(false);
+        }
+
+        fn report(&mut self, force: bool) {
+            if !self.enabled || (!force && self.last_report.elapsed() < STATS_REPORT_INTERVAL) {
+                return;
+            }
+            let elapsed = self.started.elapsed().as_secs_f64();
+            let average_batch = if self.batches == 0 {
+                0.0
+            } else {
+                self.completions as f64 / self.batches as f64
+            };
+            let average_reads_per_wake = if self.signaled_wakes == 0 {
+                0.0
+            } else {
+                self.reads as f64 / self.signaled_wakes as f64
+            };
+            eprintln!(
+                "io-ring stats: elapsed={elapsed:.1}s waits={} signaled_wakes={} batches={} completions={} reads={} writes={} avg_completions_per_batch={average_batch:.2} avg_reads_per_wake={average_reads_per_wake:.2} max_batch={}",
+                self.wait_calls,
+                self.signaled_wakes,
+                self.batches,
+                self.completions,
+                self.reads,
+                self.writes,
+                self.max_batch,
+            );
+            self.last_report = Instant::now();
+        }
     }
 
     impl Drop for Runtime {
@@ -229,7 +308,7 @@ mod windows_runtime {
     }
 
     impl Runtime {
-        fn start(total_depth: usize) -> Result<Self, String> {
+        fn start(total_depth: usize, stats_enabled: bool) -> Result<Self, String> {
             if total_depth == 0 || total_depth % ENDPOINT_COUNT != 0 {
                 return Err("read depth must be a positive even value".to_string());
             }
@@ -351,6 +430,7 @@ mod windows_runtime {
                 pool: BufferPool::new(total_depth),
                 active: (0..total_depth).map(|_| None).collect(),
                 reads_per_endpoint,
+                stats: RuntimeStats::new(stats_enabled),
             };
             for slot in 0..total_depth {
                 runtime.post_read(slot)?;
@@ -413,14 +493,14 @@ mod windows_runtime {
             )
         }
 
-        fn wait_for_completion(&self) -> Result<(), String> {
+        fn wait_for_completion(&self) -> Result<bool, String> {
             let mut submitted = 0;
             let status =
                 unsafe { SubmitIoRing(self.ring, 1, COMPLETION_WAIT_MILLISECONDS, &mut submitted) };
             if status == WAIT_TIMEOUT {
-                Ok(())
+                Ok(false)
             } else {
-                check_hr(status, "SubmitIoRing wait")
+                check_hr(status, "SubmitIoRing wait").map(|()| true)
             }
         }
 
@@ -455,7 +535,7 @@ mod windows_runtime {
             &mut self,
             switch: &mut Switch,
             completion: IoRingCompletion,
-        ) -> Result<(), String> {
+        ) -> Result<bool, String> {
             let (slot, generation, is_write) = self.validate_completion(&completion)?;
             let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
             self.active[slot] = None;
@@ -478,7 +558,7 @@ mod windows_runtime {
                                 .complete_dispatch(slot_completion)
                                 .map_err(|error| format!("invalid frame: {error:?}"))?;
                             self.post_read(slot)?;
-                            return Ok(());
+                            return Ok(true);
                         }
                         Err(error) => {
                             return Err(format!("forwarding failure: {error:?}"));
@@ -536,23 +616,31 @@ mod windows_runtime {
                     self.post_read(slot)?;
                 }
             }
-            Ok(())
+            Ok(!is_write)
         }
 
         fn run(&mut self) -> Result<(), String> {
             let mut switch = Switch::static_pair();
             loop {
                 if STOP_REQUESTED.load(Ordering::SeqCst) {
+                    self.stats.report(true);
                     return self.shutdown();
                 }
                 let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
                 let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
                 if status == S_FALSE {
-                    self.wait_for_completion()?;
+                    let signaled = self.wait_for_completion()?;
+                    self.stats.record_wait(signaled);
                     continue;
                 }
                 check_hr(status, "PopIoRingCompletion")?;
-                self.process_completion(&mut switch, unsafe { completion.assume_init() })?;
+                let mut reads = 0;
+                let mut writes = 0;
+                if self.process_completion(&mut switch, unsafe { completion.assume_init() })? {
+                    reads += 1;
+                } else {
+                    writes += 1;
+                }
 
                 loop {
                     let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
@@ -561,9 +649,14 @@ mod windows_runtime {
                         break;
                     }
                     check_hr(status, "PopIoRingCompletion")?;
-                    self.process_completion(&mut switch, unsafe { completion.assume_init() })?;
+                    if self.process_completion(&mut switch, unsafe { completion.assume_init() })? {
+                        reads += 1;
+                    } else {
+                        writes += 1;
+                    }
                 }
 
+                self.stats.record_batch(reads, writes);
                 self.submit()?;
             }
         }
@@ -718,9 +811,10 @@ mod windows_runtime {
         }
     }
 
-    fn parse_read_depth() -> Result<usize, String> {
+    fn parse_arguments() -> Result<(usize, bool), String> {
         let mut args = env::args().skip(1);
         let mut read_depth = DEFAULT_READ_DEPTH;
+        let mut stats_enabled = false;
         while let Some(argument) = args.next() {
             if argument == "--read-depth" {
                 let value = args
@@ -729,23 +823,26 @@ mod windows_runtime {
                 read_depth = value
                     .parse()
                     .map_err(|_| format!("invalid read depth '{value}'"))?;
+            } else if argument == "--stats" {
+                stats_enabled = true;
             } else if argument == "--help" || argument == "-h" {
-                println!("Usage: wintap-switch.exe [--read-depth <positive even total>]");
+                println!("Usage: wintap-switch.exe [--read-depth <positive even total>] [--stats]");
                 println!("Default read depth: {DEFAULT_READ_DEPTH}");
+                println!("--stats reports I/O-ring batching counters every 5 seconds");
                 std::process::exit(0);
             } else {
                 return Err(format!("unknown argument '{argument}'"));
             }
         }
-        Ok(read_depth)
+        Ok((read_depth, stats_enabled))
     }
 
     pub fn run() -> Result<(), String> {
-        let read_depth = parse_read_depth()?;
+        let (read_depth, stats_enabled) = parse_arguments()?;
         if unsafe { SetConsoleCtrlHandler(Some(console_handler), 1) } == 0 {
             return Err("SetConsoleCtrlHandler failed".to_string());
         }
-        let result = Runtime::start(read_depth)?.run();
+        let result = Runtime::start(read_depth, stats_enabled)?.run();
         unsafe {
             SetConsoleCtrlHandler(Some(console_handler), 0);
         }
