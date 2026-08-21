@@ -188,6 +188,15 @@ function Ensure-DiagnosticsDirectory {
     $script:DiagnosticsPath = (Resolve-Path -LiteralPath $DiagnosticsPath).Path
 }
 
+function Write-Diagnostic([string]$Message) {
+    $line = "{0} {1}" -f ([DateTime]::UtcNow.ToString("o")), $Message
+    Write-Host $line
+    if ($script:DiagnosticsPath) {
+        Add-Content -LiteralPath (Join-Path $script:DiagnosticsPath "progress.log") `
+            -Value $line -Encoding utf8
+    }
+}
+
 function Save-Diagnostics([string]$Name, [scriptblock]$Command) {
     try {
         & $Command 2>&1 | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath $Name) `
@@ -195,6 +204,17 @@ function Save-Diagnostics([string]$Name, [scriptblock]$Command) {
     } catch {
         $_ | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name.error") `
             -Encoding utf8 -Force
+    }
+}
+
+function Save-SetupApiDiagnostics([string]$Name) {
+    Save-Diagnostics "$Name-setupapi-tail.txt" {
+        $path = "$env:windir\INF\setupapi.dev.log"
+        if (Test-Path -LiteralPath $path) {
+            Get-Content -LiteralPath $path -Tail 1000
+        } else {
+            "SetupAPI device log was not found: $path"
+        }
     }
 }
 
@@ -246,10 +266,30 @@ function Invoke-RecordedNative(
     [string]$FilePath,
     [string[]]$Arguments
 ) {
-    $output = & $FilePath @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    $output | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name.txt") `
-        -Encoding utf8 -Force
+    Write-Diagnostic "native: starting name=$Name file=$FilePath args=$($Arguments -join ' ') timeoutSeconds=120"
+    $job = Start-Job -ScriptBlock {
+        param($Path, $Args)
+        $output = @(& $Path @Args 2>&1)
+        [pscustomobject]@{
+            Output = $output
+            ExitCode = $LASTEXITCODE
+        }
+    } -ArgumentList $FilePath, (,$Arguments)
+    try {
+        if ($null -eq (Wait-Job -Job $job -Timeout 120)) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            throw "$Name did not exit within 120 seconds."
+        }
+        $result = Receive-Job -Job $job
+        $output = @($result.Output)
+        $exitCode = [int]$result.ExitCode
+        $output | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name.txt") `
+            -Encoding utf8 -Force
+        Save-SetupApiDiagnostics $Name
+        Write-Diagnostic "native: completed name=$Name exitCode=$exitCode"
+    } finally {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
     $record = [pscustomobject]@{
         Name = $Name
         FilePath = $FilePath
@@ -435,19 +475,8 @@ function Assert-CleanEnvironment {
 
 function Invoke-DevConInstall([string]$HardwareId, [string]$Name) {
     # The documented DevCon operation creates the root-enumerated device.
-    $output = & $script:ResolvedDevCon install $script:InfPath $HardwareId 2>&1
-    $exitCode = $LASTEXITCODE
-    $output | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name.txt") `
-        -Encoding utf8 -Force
-    $script:CommandRecords += [pscustomobject]@{
-        Name = $Name
-        FilePath = $script:ResolvedDevCon
-        Arguments = "install `"$script:InfPath`" $HardwareId"
-        ExitCode = $exitCode
-    }
-    if ($exitCode -ne 0) {
-        throw "devcon install $script:InfPath $HardwareId failed with exit code $exitCode."
-    }
+    Invoke-RecordedNative $Name $script:ResolvedDevCon `
+        @("install", $script:InfPath, $HardwareId) | Out-Null
 }
 
 function Wait-MatchingPnpDeviceCount([int]$ExpectedCount) {
@@ -1441,8 +1470,15 @@ function Pump-Relay($Relay, [int]$WaitMilliseconds) {
     Assert-True ($pending.Count -gt 0) "Relay has no active I/O operation."
     [IntPtr[]]$events = @($pending | ForEach-Object Event)
     [uint32]$nativeError = 0
+    $script:PumpWaitSequence++
+    if ($script:PumpWaitSequence -eq 1 -or ($script:PumpWaitSequence % 20) -eq 0) {
+        Write-Diagnostic "relay: waiting sequence=$script:PumpWaitSequence pending=$($pending.Count) timeoutMs=$WaitMilliseconds"
+    }
     $wait = [WinTapDualNative]::WaitForMultipleObjectsWithError(
         $events, [uint32]$WaitMilliseconds, [ref]$nativeError)
+    if ($script:PumpWaitSequence -eq 1 -or ($script:PumpWaitSequence % 20) -eq 0) {
+        Write-Diagnostic "relay: wait returned sequence=$script:PumpWaitSequence result=$wait error=$nativeError"
+    }
     if ($wait -eq [WinTapDualNative]::WaitTimeout) {
         return
     }
@@ -1476,6 +1512,7 @@ function Invoke-UnboundPingRelay($Relay, [string]$Address, [string]$Family) {
     $ping = [System.Net.NetworkInformation.Ping]::new()
     [byte[]]$payload = [Text.Encoding]::ASCII.GetBytes("WinTapDual-$script:RunId-$Family")
     try {
+        Write-Diagnostic "ping: start family=$Family address=$Address timeoutSeconds=$TimeoutSeconds"
         if ($Family -eq "IPv4") {
             $Relay.Proofs.IPv4Request = $null
             $Relay.Proofs.IPv4Reply = $false
@@ -1486,6 +1523,7 @@ function Invoke-UnboundPingRelay($Relay, [string]$Address, [string]$Family) {
         # SendPingAsync has no source-address argument: route selection is deliberately unbound.
         $task = $ping.SendPingAsync($Address, $TimeoutSeconds * 1000, $payload)
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        $lastHeartbeat = [DateTime]::UtcNow
         do {
             Pump-Relay $Relay 250
             $proofComplete = if ($Family -eq "IPv4") {
@@ -1496,8 +1534,13 @@ function Invoke-UnboundPingRelay($Relay, [string]$Address, [string]$Family) {
             if ($task.IsCompleted -and $proofComplete) {
                 break
             }
+            if (([DateTime]::UtcNow - $lastHeartbeat).TotalSeconds -ge 5) {
+                Write-Diagnostic "ping: heartbeat family=$Family taskCompleted=$($task.IsCompleted) proofComplete=$proofComplete"
+                $lastHeartbeat = [DateTime]::UtcNow
+            }
         } while ([DateTime]::UtcNow -lt $deadline)
         Assert-PingProof $Relay $Address $payload $Family $task
+        Write-Diagnostic "ping: completed family=$Family"
     } finally {
         $ping.Dispose()
     }
@@ -1678,7 +1721,10 @@ function Invoke-Cleanup {
 
 function Invoke-DualAdapterHarness {
     Ensure-DiagnosticsDirectory
+    Write-Diagnostic "dual: start runId=$script:RunId relayIterations=$RelayIterations timeoutSeconds=$TimeoutSeconds"
+    Write-Diagnostic "dual: checking test signing"
     Assert-TestSigning
+    Write-Diagnostic "dual: test signing enabled"
     $script:InfPath = Join-Path (Resolve-Path -LiteralPath $PackageDirectory -ErrorAction Stop).Path $driverInf
     Assert-True (Test-Path -LiteralPath $script:InfPath -PathType Leaf) `
         "Driver INF is missing: $script:InfPath"
@@ -1686,12 +1732,15 @@ function Invoke-DualAdapterHarness {
 
     # All following preflight checks run before provisioning or network mutation.
     Assert-CleanEnvironment
+    Write-Diagnostic "dual: clean environment confirmed"
     $script:DriverPackagesBefore = @(Get-DriverStoreSnapshot "driver-store-before")
     $script:DriverPackageSnapshotTaken = $true
+    Write-Diagnostic "dual: installing first root device"
     Invoke-DevConInstall $hardwareIdA "devcon-install-wintaprust"
     $firstDevice = @(Wait-MatchingPnpDeviceCount 1)
     $script:CreatedPnpInstanceIds = @($firstDevice | ForEach-Object InstanceId)
     Invoke-DevConInstall $hardwareIdB "devcon-install-wintaprust2"
+    Write-Diagnostic "dual: both root devices installed"
     $devices = @(Wait-MatchingPnpDeviceCount 2)
     $script:CreatedPnpInstanceIds = @($devices | ForEach-Object InstanceId)
     $script:CreatedPnpInstanceIds | Out-File `
@@ -1707,14 +1756,21 @@ function Invoke-DualAdapterHarness {
     $script:Handles.B = Open-ControlHandle $controlPathB
     Assert-ExclusiveHandle $controlPathB
     Configure-Topology $adapters
+    Write-Diagnostic "dual: topology configured"
 
     $script:Relay = Start-Relay $script:Handles.A $script:Handles.B $adapters
+    Write-Diagnostic "dual: relay started"
     Assert-ControlFrameSuppression $script:Relay
+    Write-Diagnostic "dual: first control-frame suppression check completed"
     Assert-OwnerReopen $adapters
+    Write-Diagnostic "dual: owner reopen check completed"
     Assert-ControlFrameSuppression $script:Relay
+    Write-Diagnostic "dual: second control-frame suppression check completed"
     for ($iteration = 0; $iteration -lt $RelayIterations; ++$iteration) {
+        Write-Diagnostic "dual: iteration $($iteration + 1)/$RelayIterations start"
         Invoke-UnboundPingRelay $script:Relay $ipv4B "IPv4"
         Invoke-UnboundPingRelay $script:Relay $ipv6B "IPv6"
+        Write-Diagnostic "dual: iteration $($iteration + 1)/$RelayIterations complete"
     }
 }
 
@@ -1725,8 +1781,10 @@ try {
     Invoke-DualAdapterHarness
 } catch {
     $primaryFailure = $_
+    Write-Diagnostic "dual: failed: $($_.Exception.Message)"
     Save-Diagnostics "primary-failure.txt" { $primaryFailure | Format-List * -Force }
 } finally {
+    Write-Diagnostic "dual: cleanup start"
     if ($script:Relay) {
         Save-Diagnostics "relay-control-frames.txt" {
             [pscustomobject]@{
@@ -1741,6 +1799,7 @@ try {
     }
     Save-EnvironmentDiagnostics "before-cleanup"
     $cleanupErrors = Invoke-Cleanup
+    Write-Diagnostic "dual: cleanup completed errors=$($cleanupErrors.Count)"
     Save-EnvironmentDiagnostics "after-cleanup"
     if ($cleanupErrors.Count -gt 0) {
         $cleanupErrors | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "cleanup-errors.txt") `
