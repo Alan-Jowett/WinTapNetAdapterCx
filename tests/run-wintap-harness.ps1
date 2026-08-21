@@ -170,6 +170,17 @@ function Save-Diagnostics([string]$Name, [scriptblock]$Command) {
     }
 }
 
+function Save-SetupApiDiagnostics([string]$Name) {
+    Save-Diagnostics "$Name-setupapi-tail.txt" {
+        $path = "$env:windir\INF\setupapi.dev.log"
+        if (Test-Path -LiteralPath $path) {
+            Get-Content -LiteralPath $path -Tail 1000
+        } else {
+            "SetupAPI device log was not found: $path"
+        }
+    }
+}
+
 function Save-Packet([string]$Name, [byte[]]$Bytes) {
     if ($DiagnosticsPath -and $null -ne $Bytes) {
         [IO.File]::WriteAllBytes((Join-Path $DiagnosticsPath $Name), $Bytes)
@@ -626,6 +637,7 @@ function Invoke-DriverInstall {
         "Driver INF is missing: $inf"
     $result = Invoke-NativeWithTimeout "install-command" "pnputil.exe" `
         @("/add-driver", $inf, "/install")
+    Save-SetupApiDiagnostics "install-command"
     if ($result.ExitCode -ne 0) {
         throw "pnputil failed with exit code $($result.ExitCode)."
     }
@@ -806,7 +818,12 @@ if ($Integration) {
         Write-Diagnostic "integration: cleanup start"
         try {
             if (-not $script:IntegrationAdapter) {
-                $script:IntegrationAdapter = Get-WinTapAdapter
+                try {
+                    $script:IntegrationAdapter = Get-WinTapAdapter
+                } catch {
+                    Write-Diagnostic "integration: cleanup could not rediscover adapter; continuing"
+                    $script:IntegrationAdapter = $null
+                }
             }
             Remove-TestAddress $script:IntegrationAdapter
             if ($script:AdapterWasDisabled) {

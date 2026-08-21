@@ -207,6 +207,17 @@ function Save-Diagnostics([string]$Name, [scriptblock]$Command) {
     }
 }
 
+function Save-SetupApiDiagnostics([string]$Name) {
+    Save-Diagnostics "$Name-setupapi-tail.txt" {
+        $path = "$env:windir\INF\setupapi.dev.log"
+        if (Test-Path -LiteralPath $path) {
+            Get-Content -LiteralPath $path -Tail 1000
+        } else {
+            "SetupAPI device log was not found: $path"
+        }
+    }
+}
+
 function Save-Packet([string]$Direction, [byte[]]$Frame) {
     $script:PacketSequence++
     $name = "{0:D4}-{1}.bin" -f $script:PacketSequence, $Direction
@@ -274,6 +285,7 @@ function Invoke-RecordedNative(
         $exitCode = [int]$result.ExitCode
         $output | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name.txt") `
             -Encoding utf8 -Force
+        Save-SetupApiDiagnostics $Name
         Write-Diagnostic "native: completed name=$Name exitCode=$exitCode"
     } finally {
         Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
