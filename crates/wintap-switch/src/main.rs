@@ -11,8 +11,8 @@ mod windows_runtime {
     use std::time::{Duration, Instant};
 
     use wintap_switch_core::{
-        BufferPool, EndpointId, FRAME_MAXIMUM, ForwardingError, IoRingCapabilities, IoRingVersion,
-        Switch, select_io_ring_version,
+        select_io_ring_version, BufferPool, EndpointId, ForwardingError, IoRingCapabilities,
+        IoRingVersion, Switch, FRAME_MAXIMUM,
     };
 
     type Handle = *mut core::ffi::c_void;
@@ -28,6 +28,9 @@ mod windows_runtime {
     const S_OK: HResult = 0;
     const S_FALSE: HResult = 1;
     const WAIT_TIMEOUT: HResult = 0x8007_05B4u32 as HResult;
+    const IORING_E_SUBMISSION_QUEUE_FULL: HResult = 0x8046_0002u32 as HResult;
+    const HRESULT_FROM_NT_STATUS_DEVICE_BUSY: HResult = 0x9000_0011u32 as HResult;
+    const HRESULT_FROM_WIN32_INVALID_USER_BUFFER: HResult = 0x8007_06F8u32 as HResult;
     const IORING_OP_READ: Dword = 1;
     const IORING_OP_WRITE: Dword = 5;
     const IORING_SQE_FLAG_NONE: Dword = 0;
@@ -38,6 +41,8 @@ mod windows_runtime {
     const CTRL_CLOSE_EVENT: Dword = 2;
     const CANCEL_COMPLETION_MARKER: Ulonglong = 1_u64 << 63;
     const COMPLETION_WAIT_MILLISECONDS: Dword = 100;
+    const BUSY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(1);
+    const BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(64);
     const ENDPOINT_COUNT: usize = 2;
     const DEFAULT_READ_DEPTH: usize = 128;
     const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -218,9 +223,25 @@ mod windows_runtime {
         _registered_files: [Handle; 2],
         _registered_buffers: Vec<IoRingBufferInfo>,
         pool: BufferPool,
-        active: Vec<Option<(wintap_switch_core::SlotCompletion, Handle, Ulonglong, bool)>>,
+        active: Vec<Option<ActiveOperation>>,
+        cancellations: Vec<Option<Ulonglong>>,
+        operations_may_be_in_flight: bool,
+        submission_queue_size: usize,
         reads_per_endpoint: usize,
         stats: RuntimeStats,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ActiveOperation {
+        completion: wintap_switch_core::SlotCompletion,
+        handle: Handle,
+        user_data: Ulonglong,
+        is_write: bool,
+        length: Dword,
+        queued: bool,
+        submitted: bool,
+        busy_retries: u32,
+        drain_before_cancellation: bool,
     }
 
     struct RuntimeStats {
@@ -301,6 +322,9 @@ mod windows_runtime {
 
     impl Drop for Runtime {
         fn drop(&mut self) {
+            if self.operations_may_be_in_flight && self.active.iter().any(Option::is_some) {
+                std::process::abort();
+            }
             unsafe {
                 CloseIoRing(self.ring);
             }
@@ -434,6 +458,11 @@ mod windows_runtime {
                 .try_reserve_exact(total_depth)
                 .map_err(|_| "active operation allocation failed".to_string())?;
             active.resize(total_depth, None);
+            let mut cancellations = Vec::new();
+            cancellations
+                .try_reserve_exact(total_depth)
+                .map_err(|_| "cancellation tracking allocation failed".to_string())?;
+            cancellations.resize(total_depth, None);
             let ring = ring.into_inner();
             let mut runtime = Self {
                 ring,
@@ -443,13 +472,23 @@ mod windows_runtime {
                 _registered_buffers: registrations,
                 pool,
                 active,
+                cancellations,
+                operations_may_be_in_flight: false,
+                submission_queue_size: total_depth,
                 reads_per_endpoint,
                 stats: RuntimeStats::new(stats_enabled),
             };
             for slot in 0..total_depth {
                 runtime.post_read(slot)?;
             }
-            runtime.submit()?;
+            if let Err(error) = runtime.submit_pending_operations() {
+                return match runtime.shutdown() {
+                    Ok(()) => Err(error),
+                    Err(shutdown_error) => {
+                        Err(format!("{error}; shutdown failed: {shutdown_error}"))
+                    }
+                };
+            }
             Ok(runtime)
         }
 
@@ -477,21 +516,33 @@ mod windows_runtime {
                 },
                 "BuildIoRingReadFile",
             )?;
-            self.active[slot] = Some((
+            self.active[slot] = Some(ActiveOperation {
                 completion,
-                endpoint.handle,
-                encode_completion(slot, completion.generation)?,
-                false,
-            ));
+                handle: endpoint.handle,
+                user_data: encode_completion(slot, completion.generation)?,
+                is_write: false,
+                length: FRAME_MAXIMUM as Dword,
+                queued: true,
+                submitted: false,
+                busy_retries: 0,
+                drain_before_cancellation: false,
+            });
             Ok(())
         }
 
-        fn submit(&self) -> Result<(), String> {
+        fn submit_pending_operations(&mut self) -> Result<(), String> {
             let mut submitted = 0;
             check_hr(
                 unsafe { SubmitIoRing(self.ring, 0, 0, &mut submitted) },
                 "SubmitIoRing",
-            )
+            )?;
+            for active in self.active.iter_mut().flatten() {
+                if active.queued && !active.submitted {
+                    active.submitted = true;
+                }
+            }
+            self.operations_may_be_in_flight = true;
+            Ok(())
         }
 
         fn wait_for_completion(&self) -> Result<bool, String> {
@@ -516,14 +567,13 @@ mod windows_runtime {
             let active = self.active[slot]
                 .as_ref()
                 .ok_or_else(|| format!("completion references inactive slot {slot}"))?;
-            if active.0.slot != slot
-                || active.0.generation != generation
-                || active.2 != completion.user_data
+            if active.completion.slot != slot
+                || active.completion.generation != generation
+                || active.user_data != completion.user_data
             {
                 return Err(format!("stale or unexpected completion for slot {slot}"));
             }
-            check_hr(completion.result_code, "I/O-ring operation")?;
-            Ok((slot, generation, active.3))
+            Ok((slot, generation, active.is_write))
         }
 
         fn process_completion(
@@ -533,7 +583,20 @@ mod windows_runtime {
         ) -> Result<bool, String> {
             let (slot, generation, is_write) = self.validate_completion(&completion)?;
             let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
+            if is_device_busy(completion.result_code) {
+                self.retry_busy_operation(slot)?;
+                return Ok(is_write);
+            }
             self.active[slot] = None;
+            if completion.result_code != S_OK {
+                self.pool
+                    .cancel(slot_completion)
+                    .map_err(|error| format!("failed operation completion: {error:?}"))?;
+                return Err(format!(
+                    "I/O-ring operation failed with HRESULT 0x{:08X}",
+                    completion.result_code
+                ));
+            }
             if is_write {
                 self.pool
                     .complete_write(slot_completion)
@@ -583,12 +646,17 @@ mod windows_runtime {
                             },
                             "BuildIoRingWriteFile",
                         )?;
-                        self.active[slot] = Some((
-                            slot_completion,
-                            peer,
-                            encode_completion(slot, generation)?,
-                            true,
-                        ));
+                        self.active[slot] = Some(ActiveOperation {
+                            completion: slot_completion,
+                            handle: peer,
+                            user_data: encode_completion(slot, generation)?,
+                            is_write: true,
+                            length: length as Dword,
+                            queued: true,
+                            submitted: false,
+                            busy_retries: 0,
+                            drain_before_cancellation: false,
+                        });
                     } else {
                         self.pool
                             .complete_dispatch(slot_completion)
@@ -606,11 +674,24 @@ mod windows_runtime {
         }
 
         fn run(&mut self) -> Result<(), String> {
+            let result = self.run_until_stopped();
+            let shutdown_result = self.shutdown();
+            match (result, shutdown_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(()), Err(error)) => Err(error),
+                (Err(error), Err(shutdown_error)) => {
+                    Err(format!("{error}; shutdown failed: {shutdown_error}"))
+                }
+            }
+        }
+
+        fn run_until_stopped(&mut self) -> Result<(), String> {
             let mut switch = Switch::static_pair();
             loop {
                 if STOP_REQUESTED.load(Ordering::SeqCst) {
                     self.stats.report(true);
-                    return self.shutdown();
+                    return Ok(());
                 }
                 let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
                 let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
@@ -643,64 +724,221 @@ mod windows_runtime {
                 }
 
                 self.stats.record_batch(reads, writes);
-                self.submit()?;
+                self.submit_pending_operations()?;
             }
         }
 
         fn shutdown(&mut self) -> Result<(), String> {
-            for active in self.active.iter().flatten() {
-                check_hr(
-                    unsafe {
-                        BuildIoRingCancelRequest(
-                            self.ring,
-                            handle_ref(active.1),
-                            active.2,
-                            CANCEL_COMPLETION_MARKER | active.2,
-                        )
-                    },
-                    "BuildIoRingCancelRequest",
-                )?;
+            self.retire_unqueued_operations()?;
+            for active in self.active.iter_mut().flatten() {
+                if active.is_write && active.queued && !active.submitted {
+                    active.drain_before_cancellation = true;
+                }
             }
-            let mut submitted = 0;
-            check_hr(
-                unsafe { SubmitIoRing(self.ring, 0, 0, &mut submitted) },
-                "SubmitIoRing",
-            )?;
-            while self.active.iter().any(Option::is_some) {
-                let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
-                let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
-                if status == S_FALSE {
+
+            self.submit_pending_operations()?;
+
+            let mut cancellation_error = None;
+            while self
+                .active
+                .iter()
+                .flatten()
+                .any(|active| active.drain_before_cancellation)
+            {
+                self.wait_for_shutdown_completion(&mut cancellation_error)?;
+            }
+
+            while self.active.iter().any(Option::is_some)
+                || self.cancellations.iter().any(Option::is_some)
+            {
+                let (queued, queue_was_full) = self.queue_shutdown_cancellations()?;
+                if queued || queue_was_full {
+                    self.submit_cancellation_batch()?;
+                }
+                if !self.try_process_shutdown_completion(&mut cancellation_error)? {
                     self.wait_for_completion()?;
+                }
+            }
+            self.operations_may_be_in_flight = false;
+            match cancellation_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        fn retry_busy_operation(&mut self, slot: usize) -> Result<(), String> {
+            let (handle, length, user_data, is_write, busy_retries) = {
+                let active = self.active[slot]
+                    .as_mut()
+                    .ok_or_else(|| format!("busy completion references inactive slot {slot}"))?;
+                if !active.submitted {
+                    return Err(format!(
+                        "busy completion references inactive operation slot {slot}"
+                    ));
+                }
+                active.queued = false;
+                active.submitted = false;
+                active.busy_retries = active.busy_retries.saturating_add(1);
+                (
+                    active.handle,
+                    active.length,
+                    active.user_data,
+                    active.is_write,
+                    active.busy_retries,
+                )
+            };
+            std::thread::sleep(busy_retry_delay(busy_retries));
+            let status = if is_write {
+                unsafe {
+                    BuildIoRingWriteFile(
+                        self.ring,
+                        handle_ref(handle),
+                        buffer_ref(slot as Dword),
+                        length,
+                        0,
+                        FILE_WRITE_FLAG_NONE,
+                        user_data,
+                        IORING_SQE_FLAG_NONE,
+                    )
+                }
+            } else {
+                unsafe {
+                    BuildIoRingReadFile(
+                        self.ring,
+                        handle_ref(handle),
+                        buffer_ref(slot as Dword),
+                        length,
+                        0,
+                        user_data,
+                        IORING_SQE_FLAG_NONE,
+                    )
+                }
+            };
+            check_hr(
+                status,
+                if is_write {
+                    "BuildIoRingWriteFile retry"
+                } else {
+                    "BuildIoRingReadFile retry"
+                },
+            )?;
+            self.active[slot]
+                .as_mut()
+                .ok_or_else(|| format!("busy retry lost operation slot {slot}"))?
+                .queued = true;
+            Ok(())
+        }
+
+        fn retire_unqueued_operations(&mut self) -> Result<(), String> {
+            for slot in 0..self.active.len() {
+                let Some(active) = self.active[slot] else {
+                    continue;
+                };
+                if active.queued {
                     continue;
                 }
-                check_hr(status, "PopIoRingCompletion")?;
-                let completion = unsafe { completion.assume_init() };
-                if completion.user_data & CANCEL_COMPLETION_MARKER != 0 {
-                    let operation = completion.user_data & !CANCEL_COMPLETION_MARKER;
-                    let (slot, _) = decode_completion(operation)?;
-                    if slot >= self.active.len() {
-                        return Err(format!("cancellation references invalid slot {slot}"));
-                    }
-                    let Some(active) = self.active[slot] else {
-                        continue;
-                    };
-                    if active.2 != operation {
-                        continue;
-                    }
-                    self.active[slot] = None;
-                    self.pool
-                        .cancel(active.0)
-                        .map_err(|error| format!("cancel completion: {error:?}"))?;
-                    continue;
-                }
-                let (slot, generation, _) = self.validate_completion(&completion)?;
-                let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
                 self.pool
-                    .cancel(slot_completion)
-                    .map_err(|error| format!("cancel completion: {error:?}"))?;
+                    .cancel(active.completion)
+                    .map_err(|error| format!("retire unscheduled operation: {error:?}"))?;
                 self.active[slot] = None;
             }
             Ok(())
+        }
+
+        fn queue_shutdown_cancellations(&mut self) -> Result<(bool, bool), String> {
+            let mut queued = false;
+            let mut queue_was_full = false;
+            let mut count = 0;
+            for slot in 0..self.active.len() {
+                if count == self.submission_queue_size {
+                    break;
+                }
+                let Some(active) = self.active[slot].as_ref() else {
+                    continue;
+                };
+                if !active.queued || !active.submitted || self.cancellations[slot].is_some() {
+                    continue;
+                }
+                let operation = active.user_data;
+                let status = unsafe {
+                    BuildIoRingCancelRequest(
+                        self.ring,
+                        handle_ref(active.handle),
+                        operation,
+                        CANCEL_COMPLETION_MARKER | operation,
+                    )
+                };
+                if status == IORING_E_SUBMISSION_QUEUE_FULL {
+                    queue_was_full = true;
+                    break;
+                }
+                check_hr(status, "BuildIoRingCancelRequest")?;
+                self.cancellations[slot] = Some(operation);
+                queued = true;
+                count += 1;
+            }
+            Ok((queued, queue_was_full))
+        }
+
+        fn submit_cancellation_batch(&self) -> Result<(), String> {
+            let mut submitted = 0;
+            check_hr(
+                unsafe { SubmitIoRing(self.ring, 0, 0, &mut submitted) },
+                "SubmitIoRing cancellation batch",
+            )
+        }
+
+        fn wait_for_shutdown_completion(
+            &mut self,
+            cancellation_error: &mut Option<String>,
+        ) -> Result<(), String> {
+            loop {
+                if self.try_process_shutdown_completion(cancellation_error)? {
+                    return Ok(());
+                }
+                self.wait_for_completion()?;
+            }
+        }
+
+        fn try_process_shutdown_completion(
+            &mut self,
+            cancellation_error: &mut Option<String>,
+        ) -> Result<bool, String> {
+            let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
+            let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
+            if status == S_FALSE {
+                return Ok(false);
+            }
+            check_hr(status, "PopIoRingCompletion")?;
+            let completion = unsafe { completion.assume_init() };
+            if completion.user_data & CANCEL_COMPLETION_MARKER != 0 {
+                let operation = completion.user_data & !CANCEL_COMPLETION_MARKER;
+                let (slot, _) = decode_completion(operation)?;
+                if slot >= self.active.len() {
+                    return Err(format!("cancellation references invalid slot {slot}"));
+                }
+                if self.cancellations[slot] != Some(operation) {
+                    return Err(format!(
+                        "unexpected cancellation completion for slot {slot}"
+                    ));
+                }
+                self.cancellations[slot] = None;
+                if completion.result_code != S_OK && cancellation_error.is_none() {
+                    *cancellation_error = Some(format!(
+                        "I/O-ring cancellation failed with HRESULT 0x{:08X}",
+                        completion.result_code
+                    ));
+                }
+                return Ok(true);
+            }
+
+            let (slot, generation, _) = self.validate_completion(&completion)?;
+            let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
+            self.pool
+                .cancel(slot_completion)
+                .map_err(|error| format!("cancel completion: {error:?}"))?;
+            self.active[slot] = None;
+            Ok(true)
         }
     }
 
@@ -777,6 +1015,19 @@ mod windows_runtime {
             return Err("completion identity contains invalid generation".to_string());
         }
         Ok((slot, generation))
+    }
+
+    fn is_device_busy(status: HResult) -> bool {
+        status == HRESULT_FROM_NT_STATUS_DEVICE_BUSY
+            || status == HRESULT_FROM_WIN32_INVALID_USER_BUFFER
+    }
+
+    fn busy_retry_delay(retries: u32) -> Duration {
+        let shift = retries.saturating_sub(1).min(6);
+        BUSY_RETRY_INITIAL_DELAY
+            .checked_mul(1_u32 << shift)
+            .unwrap_or(BUSY_RETRY_MAX_DELAY)
+            .min(BUSY_RETRY_MAX_DELAY)
     }
 
     fn check_hr(status: HResult, operation: &str) -> Result<(), String> {
