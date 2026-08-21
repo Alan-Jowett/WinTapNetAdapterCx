@@ -585,7 +585,7 @@ mod windows_runtime {
             let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
             if is_device_busy(completion.result_code) {
                 self.retry_busy_operation(slot)?;
-                return Ok(is_write);
+                return Ok(!is_write);
             }
             self.active[slot] = None;
             if completion.result_code != S_OK {
