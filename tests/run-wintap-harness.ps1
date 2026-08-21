@@ -121,6 +121,15 @@ function Ensure-DiagnosticsDirectory {
     $script:DiagnosticsPath = (Resolve-Path -LiteralPath $DiagnosticsPath).Path
 }
 
+function Write-Diagnostic([string]$Message) {
+    $line = "{0} {1}" -f ([DateTime]::UtcNow.ToString("o")), $Message
+    Write-Host $line
+    if ($script:DiagnosticsPath) {
+        Add-Content -LiteralPath (Join-Path $script:DiagnosticsPath "progress.log") `
+            -Value $line -Encoding utf8
+    }
+}
+
 function Save-Diagnostics([string]$Name, [scriptblock]$Command) {
     try {
         & $Command 2>&1 | Out-File -FilePath (Join-Path $DiagnosticsPath $Name) `
@@ -640,10 +649,14 @@ function Remove-TestAddress($Adapter) {
 
 function Invoke-IntegrationHarness {
     Ensure-DiagnosticsDirectory
+    Write-Diagnostic "integration: start"
     if ($RequireTestSigning) {
+        Write-Diagnostic "integration: checking test signing"
         Assert-TestSigning
+        Write-Diagnostic "integration: test signing enabled"
     }
     if ($InstallDriver) {
+        Write-Diagnostic "integration: installing driver"
         try {
             Get-WinTapAdapter | Out-Null
             $script:AdapterExistedBeforeInstall = $true
@@ -651,21 +664,28 @@ function Invoke-IntegrationHarness {
             $script:AdapterExistedBeforeInstall = $false
         }
         Invoke-DriverInstall
+        Write-Diagnostic "integration: driver install completed"
     }
 
+    Write-Diagnostic "integration: waiting for adapter"
     $adapter = Wait-WinTapAdapter
     $script:IntegrationAdapter = $adapter
+    Write-Diagnostic "integration: adapter discovered name=$($adapter.Name) status=$($adapter.Status)"
     $script:AdapterWasDisabled = ($adapter.Status -eq "Disabled")
     if ($adapter.Status -eq "Disabled") {
+        Write-Diagnostic "integration: enabling adapter"
         Enable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction Stop
         $adapter = Wait-WinTapAdapter
         $script:IntegrationAdapter = $adapter
+        Write-Diagnostic "integration: adapter enabled"
     }
+    Write-Diagnostic "integration: configuring test address"
     Add-TestAddress $adapter
     Assert-True (Test-WinTapAdapterIdentity $adapter) `
         "The discovered adapter is not backed by the expected driver."
     Write-Host "Using adapter '$($adapter.Name)' ($($adapter.PnPDeviceID)), MAC $($adapter.MacAddress)."
 
+    Write-Diagnostic "integration: opening TAP handle"
     $localMac = Get-MacBytes $adapter.MacAddress
     $peerMac = [byte[]](0x02, 0x57, 0x54, 0x41, 0x50, 0x02)
     $localIp = Get-IPv4Bytes "192.0.2.1"
@@ -679,6 +699,7 @@ function Invoke-IntegrationHarness {
 
     $ping = $null
     try {
+        Write-Diagnostic "integration: starting ping"
         $ping = [System.Net.NetworkInformation.Ping]::new()
         $payload = [Text.Encoding]::ASCII.GetBytes("$driverDescription REQ-008")
         $pingTask = $ping.SendPingAsync(
@@ -731,7 +752,9 @@ function Invoke-IntegrationHarness {
         Assert-True (Test-BytesEqual $pingReply.Buffer $payload) `
             "Windows networking stack received an unexpected Echo Reply payload."
         Write-Host "Windows stack received the matching Echo Reply."
+        Write-Diagnostic "integration: ping completed successfully"
     } finally {
+        Write-Diagnostic "integration: closing TAP handle"
         if ($ping) {
             $ping.Dispose()
         }
@@ -747,9 +770,11 @@ if ($Integration) {
     try {
         Invoke-IntegrationHarness
     } catch {
+        Write-Diagnostic "integration: failed: $($_.Exception.Message)"
         Save-EnvironmentDiagnostics
         throw
     } finally {
+        Write-Diagnostic "integration: cleanup start"
         try {
             if (-not $script:IntegrationAdapter) {
                 $script:IntegrationAdapter = Get-WinTapAdapter
@@ -770,6 +795,7 @@ if ($Integration) {
                     Out-File (Join-Path $DiagnosticsPath "remove-device.txt") `
                     -Encoding utf8 -Force
             }
+            Write-Diagnostic "integration: cleanup completed"
         } catch {
             $_ | Out-File (Join-Path $DiagnosticsPath "cleanup.error") `
                 -Encoding utf8 -Force
