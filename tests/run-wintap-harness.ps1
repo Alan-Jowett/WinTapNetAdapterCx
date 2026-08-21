@@ -130,6 +130,36 @@ function Write-Diagnostic([string]$Message) {
     }
 }
 
+function Invoke-NativeWithTimeout(
+    [string]$Name,
+    [string]$FilePath,
+    [string[]]$Arguments,
+    [int]$TimeoutSeconds = 120
+) {
+    Write-Diagnostic "native: starting name=$Name file=$FilePath args=$($Arguments -join ' ') timeoutSeconds=$TimeoutSeconds"
+    $job = Start-Job -ScriptBlock {
+        param($Path, $Args)
+        $output = @(& $Path @Args 2>&1)
+        [pscustomobject]@{
+            Output = $output
+            ExitCode = $LASTEXITCODE
+        }
+    } -ArgumentList $FilePath, (,$Arguments)
+    try {
+        if ($null -eq (Wait-Job -Job $job -Timeout ($TimeoutSeconds))) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            throw "$Name did not exit within $TimeoutSeconds seconds."
+        }
+        $result = Receive-Job -Job $job
+        $result.Output | Out-File (Join-Path $DiagnosticsPath "$Name.txt") `
+            -Encoding utf8 -Force
+        Write-Diagnostic "native: completed name=$Name exitCode=$($result.ExitCode)"
+        return $result
+    } finally {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Save-Diagnostics([string]$Name, [scriptblock]$Command) {
     try {
         & $Command 2>&1 | Out-File -FilePath (Join-Path $DiagnosticsPath $Name) `
@@ -594,11 +624,10 @@ function Invoke-DriverInstall {
     $inf = Join-Path $package $driverInf
     Assert-True (Test-Path -LiteralPath $inf -PathType Leaf) `
         "Driver INF is missing: $inf"
-    $installOutput = & pnputil.exe /add-driver $inf /install 2>&1
-    $installOutput | Out-File (Join-Path $DiagnosticsPath "install-command.txt") `
-        -Encoding utf8 -Force
-    if ($LASTEXITCODE -ne 0) {
-        throw "pnputil failed with exit code $LASTEXITCODE."
+    $result = Invoke-NativeWithTimeout "install-command" "pnputil.exe" `
+        @("/add-driver", $inf, "/install")
+    if ($result.ExitCode -ne 0) {
+        throw "pnputil failed with exit code $($result.ExitCode)."
     }
     $service = Get-Service -Name $driverService -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne "Running") {

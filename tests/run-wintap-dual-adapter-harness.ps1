@@ -255,10 +255,29 @@ function Invoke-RecordedNative(
     [string]$FilePath,
     [string[]]$Arguments
 ) {
-    $output = & $FilePath @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    $output | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name.txt") `
-        -Encoding utf8 -Force
+    Write-Diagnostic "native: starting name=$Name file=$FilePath args=$($Arguments -join ' ') timeoutSeconds=120"
+    $job = Start-Job -ScriptBlock {
+        param($Path, $Args)
+        $output = @(& $Path @Args 2>&1)
+        [pscustomobject]@{
+            Output = $output
+            ExitCode = $LASTEXITCODE
+        }
+    } -ArgumentList $FilePath, (,$Arguments)
+    try {
+        if ($null -eq (Wait-Job -Job $job -Timeout 120)) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            throw "$Name did not exit within 120 seconds."
+        }
+        $result = Receive-Job -Job $job
+        $output = @($result.Output)
+        $exitCode = [int]$result.ExitCode
+        $output | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name.txt") `
+            -Encoding utf8 -Force
+        Write-Diagnostic "native: completed name=$Name exitCode=$exitCode"
+    } finally {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
     $record = [pscustomobject]@{
         Name = $Name
         FilePath = $FilePath
@@ -444,19 +463,8 @@ function Assert-CleanEnvironment {
 
 function Invoke-DevConInstall([string]$HardwareId, [string]$Name) {
     # The documented DevCon operation creates the root-enumerated device.
-    $output = & $script:ResolvedDevCon install $script:InfPath $HardwareId 2>&1
-    $exitCode = $LASTEXITCODE
-    $output | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name.txt") `
-        -Encoding utf8 -Force
-    $script:CommandRecords += [pscustomobject]@{
-        Name = $Name
-        FilePath = $script:ResolvedDevCon
-        Arguments = "install `"$script:InfPath`" $HardwareId"
-        ExitCode = $exitCode
-    }
-    if ($exitCode -ne 0) {
-        throw "devcon install $script:InfPath $HardwareId failed with exit code $exitCode."
-    }
+    Invoke-RecordedNative $Name $script:ResolvedDevCon `
+        @("install", $script:InfPath, $HardwareId) | Out-Null
 }
 
 function Wait-MatchingPnpDeviceCount([int]$ExpectedCount) {
