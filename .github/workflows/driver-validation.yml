@@ -102,6 +102,17 @@ jobs:
         with:
           name: WinTapRust-x64
           path: .\artifacts\WinTapRust-x64
+      - name: Trust package test certificate
+        shell: pwsh
+        run: |
+          $certificate = ".\artifacts\WinTapRust-x64\WDRLocalTestCert.cer"
+          if (-not (Test-Path -LiteralPath $certificate -PathType Leaf)) {
+            throw "Package test certificate is missing: $certificate"
+          }
+          Import-Certificate -FilePath $certificate -CertStoreLocation Cert:\LocalMachine\Root |
+            Out-Null
+          Import-Certificate -FilePath $certificate -CertStoreLocation Cert:\LocalMachine\TrustedPublisher |
+            Out-Null
       - name: Restore pinned WDK DevCon
         id: devcon
         shell: pwsh
@@ -145,6 +156,17 @@ jobs:
         with:
           name: WinTapRust-x64
           path: .\artifacts\WinTapRust-x64
+      - name: Trust package test certificate
+        shell: pw
+        run: |
+          $certificate = ".\artifacts\WinTapRust-x64\WDRLocalTestCert.cer"
+          if (-not (Test-Path -LiteralPath $certificate -PathType Leaf)) {
+            throw "Package test certificate is missing: $certificate"
+          }
+          Import-Certificate -FilePath $certificate -CertStoreLocation Cert:\LocalMachine\Root |
+            Out-Null
+          Import-Certificate -FilePath $certificate -CertStoreLocation Cert:\LocalMachine\TrustedPublisher |
+            Out-Null
       - name: Restore pinned WDK DevCon
         id: devcon
         shell: pwsh

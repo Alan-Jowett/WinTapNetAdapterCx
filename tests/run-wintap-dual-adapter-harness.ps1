@@ -34,6 +34,7 @@ $driverInf = "wintap_netadaptercx_driver.inf"
 $driverService = "WinTapRust"
 $hardwareIdA = "ROOT\WinTapRust"
 $hardwareIdB = "ROOT\WinTapRust2"
+$driverHardwareIds = @($hardwareIdA, $hardwareIdB)
 $controlPathA = "\\.\WinTapRust"
 $controlPathB = "\\.\WinTapRust2"
 $macAExpected = "02-57-54-41-50-01"
@@ -277,6 +278,12 @@ function Invoke-RecordedNative(
     } -ArgumentList $FilePath, (,$Arguments)
     try {
         if ($null -eq (Wait-Job -Job $job -Timeout 120)) {
+            $partialOutput = @(Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue)
+            $partialOutput | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name-timeout-output.txt") `
+                -Encoding utf8 -Force
+            $job | Format-List * | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name-timeout-job.txt") `
+                -Encoding utf8 -Force
+            Save-ProvisioningDiagnostics "$Name-timeout"
             Stop-Job -Job $job -ErrorAction SilentlyContinue
             throw "$Name did not exit within 120 seconds."
         }
@@ -301,6 +308,52 @@ function Invoke-RecordedNative(
         throw "$Name failed with exit code $exitCode. See $Name.txt in $script:DiagnosticsPath."
     }
     return ,$output
+}
+
+function Save-ProvisioningDiagnostics([string]$Name) {
+    Save-SetupApiDiagnostics $Name
+    Save-Diagnostics "$Name-processes.txt" {
+        Get-CimInstance -ClassName Win32_Process |
+            Where-Object {
+                $_.Name -match "^(devcon|pnputil|rundll32|msiexec)\.exe$" -or
+                $_.CommandLine -match "WinTapRust|wintap_netadaptercx_driver"
+            } |
+            Select-Object ProcessId, ParentProcessId, Name, CommandLine, CreationDate |
+            Format-List *
+    }
+    Save-Diagnostics "$Name-pnp-devices.txt" {
+        Get-CimInstance -ClassName Win32_PnPEntity |
+            Where-Object {
+                @($_.HardwareID | ForEach-Object { [string]$_ } |
+                    Where-Object { $driverHardwareIds -contains $_ }).Count -gt 0
+            } |
+            Format-List *
+    }
+    Save-Diagnostics "$Name-pnputil-devices.txt" {
+        foreach ($hardwareId in $driverHardwareIds) {
+            "=== $hardwareId ==="
+            & pnputil.exe /enum-devices /deviceid $hardwareId /drivers /services /stack /properties
+        }
+    }
+    Save-Diagnostics "$Name-device-install-events.txt" {
+        Get-WinEvent -FilterHashtable @{
+            LogName = "System"
+            StartTime = (Get-Date).AddMinutes(-10)
+        } -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ProviderName -in @(
+                    "Microsoft-Windows-Kernel-PnP",
+                    "Microsoft-Windows-UserPnp",
+                    "Microsoft-Windows-DeviceSetupManager",
+                    "Microsoft-Windows-CodeIntegrity"
+                )
+            } |
+            Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message
+    }
+    Save-Diagnostics "$Name-device-guard.txt" {
+        Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard `
+            -ClassName Win32_DeviceGuard | Format-List *
+    }
 }
 
 function Get-NormalizedMac([string]$MacAddress) {
