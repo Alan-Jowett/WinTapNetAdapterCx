@@ -157,7 +157,7 @@ jobs:
           name: WinTapRust-x64
           path: .\artifacts\WinTapRust-x64
       - name: Trust package test certificate
-        shell: pw
+        shell: pwsh
         run: |
           $certificate = ".\artifacts\WinTapRust-x64\WDRLocalTestCert.cer"
           if (-not (Test-Path -LiteralPath $certificate -PathType Leaf)) {
