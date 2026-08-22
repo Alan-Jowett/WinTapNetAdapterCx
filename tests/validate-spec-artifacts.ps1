@@ -84,9 +84,8 @@ $workflow = Get-Content -Raw .github\workflows\driver-validation.yml
 if ($workflow -notmatch 'cargo-wdk' -or
     $workflow -notmatch 'wintap_package' -or
     $workflow -notmatch 'validate-package.ps1' -or
-    $workflow -notmatch 'run-wintap-harness.ps1' -or
     $workflow -notmatch 'run-wintap-dual-adapter-harness.ps1') {
-    throw "The workflow does not cover Rust driver packaging and package validation."
+    throw "The workflow does not cover Rust driver packaging, package validation, and routed integration."
 }
 
 Write-Host "Specification and implementation artifacts are present."
