@@ -6,6 +6,7 @@ param(
     [switch]$RemoveDevice,
     [switch]$RequireTestSigning,
     [string]$PackageDirectory,
+    [string]$DevConPath,
     [string]$DiagnosticsPath = ".\artifacts\wintap-harness",
     [int]$TimeoutSeconds = 15
 )
@@ -138,8 +139,8 @@ function Invoke-NativeWithTimeout(
 ) {
     Write-Diagnostic "native: starting name=$Name file=$FilePath args=$($Arguments -join ' ') timeoutSeconds=$TimeoutSeconds"
     $job = Start-Job -ScriptBlock {
-        param($Path, $Args)
-        $output = @(& $Path @Args 2>&1)
+        param($Path, $CommandArguments)
+        $output = @(& $Path @CommandArguments 2>&1)
         [pscustomobject]@{
             Output = $output
             ExitCode = $LASTEXITCODE
@@ -635,11 +636,16 @@ function Invoke-DriverInstall {
     $inf = Join-Path $package $driverInf
     Assert-True (Test-Path -LiteralPath $inf -PathType Leaf) `
         "Driver INF is missing: $inf"
-    $result = Invoke-NativeWithTimeout "install-command" "pnputil.exe" `
-        @("/add-driver", $inf, "/install")
+    Assert-True (-not [string]::IsNullOrWhiteSpace($DevConPath)) `
+        "-DevConPath is required with -InstallDriver."
+    $devcon = (Resolve-Path -LiteralPath $DevConPath).Path
+    Assert-True ((Split-Path -Leaf $devcon) -ieq "devcon.exe") `
+        "-DevConPath must name devcon.exe: $devcon"
+    $result = Invoke-NativeWithTimeout "install-command" $devcon `
+        @("install", $inf, $driverHardwareId)
     Save-SetupApiDiagnostics "install-command"
     if ($result.ExitCode -ne 0) {
-        throw "pnputil failed with exit code $($result.ExitCode)."
+        throw "devcon failed with exit code $($result.ExitCode)."
     }
     $service = Get-Service -Name $driverService -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne "Running") {

@@ -268,8 +268,8 @@ function Invoke-RecordedNative(
 ) {
     Write-Diagnostic "native: starting name=$Name file=$FilePath args=$($Arguments -join ' ') timeoutSeconds=120"
     $job = Start-Job -ScriptBlock {
-        param($Path, $Args)
-        $output = @(& $Path @Args 2>&1)
+        param($Path, $CommandArguments)
+        $output = @(& $Path @CommandArguments 2>&1)
         [pscustomobject]@{
             Output = $output
             ExitCode = $LASTEXITCODE
