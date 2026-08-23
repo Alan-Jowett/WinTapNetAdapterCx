@@ -132,39 +132,51 @@ function Write-Diagnostic([string]$Message) {
     }
 }
 
+function ConvertTo-NativeCommandLine([string[]]$Arguments) {
+    return (($Arguments | ForEach-Object {
+        if ($_ -notmatch '[\s"]') {
+            $_
+        } else {
+            '"' + (($_ -replace '(\\*)"', '${1}${1}\"') -replace '(\\+)$', '${1}${1}') + '"'
+        }
+    }) -join ' ')
+}
+
 function Invoke-NativeWithTimeout(
     [string]$Name,
     [string]$FilePath,
     [string[]]$Arguments,
     [int]$TimeoutSeconds = 120
 ) {
-    Write-Diagnostic "native: starting name=$Name file=$FilePath args=$($Arguments -join ' ') timeoutSeconds=$TimeoutSeconds"
-    $job = Start-Job -ScriptBlock {
-        param($Path, $CommandArguments)
-        $output = @(& $Path @CommandArguments 2>&1)
-        [pscustomobject]@{
-            Output = $output
-            ExitCode = $LASTEXITCODE
-        }
-    } -ArgumentList $FilePath, (,$Arguments)
+    $commandLine = ConvertTo-NativeCommandLine $Arguments
+    $stdoutPath = Join-Path $script:DiagnosticsPath "$Name-stdout.txt"
+    $stderrPath = Join-Path $script:DiagnosticsPath "$Name-stderr.txt"
+    Write-Diagnostic "native: starting name=$Name file=$FilePath args=$commandLine timeoutSeconds=$TimeoutSeconds"
+    $process = Start-Process -FilePath $FilePath -ArgumentList $commandLine -PassThru -NoNewWindow `
+        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     try {
-        if ($null -eq (Wait-Job -Job $job -Timeout ($TimeoutSeconds))) {
-            $partialOutput = @(Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue)
-            $partialOutput | Out-File (Join-Path $DiagnosticsPath "$Name-timeout-output.txt") `
-                -Encoding utf8 -Force
-            $job | Format-List * | Out-File (Join-Path $DiagnosticsPath "$Name-timeout-job.txt") `
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $process | Format-List * | Out-File (Join-Path $script:DiagnosticsPath "$Name-timeout-process.txt") `
                 -Encoding utf8 -Force
             Save-ProvisioningDiagnostics "$Name-timeout"
-            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            $process.WaitForExit()
             throw "$Name did not exit within $TimeoutSeconds seconds."
         }
-        $result = Receive-Job -Job $job
-        $result.Output | Out-File (Join-Path $DiagnosticsPath "$Name.txt") `
+        $output = @(
+            Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
+            Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue
+        )
+        $output | Out-File (Join-Path $script:DiagnosticsPath "$Name.txt") `
             -Encoding utf8 -Force
+        $result = [pscustomobject]@{
+            Output = $output
+            ExitCode = $process.ExitCode
+        }
         Write-Diagnostic "native: completed name=$Name exitCode=$($result.ExitCode)"
         return $result
     } finally {
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        $process.Dispose()
     }
 }
 
@@ -807,7 +819,12 @@ function Invoke-IntegrationHarness {
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
         $echoRequest = $null
         $packetIndex = 0
+        $nextHeartbeat = [DateTime]::UtcNow
         while ([DateTime]::UtcNow -lt $deadline -and $null -eq $echoRequest) {
+            if ([DateTime]::UtcNow -ge $nextHeartbeat) {
+                Write-Diagnostic "integration: waiting for ping frame packets=$packetIndex"
+                $nextHeartbeat = [DateTime]::UtcNow.AddSeconds(1)
+            }
             $remaining = [Math]::Max(100, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
             $frame = Read-Frame $handle ([Math]::Min(1000, $remaining))
             if ($null -eq $frame) {
@@ -885,7 +902,7 @@ if ($Integration) {
                 }
             }
             Remove-TestAddress $script:IntegrationAdapter
-            if ($script:AdapterWasDisabled) {
+            if ($script:AdapterWasDisabled -and $script:IntegrationAdapter) {
                 Disable-NetAdapter -Name $script:IntegrationAdapter.Name `
                     -Confirm:$false -ErrorAction SilentlyContinue
             }
@@ -895,7 +912,8 @@ if ($Integration) {
             }
             $removeInstalledDevice = $RemoveDevice -or (
                 $InstallDriver -and -not $script:AdapterExistedBeforeInstall)
-            if ($removeInstalledDevice -and $script:IntegrationAdapter.PnPDeviceID) {
+            if ($removeInstalledDevice -and $script:IntegrationAdapter -and
+                $script:IntegrationAdapter.PnPDeviceID) {
                 & pnputil.exe /remove-device $script:IntegrationAdapter.PnPDeviceID 2>&1 |
                     Out-File (Join-Path $DiagnosticsPath "remove-device.txt") `
                     -Encoding utf8 -Force

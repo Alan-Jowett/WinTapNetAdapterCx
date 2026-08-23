@@ -58,6 +58,7 @@ $script:PnpRemovalConfirmed = $false
 $script:Relay = $null
 $script:Handles = @{}
 $script:PacketSequence = 0
+$script:PumpWaitSequence = 0
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -262,45 +263,53 @@ function Assert-TestSigning {
     }
 }
 
+function ConvertTo-NativeCommandLine([string[]]$Arguments) {
+    return (($Arguments | ForEach-Object {
+        if ($_ -notmatch '[\s"]') {
+            $_
+        } else {
+            '"' + (($_ -replace '(\\*)"', '${1}${1}\"') -replace '(\\+)$', '${1}${1}') + '"'
+        }
+    }) -join ' ')
+}
+
 function Invoke-RecordedNative(
     [string]$Name,
     [string]$FilePath,
-    [string[]]$Arguments
+    [string[]]$Arguments,
+    [int]$TimeoutSeconds = 120
 ) {
-    Write-Diagnostic "native: starting name=$Name file=$FilePath args=$($Arguments -join ' ') timeoutSeconds=120"
-    $job = Start-Job -ScriptBlock {
-        param($Path, $CommandArguments)
-        $output = @(& $Path @CommandArguments 2>&1)
-        [pscustomobject]@{
-            Output = $output
-            ExitCode = $LASTEXITCODE
-        }
-    } -ArgumentList $FilePath, (,$Arguments)
+    $commandLine = ConvertTo-NativeCommandLine $Arguments
+    $stdoutPath = Join-Path $script:DiagnosticsPath "$Name-stdout.txt"
+    $stderrPath = Join-Path $script:DiagnosticsPath "$Name-stderr.txt"
+    Write-Diagnostic "native: starting name=$Name file=$FilePath args=$commandLine timeoutSeconds=$TimeoutSeconds"
+    $process = Start-Process -FilePath $FilePath -ArgumentList $commandLine -PassThru -NoNewWindow `
+        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     try {
-        if ($null -eq (Wait-Job -Job $job -Timeout 120)) {
-            $partialOutput = @(Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue)
-            $partialOutput | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name-timeout-output.txt") `
-                -Encoding utf8 -Force
-            $job | Format-List * | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name-timeout-job.txt") `
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $process | Format-List * | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name-timeout-process.txt") `
                 -Encoding utf8 -Force
             Save-ProvisioningDiagnostics "$Name-timeout"
-            Stop-Job -Job $job -ErrorAction SilentlyContinue
-            throw "$Name did not exit within 120 seconds."
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            $process.WaitForExit()
+            throw "$Name did not exit within $TimeoutSeconds seconds."
         }
-        $result = Receive-Job -Job $job
-        $output = @($result.Output)
-        $exitCode = [int]$result.ExitCode
+        $output = @(
+            Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
+            Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue
+        )
+        $exitCode = $process.ExitCode
         $output | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name.txt") `
             -Encoding utf8 -Force
         Save-SetupApiDiagnostics $Name
         Write-Diagnostic "native: completed name=$Name exitCode=$exitCode"
     } finally {
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        $process.Dispose()
     }
     $record = [pscustomobject]@{
         Name = $Name
         FilePath = $FilePath
-        Arguments = $Arguments -join " "
+        Arguments = @($Arguments)
         ExitCode = $exitCode
     }
     $script:CommandRecords += $record
