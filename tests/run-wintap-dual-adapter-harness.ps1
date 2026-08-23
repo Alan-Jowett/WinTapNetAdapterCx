@@ -291,7 +291,9 @@ function Invoke-RecordedNative(
                 -Encoding utf8 -Force
             Save-ProvisioningDiagnostics "$Name-timeout"
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-            $process.WaitForExit()
+            if (-not $process.WaitForExit(5000)) {
+                Write-Diagnostic "native: process did not exit after termination name=$Name processId=$($process.Id)"
+            }
             throw "$Name did not exit within $TimeoutSeconds seconds."
         }
         $output = @(
