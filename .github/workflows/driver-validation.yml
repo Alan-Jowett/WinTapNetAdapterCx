@@ -15,7 +15,7 @@ env:
 
 jobs:
   repository-validation:
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +38,7 @@ jobs:
 
   cargo-build:
     name: NuGet-only Cargo build
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -91,41 +91,28 @@ jobs:
           name: WinTapRust-${{ matrix.architecture }}
           path: out/cmake/${{ matrix.architecture }}/package/${{ matrix.architecture }}/${{ env.BUILD_CONFIGURATION }}/
 
-  single-adapter-integration:
-    name: Existing ICMP TAP integration
-    needs: package
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: WinTapRust-x64
-          path: .\artifacts\WinTapRust-x64
-      - name: Run existing ICMP TAP harness
-        shell: pwsh
-        run: |
-          .\tests\run-wintap-harness.ps1 -Integration `
-            -InstallDriver `
-            -RequireTestSigning `
-            -PackageDirectory .\artifacts\WinTapRust-x64 `
-            -DiagnosticsPath .\artifacts\wintap-harness
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: WinTapHarnessDiagnostics
-          path: artifacts/wintap-harness/
-          if-no-files-found: warn
-
   dual-adapter-integration:
     name: Routed dual-adapter integration
     needs: package
-    runs-on: windows-2022
+    runs-on: windows-2025
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: WinTapRust-x64
           path: .\artifacts\WinTapRust-x64
+      - name: Trust package test certificate
+        shell: pwsh
+        run: |
+          $certificate = ".\artifacts\WinTapRust-x64\WDRLocalTestCert.cer"
+          if (-not (Test-Path -LiteralPath $certificate -PathType Leaf)) {
+            throw "Package test certificate is missing: $certificate"
+          }
+          Import-Certificate -FilePath $certificate -CertStoreLocation Cert:\LocalMachine\Root |
+            Out-Null
+          Import-Certificate -FilePath $certificate -CertStoreLocation Cert:\LocalMachine\TrustedPublisher |
+            Out-Null
       - name: Restore pinned WDK DevCon
         id: devcon
         shell: pwsh

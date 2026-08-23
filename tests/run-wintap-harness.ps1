@@ -6,6 +6,7 @@ param(
     [switch]$RemoveDevice,
     [switch]$RequireTestSigning,
     [string]$PackageDirectory,
+    [string]$DevConPath,
     [string]$DiagnosticsPath = ".\artifacts\wintap-harness",
     [int]$TimeoutSeconds = 15
 )
@@ -15,6 +16,7 @@ $ErrorActionPreference = "Stop"
 $driverService = "WinTapRust"
 $driverInf = "wintap_netadaptercx_driver.inf"
 $driverHardwareId = "ROOT\WinTapRust"
+$driverHardwareIds = @($driverHardwareId)
 $driverDescription = "WinTapRust"
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -121,6 +123,65 @@ function Ensure-DiagnosticsDirectory {
     $script:DiagnosticsPath = (Resolve-Path -LiteralPath $DiagnosticsPath).Path
 }
 
+function Write-Diagnostic([string]$Message) {
+    $line = "{0} {1}" -f ([DateTime]::UtcNow.ToString("o")), $Message
+    Write-Host $line
+    if ($script:DiagnosticsPath) {
+        Add-Content -LiteralPath (Join-Path $script:DiagnosticsPath "progress.log") `
+            -Value $line -Encoding utf8
+    }
+}
+
+function ConvertTo-NativeCommandLine([string[]]$Arguments) {
+    return (($Arguments | ForEach-Object {
+        if ($_ -notmatch '[\s"]') {
+            $_
+        } else {
+            '"' + (($_ -replace '(\\*)"', '${1}${1}\"') -replace '(\\+)$', '${1}${1}') + '"'
+        }
+    }) -join ' ')
+}
+
+function Invoke-NativeWithTimeout(
+    [string]$Name,
+    [string]$FilePath,
+    [string[]]$Arguments,
+    [int]$TimeoutSeconds = 120
+) {
+    $commandLine = ConvertTo-NativeCommandLine $Arguments
+    $stdoutPath = Join-Path $script:DiagnosticsPath "$Name-stdout.txt"
+    $stderrPath = Join-Path $script:DiagnosticsPath "$Name-stderr.txt"
+    Write-Diagnostic "native: starting name=$Name file=$FilePath args=$commandLine timeoutSeconds=$TimeoutSeconds"
+    $process = Start-Process -FilePath $FilePath -ArgumentList $commandLine -PassThru -NoNewWindow `
+        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    try {
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $process | Format-List * | Out-File (Join-Path $script:DiagnosticsPath "$Name-timeout-process.txt") `
+                -Encoding utf8 -Force
+            Save-ProvisioningDiagnostics "$Name-timeout"
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            if (-not $process.WaitForExit(5000)) {
+                Write-Diagnostic "native: process did not exit after termination name=$Name processId=$($process.Id)"
+            }
+            throw "$Name did not exit within $TimeoutSeconds seconds."
+        }
+        $output = @(
+            Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
+            Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue
+        )
+        $output | Out-File (Join-Path $script:DiagnosticsPath "$Name.txt") `
+            -Encoding utf8 -Force
+        $result = [pscustomobject]@{
+            Output = $output
+            ExitCode = $process.ExitCode
+        }
+        Write-Diagnostic "native: completed name=$Name exitCode=$($result.ExitCode)"
+        return $result
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function Save-Diagnostics([string]$Name, [scriptblock]$Command) {
     try {
         & $Command 2>&1 | Out-File -FilePath (Join-Path $DiagnosticsPath $Name) `
@@ -128,6 +189,63 @@ function Save-Diagnostics([string]$Name, [scriptblock]$Command) {
     } catch {
         $_ | Out-File -FilePath (Join-Path $DiagnosticsPath "$Name.error") `
             -Encoding utf8 -Force
+    }
+}
+
+function Save-SetupApiDiagnostics([string]$Name) {
+    Save-Diagnostics "$Name-setupapi-tail.txt" {
+        $path = "$env:windir\INF\setupapi.dev.log"
+        if (Test-Path -LiteralPath $path) {
+            Get-Content -LiteralPath $path -Tail 1000
+        } else {
+            "SetupAPI device log was not found: $path"
+        }
+    }
+}
+
+function Save-ProvisioningDiagnostics([string]$Name) {
+    Save-SetupApiDiagnostics $Name
+    Save-Diagnostics "$Name-processes.txt" {
+        Get-CimInstance -ClassName Win32_Process |
+            Where-Object {
+                $_.Name -match "^(devcon|pnputil|rundll32|msiexec)\.exe$" -or
+                $_.CommandLine -match "WinTapRust|wintap_netadaptercx_driver"
+            } |
+            Select-Object ProcessId, ParentProcessId, Name, CommandLine, CreationDate |
+            Format-List *
+    }
+    Save-Diagnostics "$Name-pnp-devices.txt" {
+        Get-CimInstance -ClassName Win32_PnPEntity |
+            Where-Object {
+                @($_.HardwareID | ForEach-Object { [string]$_ } |
+                    Where-Object { $driverHardwareIds -contains $_ }).Count -gt 0
+            } |
+            Format-List *
+    }
+    Save-Diagnostics "$Name-pnputil-devices.txt" {
+        foreach ($hardwareId in $driverHardwareIds) {
+            "=== $hardwareId ==="
+            & pnputil.exe /enum-devices /deviceid $hardwareId /drivers /services /stack /properties
+        }
+    }
+    Save-Diagnostics "$Name-device-install-events.txt" {
+        Get-WinEvent -FilterHashtable @{
+            LogName = "System"
+            StartTime = (Get-Date).AddMinutes(-10)
+        } -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ProviderName -in @(
+                    "Microsoft-Windows-Kernel-PnP",
+                    "Microsoft-Windows-UserPnp",
+                    "Microsoft-Windows-DeviceSetupManager",
+                    "Microsoft-Windows-CodeIntegrity"
+                )
+            } |
+            Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message
+    }
+    Save-Diagnostics "$Name-device-guard.txt" {
+        Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard `
+            -ClassName Win32_DeviceGuard | Format-List *
     }
 }
 
@@ -585,11 +703,16 @@ function Invoke-DriverInstall {
     $inf = Join-Path $package $driverInf
     Assert-True (Test-Path -LiteralPath $inf -PathType Leaf) `
         "Driver INF is missing: $inf"
-    $installOutput = & pnputil.exe /add-driver $inf /install 2>&1
-    $installOutput | Out-File (Join-Path $DiagnosticsPath "install-command.txt") `
-        -Encoding utf8 -Force
-    if ($LASTEXITCODE -ne 0) {
-        throw "pnputil failed with exit code $LASTEXITCODE."
+    Assert-True (-not [string]::IsNullOrWhiteSpace($DevConPath)) `
+        "-DevConPath is required with -InstallDriver."
+    $devcon = (Resolve-Path -LiteralPath $DevConPath).Path
+    Assert-True ((Split-Path -Leaf $devcon) -ieq "devcon.exe") `
+        "-DevConPath must name devcon.exe: $devcon"
+    $result = Invoke-NativeWithTimeout "install-command" $devcon `
+        @("install", $inf, $driverHardwareId)
+    Save-SetupApiDiagnostics "install-command"
+    if ($result.ExitCode -ne 0) {
+        throw "devcon failed with exit code $($result.ExitCode)."
     }
     $service = Get-Service -Name $driverService -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne "Running") {
@@ -640,10 +763,14 @@ function Remove-TestAddress($Adapter) {
 
 function Invoke-IntegrationHarness {
     Ensure-DiagnosticsDirectory
+    Write-Diagnostic "integration: start"
     if ($RequireTestSigning) {
+        Write-Diagnostic "integration: checking test signing"
         Assert-TestSigning
+        Write-Diagnostic "integration: test signing enabled"
     }
     if ($InstallDriver) {
+        Write-Diagnostic "integration: installing driver"
         try {
             Get-WinTapAdapter | Out-Null
             $script:AdapterExistedBeforeInstall = $true
@@ -651,21 +778,28 @@ function Invoke-IntegrationHarness {
             $script:AdapterExistedBeforeInstall = $false
         }
         Invoke-DriverInstall
+        Write-Diagnostic "integration: driver install completed"
     }
 
+    Write-Diagnostic "integration: waiting for adapter"
     $adapter = Wait-WinTapAdapter
     $script:IntegrationAdapter = $adapter
+    Write-Diagnostic "integration: adapter discovered name=$($adapter.Name) status=$($adapter.Status)"
     $script:AdapterWasDisabled = ($adapter.Status -eq "Disabled")
     if ($adapter.Status -eq "Disabled") {
+        Write-Diagnostic "integration: enabling adapter"
         Enable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction Stop
         $adapter = Wait-WinTapAdapter
         $script:IntegrationAdapter = $adapter
+        Write-Diagnostic "integration: adapter enabled"
     }
+    Write-Diagnostic "integration: configuring test address"
     Add-TestAddress $adapter
     Assert-True (Test-WinTapAdapterIdentity $adapter) `
         "The discovered adapter is not backed by the expected driver."
     Write-Host "Using adapter '$($adapter.Name)' ($($adapter.PnPDeviceID)), MAC $($adapter.MacAddress)."
 
+    Write-Diagnostic "integration: opening TAP handle"
     $localMac = Get-MacBytes $adapter.MacAddress
     $peerMac = [byte[]](0x02, 0x57, 0x54, 0x41, 0x50, 0x02)
     $localIp = Get-IPv4Bytes "192.0.2.1"
@@ -679,6 +813,7 @@ function Invoke-IntegrationHarness {
 
     $ping = $null
     try {
+        Write-Diagnostic "integration: starting ping"
         $ping = [System.Net.NetworkInformation.Ping]::new()
         $payload = [Text.Encoding]::ASCII.GetBytes("$driverDescription REQ-008")
         $pingTask = $ping.SendPingAsync(
@@ -686,7 +821,12 @@ function Invoke-IntegrationHarness {
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
         $echoRequest = $null
         $packetIndex = 0
+        $nextHeartbeat = [DateTime]::UtcNow
         while ([DateTime]::UtcNow -lt $deadline -and $null -eq $echoRequest) {
+            if ([DateTime]::UtcNow -ge $nextHeartbeat) {
+                Write-Diagnostic "integration: waiting for ping frame packets=$packetIndex"
+                $nextHeartbeat = [DateTime]::UtcNow.AddSeconds(1)
+            }
             $remaining = [Math]::Max(100, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
             $frame = Read-Frame $handle ([Math]::Min(1000, $remaining))
             if ($null -eq $frame) {
@@ -731,7 +871,9 @@ function Invoke-IntegrationHarness {
         Assert-True (Test-BytesEqual $pingReply.Buffer $payload) `
             "Windows networking stack received an unexpected Echo Reply payload."
         Write-Host "Windows stack received the matching Echo Reply."
+        Write-Diagnostic "integration: ping completed successfully"
     } finally {
+        Write-Diagnostic "integration: closing TAP handle"
         if ($ping) {
             $ping.Dispose()
         }
@@ -747,15 +889,22 @@ if ($Integration) {
     try {
         Invoke-IntegrationHarness
     } catch {
+        Write-Diagnostic "integration: failed: $($_.Exception.Message)"
         Save-EnvironmentDiagnostics
         throw
     } finally {
+        Write-Diagnostic "integration: cleanup start"
         try {
             if (-not $script:IntegrationAdapter) {
-                $script:IntegrationAdapter = Get-WinTapAdapter
+                try {
+                    $script:IntegrationAdapter = Get-WinTapAdapter
+                } catch {
+                    Write-Diagnostic "integration: cleanup could not rediscover adapter; continuing"
+                    $script:IntegrationAdapter = $null
+                }
             }
             Remove-TestAddress $script:IntegrationAdapter
-            if ($script:AdapterWasDisabled) {
+            if ($script:AdapterWasDisabled -and $script:IntegrationAdapter) {
                 Disable-NetAdapter -Name $script:IntegrationAdapter.Name `
                     -Confirm:$false -ErrorAction SilentlyContinue
             }
@@ -765,11 +914,13 @@ if ($Integration) {
             }
             $removeInstalledDevice = $RemoveDevice -or (
                 $InstallDriver -and -not $script:AdapterExistedBeforeInstall)
-            if ($removeInstalledDevice -and $script:IntegrationAdapter.PnPDeviceID) {
+            if ($removeInstalledDevice -and $script:IntegrationAdapter -and
+                $script:IntegrationAdapter.PnPDeviceID) {
                 & pnputil.exe /remove-device $script:IntegrationAdapter.PnPDeviceID 2>&1 |
                     Out-File (Join-Path $DiagnosticsPath "remove-device.txt") `
                     -Encoding utf8 -Force
             }
+            Write-Diagnostic "integration: cleanup completed"
         } catch {
             $_ | Out-File (Join-Path $DiagnosticsPath "cleanup.error") `
                 -Encoding utf8 -Force
