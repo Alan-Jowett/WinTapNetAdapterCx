@@ -29,8 +29,10 @@ else()
     set(WINTAP_RUST_PROFILE_ARG)
 endif()
 
-set(WINTAP_RUST_PACKAGE_DIR
+set(WINTAP_CHILD_PACKAGE_DIR
     "${CMAKE_SOURCE_DIR}/out/rust-target/${WINTAP_RUST_TARGET}/${WINTAP_RUST_PROFILE}/wintap_netadaptercx_driver_package")
+set(WINTAP_BUS_PACKAGE_DIR
+    "${CMAKE_SOURCE_DIR}/out/rust-target/${WINTAP_RUST_TARGET}/${WINTAP_RUST_PROFILE}/wintap_bus_driver_package")
 set(WINTAP_PACKAGE_DIR
     "${CMAKE_BINARY_DIR}/package/${CMAKE_GENERATOR_PLATFORM}/${WINTAP_CONFIGURATION}")
 
@@ -61,7 +63,10 @@ add_custom_target(wintap_package
     COMMAND "${CMAKE_COMMAND}" -E rm -rf "${WINTAP_PACKAGE_DIR}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${WINTAP_PACKAGE_DIR}"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
-        "${WINTAP_RUST_PACKAGE_DIR}"
+        "${WINTAP_CHILD_PACKAGE_DIR}"
+        "${WINTAP_PACKAGE_DIR}"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+        "${WINTAP_BUS_PACKAGE_DIR}"
         "${WINTAP_PACKAGE_DIR}"
     DEPENDS wintap_rust_driver
     VERBATIM)

@@ -1,9 +1,8 @@
 # WinTapNetAdapterCx Design Specification
 
 **Workflow:** `/evolve`  
-**Phase:** Phase 8 — Create Deliverable
-**Status:** Specification package approved; implementation and validation
-changes are being delivered
+**Phase:** Phase 2 — Specification Changes
+**Status:** Dynamic-bus specification changes proposed; awaiting approval
 **Trace source:** `specs/requirements.md`
 
 ## Design principles
@@ -15,9 +14,9 @@ changes are being delivered
 - Queues are bounded and use cancellation-aware backpressure.
 - Every asynchronous operation has one terminal completion and one owner at
   every transition.
-- The first switch release opens exactly the two existing static adapter
-  endpoints; endpoint handling is collection-oriented so future dynamic
-  devices can be added without changing completion ownership.
+- TAP children are discovered through immutable GUID-correlated device
+  interfaces; the initial relay and switch acceptance topology selects two
+  endpoints without imposing a static-root identity.
 - Protocol tests exercise the existing Ethernet/TAP boundary and do not add
   an IP/TUN mode or test-only driver path.
 
@@ -77,13 +76,11 @@ places the pinned `stampinf` x64 and `inf2cat` x86 tool directories on `PATH`,
 and invokes `cargo wdk build` for the selected target architecture. Debug uses
 the cargo-wdk default profile; Release passes `--profile release`.
 
-The package template is `wintap_netadaptercx_driver.inx`; cargo-wdk generates
-`wintap_netadaptercx_driver.inf` and `wintap_netadaptercx_driver.cat` beside
-the Rust driver binary. The supported root-enumerated hardware IDs are
-`ROOT\WinTapRust` and `ROOT\WinTapRust2`, and the service is `WinTapRust`. No
-C/C++ driver project, INF, source, service, hardware ID, package fallback, or
-selection switch remains in this branch. The first and second Rust control
-devices are exposed as `\\.\WinTapRust` and `\\.\WinTapRust2`.
+The Rust package flow shall produce distinct bus and child INF/catalog/service
+artifacts as specified in the dynamic KMDF bus and child design. No C/C++
+driver project, INF, source, service, hardware ID, package fallback, or
+selection switch remains in this branch. Legacy `ROOT\WinTapRust` and
+`ROOT\WinTapRust2` identities are migration inputs only, not runtime models.
 
 ## Component boundaries
 
@@ -99,11 +96,10 @@ the documented read/write operations.
   driver design together; no undocumented path may be relied upon.
 - A second open of the same control device shall fail deterministically while
   an owner is active.
-- The two supported instances retain independently exclusive control devices;
-  a process may hold one exclusive handle to each instance concurrently.
-- The routed dual-adapter harness shall validate the first and second
-  instance-specific MAC/control-device mapping and fail rather than infer that
-  mapping from PnP enumeration order.
+- Each GUID-keyed child retains an independently exclusive control interface;
+  a process may hold one exclusive handle to each selected child concurrently.
+- The routed dual-adapter harness shall validate GUID/interface mapping and
+  fail rather than infer identity from PnP enumeration order.
 - Closing the owner handle, process termination, or cancellation shall begin
   owner teardown and complete all outstanding requests.
 
@@ -438,21 +434,22 @@ reschedules required passive drain/completion work.
 
 ## ICMP/TAP integration-test design
 
-The REQ-008 test is an external user-mode acceptance workflow. It shall use
-the existing named device and overlapped read/write contract; the driver shall
-not contain test-only ARP or ICMP handling.
+The REQ-008 test is an external user-mode acceptance workflow. It shall create
+one test GUID child through the manager, use that child's discovered TAP
+interface and overlapped read/write contract, and shall not add test-only ARP
+or ICMP handling to the driver.
 
 ### Provisioning and isolation
 
-1. Install and start the test-signed package, then uniquely identify the
-   virtual Ethernet interface using stable adapter identity rather than an
-   interface index alone.
+1. Install and start the test-signed package, create one test GUID child
+   through the manager, then uniquely identify the resulting virtual Ethernet
+   and TAP interfaces by GUID rather than interface index or fixed path.
 2. Record the interface address, routes, administrative state, and driver
    state needed for restoration.
 3. Assign `192.0.2.1/30` only to the test interface. Do not add a default
    route; reject address collisions or ambiguous adapter matches.
-4. Open `\\.\WinTapRust` exclusively with overlapped I/O before the
-   protocol exchange.
+4. Open the GUID-correlated TAP interface exclusively with overlapped I/O
+   before the protocol exchange.
 
 ### Request/reply packet flow
 
@@ -489,9 +486,10 @@ malformed frames fail the test.
 
 Cleanup runs from a guaranteed finalization path and is idempotent. It
 cancel/completes pending operations before closing the handle, removes only
-the test address and any test-created route, restores the interface and
-driver state, removes the test package where permitted, and retains command
-output, packet bytes, driver status, and event logs on failure.
+the test address and any test-created route, removes the recorded test child,
+restores the interface and driver state, removes the test package where
+permitted, and retains command output, packet bytes, driver status, and event
+logs on failure.
 
 Provisioning, packet-validation, timeout, or cleanup errors are test
 failures. Cleanup failures are reported in addition to the primary failure
@@ -684,6 +682,93 @@ completion path occur outside the state lock. User buffers and ring resources
 are accessed only at permitted user-mode execution contexts; all completion
 and cancellation paths are idempotent.
 
+## Dynamic KMDF bus and child design
+
+This section supersedes the fixed-root package, control-path, relay
+provisioning, and endpoint-selection details elsewhere in this document.
+
+### Package and PnP topology
+
+The package contains separate KMDF bus and TAP-child services. The bus service
+binds a bus-parent hardware identity and owns the WDF child list. The child
+service binds only the bus child hardware/compatible identity and performs the
+existing NetAdapterCx and TAP-child initialization. The design shall not bind
+the child service to `ROOT\WinTapRust` or `ROOT\WinTapRust2`.
+
+The bus's child identification description contains the immutable manager GUID
+as its sole identity key. A child description is allocated and initialized
+before it is added to the WDF child list. The bus publishes a child only after
+all checked allocation and identity initialization succeeds. The child PDO
+context owns its GUID and cannot reference mutable manager-owned request
+storage.
+
+### Bus manager control plane
+
+The bus exposes an administrator-only control interface. Its request header
+contains protocol version, operation, bounded total length, request ID, and
+adapter GUID. The bus rejects unknown versions, invalid operation codes,
+lengths smaller than the header, lengths exceeding the supplied buffer, and
+invalid GUIDs before allocation or mutation.
+
+Create validates the GUID, reserves the per-GUID lifecycle state, adds the
+child description, and returns an in-progress result correlated by request ID
+and GUID. It reaches terminal success only after the child publishes its TAP
+interface. Remove marks the GUID removing, prevents duplicate create/remove,
+requests WDF child removal, and reaches terminal success only after child PnP
+removal and interface withdrawal. Enumerate and query report only GUID,
+lifecycle state, and interface identity; the manager never opens, reads, or
+writes a TAP endpoint.
+
+### Child lifetime and TAP interface
+
+The child receives its GUID from immutable PDO context during device addition.
+It allocates all NetAdapterCx, queue, frame, filter, lock, work-item, and
+exclusive-owner state per child. No fixed instance ID, static state array, or
+cross-child raw state lookup is permitted. The child creates and registers a
+unique device interface and correlates it to the GUID for manager discovery.
+
+The child interface replaces fixed `\\.\WinTapRust` paths. Its access control
+continues to restrict TAP open/control to elevated administrators. A manager
+restart loses only manager user-mode state: the bus retains child descriptions,
+and enumerate permits reattachment. Bus unload or reboot does not promise
+persistence.
+
+### Synchronization, IRQL, and teardown
+
+The bus serializes child-list mutation and per-GUID lifecycle transitions. A
+per-GUID state machine is `Absent -> Creating -> Active -> Removing -> Absent`,
+with terminal `Failed` reported only after partial resources are unwound.
+Surprise removal and bus teardown enter `Removing`, reject new operations, and
+wait for the child PnP lifecycle to withdraw its interface.
+
+Bus control processing and PnP child-list mutation follow the verified KMDF
+execution-level contract. The bus does not run packet processing. Child
+NetAdapterCx callbacks preserve their existing IRQL/pageability requirements;
+teardown first blocks new queue work, then terminally completes or cancels
+child I/O, drains child frames and callbacks, unregisters the TAP interface,
+and releases child state exactly once.
+
+### Dynamic relay and switch selection
+
+The relay harness creates two test GUIDs through the manager, waits for their
+distinct interfaces, and selects them by returned GUID rather than device
+order, MAC ordinal, or fixed DOS name. It retains the existing two-endpoint
+IPv4/IPv6 route, neighbor, relay, directional-isolation, and cleanup
+assertions. The switch enumerates a selected GUID/interface collection; its
+initial forwarding policy still has two selected endpoints and therefore does
+not specify arbitrary-N flooding behavior.
+
+### Migration and diagnostics
+
+Package installation, upgrade, and uninstall enumerate legacy
+`ROOT\WinTapRust`/`ROOT\WinTapRust2` devices separately from dynamic children.
+They never adopt a legacy device as a bus child. An explicit migration or
+cleanup operation removes legacy instances and records the result.
+
+The bus and manager emit request ID, GUID, lifecycle transition, child PnP
+identity, interface identity, and primary cleanup failure. Diagnostics omit
+packet contents by default.
+
 ## Execution-environment design
 
 The hosted and VM paths share the REQ-008 and REQ-015 entry points, packet
@@ -693,11 +778,12 @@ cleanup policy may vary.
 
 ### GitHub-hosted Windows runner
 
-The workflow shall provision the WDK/SDK and test package, resolve the pinned
-WDK DevCon tool, verify the required test-signing/install state, run REQ-008
-and REQ-015, upload diagnostics, and restore the runner. The job must use the
-privileges required by the driver and network commands. If the runner rejects
-any required operation, the job fails with the operation and platform error.
+The workflow shall provision the WDK/SDK and test packages, verify the
+required test-signing/install state, use the manager control interface to
+create and remove the REQ-015 children, run REQ-008 and REQ-015, upload
+diagnostics, and restore the runner. The job must use the privileges required
+by the driver and network commands. If the runner rejects any required
+operation, the job fails with the operation and platform error.
 
 ### Manual Hyper-V VM
 

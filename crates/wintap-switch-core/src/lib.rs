@@ -131,12 +131,6 @@ pub struct EndpointSet {
 }
 
 impl EndpointSet {
-    pub fn static_pair() -> Self {
-        Self {
-            endpoints: vec![EndpointId::new(1), EndpointId::new(2)],
-        }
-    }
-
     pub fn from_ids<I>(ids: I) -> Result<Self, ForwardingError>
     where
         I: IntoIterator<Item = EndpointId>,
@@ -166,9 +160,22 @@ pub struct Switch {
 }
 
 impl Switch {
-    pub fn static_pair() -> Self {
+    pub fn from_endpoints<I>(endpoints: I) -> Result<Self, ForwardingError>
+    where
+        I: IntoIterator<Item = EndpointId>,
+    {
+        let endpoints = EndpointSet::from_ids(endpoints)?;
+        Ok(Self {
+            endpoints,
+            fdb: ForwardingDatabase::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn test_pair() -> Self {
         Self {
-            endpoints: EndpointSet::static_pair(),
+            endpoints: EndpointSet::from_ids([EndpointId::new(1), EndpointId::new(2)])
+                .expect("the test endpoint pair is non-empty"),
             fdb: ForwardingDatabase::new(),
         }
     }
@@ -398,10 +405,10 @@ mod tests {
     }
 
     #[test]
-    fn static_pair_forwards_known_unicast_and_floods_unknown() {
+    fn selected_pair_forwards_known_unicast_and_floods_unknown() {
         let a = EndpointId::new(1);
         let b = EndpointId::new(2);
-        let mut switch = Switch::static_pair();
+        let mut switch = Switch::test_pair();
         let source_a = [2, 0, 0, 0, 0, 1];
         let source_b = [2, 0, 0, 0, 0, 2];
 
@@ -419,7 +426,7 @@ mod tests {
     fn source_move_updates_destination_without_reflection() {
         let a = EndpointId::new(1);
         let b = EndpointId::new(2);
-        let mut switch = Switch::static_pair();
+        let mut switch = Switch::test_pair();
         let source = [2, 0, 0, 0, 0, 1];
         let other = [2, 0, 0, 0, 0, 2];
 
@@ -431,7 +438,7 @@ mod tests {
     #[test]
     fn full_fdb_preserves_existing_entries() {
         let a = EndpointId::new(1);
-        let mut switch = Switch::static_pair();
+        let mut switch = Switch::test_pair();
         for value in 0..FDB_CAPACITY {
             let mac = [
                 2,

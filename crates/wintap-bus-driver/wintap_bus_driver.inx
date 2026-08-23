@@ -1,0 +1,48 @@
+[Version]
+Signature = "$WINDOWS NT$"
+Class = System
+ClassGuid = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider = %ProviderName%
+DriverVer = 08/22/2026,1.1.0.0
+CatalogFile = wintap_bus_driver.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderName% = Standard,NTamd64.10.0...19041,NTarm64.10.0...19041
+
+[Standard.NTamd64.10.0...19041]
+%WinTapBusDeviceDesc% = WinTapBus_Install, Root\WinTapBus
+
+[Standard.NTarm64.10.0...19041]
+%WinTapBusDeviceDesc% = WinTapBus_Install, Root\WinTapBus
+
+[WinTapBus_Install]
+CopyFiles = WinTapBus_CopyFiles
+
+[WinTapBus_Install.Services]
+AddService = WinTapBus, 2, WinTapBus_Service
+
+[WinTapBus_CopyFiles]
+wintap_bus_driver.sys
+
+[DestinationDirs]
+WinTapBus_CopyFiles = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,
+
+[SourceDisksFiles]
+wintap_bus_driver.sys = 1
+
+[WinTapBus_Service]
+DisplayName = %WinTapBusServiceDesc%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %13%\wintap_bus_driver.sys
+
+[Strings]
+ProviderName = "WinTapRust contributors"
+DiskName = "WinTap bus installation media"
+WinTapBusDeviceDesc = "WinTap dynamic KMDF bus"
+WinTapBusServiceDesc = "WinTap Bus Driver"

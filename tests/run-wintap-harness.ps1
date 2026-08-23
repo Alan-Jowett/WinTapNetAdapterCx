@@ -1,5 +1,5 @@
 param(
-    [string]$DevicePath = "\\.\WinTapRust",
+    [string]$DevicePath,
     [switch]$Extended,
     [switch]$Integration,
     [switch]$InstallDriver,
@@ -13,11 +13,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$driverService = "WinTapRust"
+Import-Module (Join-Path $PSScriptRoot "wintap-bus-manager.psm1") -Force
+
+$driverService = "WinTapChild"
+$busService = "WinTapBus"
 $driverInf = "wintap_netadaptercx_driver.inf"
-$driverHardwareId = "ROOT\WinTapRust"
-$driverHardwareIds = @($driverHardwareId)
-$driverDescription = "WinTapRust"
+$busInf = "wintap_bus_driver.inf"
+$busHardwareId = "ROOT\WinTapBus"
+$driverHardwareIds = @($busHardwareId, "ROOT\WinTapRust", "ROOT\WinTapRust2")
+$driverDescription = "WinTap dynamic"
+$script:IntegrationChildGuid = [Guid]::NewGuid()
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -659,9 +664,13 @@ function Get-ValidIcmpRequest(
 }
 
 function Get-WinTapAdapter {
+    $dynamicHardwareId = "WINTAPBUS\{$($script:IntegrationChildGuid.ToString().ToUpperInvariant())}"
     $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
-        $_.InterfaceDescription -like "*$driverDescription*" -or
-        $_.PnPDeviceID -like "$driverHardwareId*"
+        $hardwareIds = @(
+            Get-PnpDeviceProperty -InstanceId $_.PnPDeviceID `
+                -KeyName "DEVPKEY_Device_HardwareIds" -ErrorAction SilentlyContinue
+        ).Data | ForEach-Object { [string]$_ }
+        $hardwareIds -contains $dynamicHardwareId
     })
     if ($adapters.Count -ne 1) {
         throw "Expected exactly one WinTap adapter; found $($adapters.Count)."
@@ -691,7 +700,7 @@ function Test-WinTapAdapterIdentity($Adapter) {
             -KeyName "DEVPKEY_Device_Service" -ErrorAction Stop
     ).Data
     return (
-        ($hardwareIds -contains $driverHardwareId) -and
+        ($hardwareIds -contains "WINTAPBUS\{$($script:IntegrationChildGuid.ToString().ToUpperInvariant())}") -and
         $service -eq $driverService
     )
 }
@@ -700,25 +709,31 @@ function Invoke-DriverInstall {
     Assert-True (-not [string]::IsNullOrWhiteSpace($PackageDirectory)) `
         "-PackageDirectory is required with -InstallDriver."
     $package = (Resolve-Path -LiteralPath $PackageDirectory).Path
-    $inf = Join-Path $package $driverInf
-    Assert-True (Test-Path -LiteralPath $inf -PathType Leaf) `
-        "Driver INF is missing: $inf"
+    $childInfPath = Join-Path $package $driverInf
+    $busInfPath = Join-Path $package $busInf
+    Assert-True (Test-Path -LiteralPath $childInfPath -PathType Leaf) `
+        "TAP child INF is missing: $childInfPath"
+    Assert-True (Test-Path -LiteralPath $busInfPath -PathType Leaf) `
+        "KMDF bus INF is missing: $busInfPath"
     Assert-True (-not [string]::IsNullOrWhiteSpace($DevConPath)) `
         "-DevConPath is required with -InstallDriver."
     $devcon = (Resolve-Path -LiteralPath $DevConPath).Path
     Assert-True ((Split-Path -Leaf $devcon) -ieq "devcon.exe") `
         "-DevConPath must name devcon.exe: $devcon"
-    $result = Invoke-NativeWithTimeout "install-command" $devcon `
-        @("install", $inf, $driverHardwareId)
+    $stage = Invoke-NativeWithTimeout "stage-child-command" "pnputil.exe" `
+        @("/add-driver", $childInfPath, "/install")
+    if ($stage.ExitCode -ne 0) {
+        throw "pnputil failed with exit code $($stage.ExitCode)."
+    }
+    $result = Invoke-NativeWithTimeout "install-bus-command" $devcon `
+        @("install", $busInfPath, $busHardwareId)
     Save-SetupApiDiagnostics "install-command"
     if ($result.ExitCode -ne 0) {
         throw "devcon failed with exit code $($result.ExitCode)."
     }
-    $service = Get-Service -Name $driverService -ErrorAction SilentlyContinue
-    if ($service -and $service.Status -ne "Running") {
-        Start-Service -Name $driverService -ErrorAction Stop
-        $script:ServiceStartedByHarness = $true
-    }
+    $child = New-WinTapBusChild $script:IntegrationChildGuid $TimeoutSeconds
+    $script:IntegrationChildCreated = $true
+    $script:DevicePath = $child.InterfacePath
 }
 
 function Assert-TestSigning {
@@ -908,16 +923,12 @@ if ($Integration) {
                 Disable-NetAdapter -Name $script:IntegrationAdapter.Name `
                     -Confirm:$false -ErrorAction SilentlyContinue
             }
-            if ($script:ServiceStartedByHarness) {
-                Stop-Service -Name $driverService `
-                    -ErrorAction SilentlyContinue
+            if ($script:IntegrationChildCreated) {
+                Remove-WinTapBusChild $script:IntegrationChildGuid $TimeoutSeconds | Out-Null
             }
-            $removeInstalledDevice = $RemoveDevice -or (
-                $InstallDriver -and -not $script:AdapterExistedBeforeInstall)
-            if ($removeInstalledDevice -and $script:IntegrationAdapter -and
-                $script:IntegrationAdapter.PnPDeviceID) {
-                & pnputil.exe /remove-device $script:IntegrationAdapter.PnPDeviceID 2>&1 |
-                    Out-File (Join-Path $DiagnosticsPath "remove-device.txt") `
+            if ($InstallDriver) {
+                & $DevConPath remove $busHardwareId 2>&1 |
+                    Out-File (Join-Path $DiagnosticsPath "remove-bus.txt") `
                     -Encoding utf8 -Force
             }
             Write-Diagnostic "integration: cleanup completed"
@@ -933,15 +944,19 @@ if ($Integration) {
     exit 0
 }
 
+$nonIntegrationDevicePath = $DevicePath
+if ([string]::IsNullOrWhiteSpace($nonIntegrationDevicePath)) {
+    throw "-DevicePath is required outside -Integration; use a manager-returned GUID-correlated interface path."
+}
 $handle = [WinTapNative]::CreateFile(
-    $DevicePath,
+    $nonIntegrationDevicePath,
     ([WinTapNative]::GenericRead -bor [WinTapNative]::GenericWrite),
     0, [IntPtr]::Zero, [WinTapNative]::OpenExisting,
     [WinTapNative]::FileFlagOverlapped, [IntPtr]::Zero)
 Assert-True ($handle -ne [IntPtr]::new(-1)) "Open failed: $(Get-Win32Error)"
 try {
     $secondHandle = [WinTapNative]::CreateFile(
-        $DevicePath,
+        $nonIntegrationDevicePath,
         ([WinTapNative]::GenericRead -bor [WinTapNative]::GenericWrite),
         0, [IntPtr]::Zero, [WinTapNative]::OpenExisting,
         [WinTapNative]::FileFlagOverlapped, [IntPtr]::Zero)

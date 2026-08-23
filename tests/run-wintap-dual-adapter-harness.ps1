@@ -3,9 +3,10 @@
 Runs the REQ-015/REQ-016 routed dual-adapter WinTap relay test.
 
 .DESCRIPTION
-This is intentionally separate from run-wintap-harness.ps1.  It provisions
-two disposable root devices, owns their independently exclusive TAP handles,
-and removes only state recorded as created by this invocation.
+This is intentionally separate from run-wintap-harness.ps1. It installs one
+KMDF bus, creates two GUID-correlated children through its administrator
+manager interface, owns their independently exclusive TAP handles, and removes
+only children created by this invocation.
 #>
 [CmdletBinding()]
 param(
@@ -30,15 +31,21 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$driverInf = "wintap_netadaptercx_driver.inf"
-$driverService = "WinTapRust"
-$hardwareIdA = "ROOT\WinTapRust"
-$hardwareIdB = "ROOT\WinTapRust2"
-$driverHardwareIds = @($hardwareIdA, $hardwareIdB)
-$controlPathA = "\\.\WinTapRust"
-$controlPathB = "\\.\WinTapRust2"
-$macAExpected = "02-57-54-41-50-01"
-$macBExpected = "02-57-54-41-50-02"
+Import-Module (Join-Path $PSScriptRoot "wintap-bus-manager.psm1") -Force
+
+$busInf = "wintap_bus_driver.inf"
+$childInf = "wintap_netadaptercx_driver.inf"
+$driverInf = $childInf
+$driverService = "WinTapChild"
+$busService = "WinTapBus"
+$busHardwareId = "ROOT\WinTapBus"
+$legacyHardwareIds = @("ROOT\WinTapRust", "ROOT\WinTapRust2")
+$childHardwareIdPrefix = "WINTAPBUS\{"
+$driverHardwareIds = @($busHardwareId) + $legacyHardwareIds
+$script:ChildGuidA = [Guid]::NewGuid()
+$script:ChildGuidB = [Guid]::NewGuid()
+$controlPathA = $null
+$controlPathB = $null
 $ipv4A = "198.51.100.1"
 $ipv4B = "198.51.100.2"
 $ipv6A = "2001:db8:515:1::1"
@@ -49,11 +56,13 @@ $script:CreatedNeighbors = @()
 $script:CreatedRoutes = @()
 $script:CreatedFirewallRules = @()
 $script:CreatedPnpInstanceIds = @()
+$script:CreatedChildGuids = @()
+$script:BusInstalledByHarness = $false
 $script:CommandRecords = @()
 $script:DriverPackagesBefore = @()
 $script:DriverPackagesAfter = @()
 $script:DriverPackageSnapshotTaken = $false
-$script:AddedPublishedInf = $null
+$script:AddedPublishedInfs = @()
 $script:PnpRemovalConfirmed = $false
 $script:Relay = $null
 $script:Handles = @{}
@@ -444,7 +453,7 @@ function Get-DriverStoreSnapshot([string]$Name) {
     $packages = @()
     foreach ($driver in $drivers) {
         $original = [string]$driver.OriginalFileName
-        if ($original -ine $driverInf) {
+        if ($original -notin @($childInf, $busInf)) {
             continue
         }
         $published = if ($driver.PSObject.Properties["PublishedName"]) {
@@ -473,11 +482,9 @@ function Update-AddedDriverPackage([string]$SnapshotName) {
             $before -notcontains $_.PublishedInf
         }
     )
-    Assert-True ($added.Count -le 1) `
-        "More than one new $driverInf driver-store package was detected."
-    if ($added.Count -eq 1) {
-        $script:AddedPublishedInf = $added[0].PublishedInf
-    }
+    Assert-True ($added.Count -le 2) `
+        "More than two new WinTap bus/child driver-store packages were detected."
+    $script:AddedPublishedInfs = @($added | ForEach-Object PublishedInf)
 }
 
 function Resolve-DevCon {
@@ -513,13 +520,11 @@ function Resolve-DevCon {
 }
 
 function Get-MatchingPnpDevices {
-    $hardwareIds = @($hardwareIdA, $hardwareIdB)
     return @(
-        # PnP assigns ROOT\NET instance IDs, so ownership must use the hardware-ID property.
         Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop | Where-Object {
             $deviceHardwareIds = @($_.HardwareID | ForEach-Object { [string]$_ })
             -not [string]::IsNullOrWhiteSpace($_.PNPDeviceID) -and
-            @($deviceHardwareIds | Where-Object { $hardwareIds -contains $_ }).Count -gt 0
+            @($deviceHardwareIds | Where-Object { $_ -like "$childHardwareIdPrefix*" }).Count -gt 0
         } | ForEach-Object {
             [pscustomobject]@{
                 InstanceId = [string]$_.PNPDeviceID
@@ -529,11 +534,32 @@ function Get-MatchingPnpDevices {
     )
 }
 
+function Get-LegacyPnpDevices {
+    return @(
+        Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop | Where-Object {
+            $hardwareIds = @($_.HardwareID | ForEach-Object { [string]$_ })
+            @($hardwareIds | Where-Object { $legacyHardwareIds -contains $_ }).Count -gt 0
+        }
+    )
+}
+
+function Get-BusPnpDevices {
+    return @(
+        Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop | Where-Object {
+            @($_.HardwareID | ForEach-Object { [string]$_ }) -contains $busHardwareId
+        }
+    )
+}
+
 function Assert-CleanEnvironment {
-    $existing = @(Get-MatchingPnpDevices)
-    if ($existing.Count -ne 0) {
-        $instances = ($existing | ForEach-Object InstanceId) -join ", "
-        throw "Refusing to modify state because matching WinTap Net adapter(s) already exist: $instances"
+    $legacy = @(Get-LegacyPnpDevices)
+    if ($legacy.Count -ne 0) {
+        $instances = ($legacy | ForEach-Object PNPDeviceID) -join ", "
+        throw "Legacy ROOT\WinTapRust device(s) require explicit migration or cleanup before dynamic provisioning: $instances"
+    }
+    $bus = @(Get-BusPnpDevices)
+    if ($bus.Count -ne 0) {
+        throw "Refusing to install a second WinTap bus; existing bus instance(s): $($bus.PNPDeviceID -join ', ')."
     }
 }
 
@@ -579,7 +605,47 @@ function Get-PnpPropertyData([string]$InstanceId, [string]$KeyName) {
     return (Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName $KeyName -ErrorAction Stop).Data
 }
 
-function Assert-AdapterIdentity($Adapter, [string]$HardwareId, [string]$ExpectedMac) {
+function Get-DynamicAdapterMap([object[]]$Children) {
+    Assert-True ($Children.Count -eq 2) "Expected exactly two manager-created children."
+    $expectedHardwareIds = @{}
+    foreach ($child in $Children) {
+        $expectedHardwareIds[$child.Guid.ToString()] = "WINTAPBUS\{$($child.Guid.ToString().ToUpperInvariant())}"
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
+            $hardwareIds = @(
+                Get-PnpDeviceProperty -InstanceId $_.PnPDeviceID `
+                    -KeyName "DEVPKEY_Device_HardwareIds" -ErrorAction SilentlyContinue
+            ).Data | ForEach-Object { [string]$_ }
+            @($hardwareIds | Where-Object { $expectedHardwareIds.Values -contains $_ }).Count -ne 0
+        })
+        if ($adapters.Count -eq 2 -and @($adapters | Where-Object Status -ne "Up").Count -eq 0) {
+            $mapped = @{}
+            foreach ($child in $Children) {
+                $hardwareId = $expectedHardwareIds[$child.Guid.ToString()]
+                $adapter = @($adapters | Where-Object {
+                    $ids = @(
+                        Get-PnpDeviceProperty -InstanceId $_.PnPDeviceID `
+                            -KeyName "DEVPKEY_Device_HardwareIds" -ErrorAction Stop
+                    ).Data | ForEach-Object { [string]$_ }
+                    $ids -contains $hardwareId
+                })
+                Assert-True ($adapter.Count -eq 1) "GUID $($child.Guid) does not map to exactly one adapter."
+                $service = [string](Get-PnpDeviceProperty -InstanceId $adapter[0].PnPDeviceID `
+                    -KeyName "DEVPKEY_Device_Service" -ErrorAction Stop).Data
+                Assert-True ($service -eq $driverService) `
+                    "Adapter $($adapter[0].PnPDeviceID) service is '$service', not '$driverService'."
+                $mapped[$child.Guid.ToString()] = $adapter[0]
+            }
+            return $mapped
+        }
+        Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Manager-created GUIDs did not produce two enabled dynamic adapters before timeout."
+}
+
+function Assert-AdapterIdentity($Adapter, [string]$HardwareId) {
     $hardwareIds = @(Get-PnpPropertyData $Adapter.PnPDeviceID "DEVPKEY_Device_HardwareIds")
     $service = [string](Get-PnpPropertyData $Adapter.PnPDeviceID "DEVPKEY_Device_Service")
     Assert-True (@($hardwareIds | Where-Object { [string]$_ -ieq $HardwareId }).Count -eq 1) `
@@ -587,33 +653,13 @@ function Assert-AdapterIdentity($Adapter, [string]$HardwareId, [string]$Expected
     Assert-True ($service -eq $driverService) `
         "Adapter $($Adapter.PnPDeviceID) service is '$service', not '$driverService'."
 
-    $expected = Get-NormalizedMac $ExpectedMac
-    $current = Get-NormalizedMac $Adapter.MacAddress
-    Assert-True ($current -eq $expected) `
-        "Adapter $($Adapter.PnPDeviceID) current MAC $($Adapter.MacAddress) is not $ExpectedMac."
-    $networkAdapter = @(
-        Get-CimInstance -ClassName Win32_NetworkAdapter -ErrorAction Stop |
-            Where-Object { $_.InterfaceIndex -eq $Adapter.ifIndex }
-    )
-    $permanent = @($networkAdapter | Where-Object { -not [string]::IsNullOrWhiteSpace($_.PermanentAddress) } |
-        Select-Object -First 1).PermanentAddress
-    if (-not [string]::IsNullOrWhiteSpace($permanent)) {
-        Assert-True ((Get-NormalizedMac $permanent) -eq $expected) `
-            "Adapter $($Adapter.PnPDeviceID) permanent MAC $permanent is not $ExpectedMac."
-    }
 }
 
-function Map-Adapters([object[]]$Adapters) {
-    Assert-True ($Adapters.Count -eq 2) "Expected exactly two adapters to map."
-    $a = @($Adapters | Where-Object { (Get-NormalizedMac $_.MacAddress) -eq (Get-NormalizedMac $macAExpected) })
-    $b = @($Adapters | Where-Object { (Get-NormalizedMac $_.MacAddress) -eq (Get-NormalizedMac $macBExpected) })
-    Assert-True ($a.Count -eq 1 -and $b.Count -eq 1) `
-        "MAC-to-control endpoint mapping is missing, duplicate, or ambiguous."
-    Assert-AdapterIdentity $a[0] $hardwareIdA $macAExpected
-    Assert-AdapterIdentity $b[0] $hardwareIdB $macBExpected
+function Map-Adapters([object[]]$Children) {
+    $mapped = Get-DynamicAdapterMap $Children
     return @{
-        A = $a[0]
-        B = $b[0]
+        A = $mapped[$script:ChildGuidA.ToString()]
+        B = $mapped[$script:ChildGuidB.ToString()]
     }
 }
 
@@ -1719,6 +1765,26 @@ function Invoke-Cleanup {
     Invoke-CleanupAction "control handles" {
         Close-ControlHandles
     } $errors
+    foreach ($guid in @($script:CreatedChildGuids)) {
+        Invoke-CleanupAction "manager child $guid" {
+            Remove-WinTapBusChild $guid $TimeoutSeconds | Out-Null
+        } $errors
+    }
+    if ($script:BusInstalledByHarness) {
+        Invoke-CleanupAction "bus parent" {
+            Invoke-RecordedNative "remove-wintap-bus" $script:ResolvedDevCon `
+                @("remove", $busHardwareId) | Out-Null
+            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+            do {
+                if (@(Get-BusPnpDevices).Count -eq 0) {
+                    break
+                }
+                Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $deadline)
+            Assert-True (@(Get-BusPnpDevices).Count -eq 0) `
+                "WinTap bus parent remains after cleanup."
+        } $errors
+    }
     Invoke-CleanupAction "driver-store package tracking" {
         if ($script:DriverPackageSnapshotTaken) {
             Update-AddedDriverPackage "driver-store-cleanup"
@@ -1769,15 +1835,15 @@ function Invoke-Cleanup {
             "Matching WinTap PnP device(s) remain after cleanup: $(($remaining | ForEach-Object InstanceId) -join ', ')"
         $script:PnpRemovalConfirmed = $true
     } $errors
-    if ($script:AddedPublishedInf) {
+    foreach ($publishedInf in @($script:AddedPublishedInfs)) {
         if ($script:PnpRemovalConfirmed) {
-            Invoke-CleanupAction "driver package $script:AddedPublishedInf" {
-                Invoke-RecordedNative "remove-driver-$script:AddedPublishedInf" "pnputil.exe" `
-                    @("/delete-driver", $script:AddedPublishedInf, "/uninstall", "/force") | Out-Null
+            Invoke-CleanupAction "driver package $publishedInf" {
+                Invoke-RecordedNative "remove-driver-$publishedInf" "pnputil.exe" `
+                    @("/delete-driver", $publishedInf, "/uninstall", "/force") | Out-Null
             } $errors
         } else {
             $errors.Add(
-                "driver package $script:AddedPublishedInf was retained because created PnP removal was not confirmed.")
+                "driver package $publishedInf was retained because created PnP removal was not confirmed.")
         }
     }
     return $errors
@@ -1789,9 +1855,13 @@ function Invoke-DualAdapterHarness {
     Write-Diagnostic "dual: checking test signing"
     Assert-TestSigning
     Write-Diagnostic "dual: test signing enabled"
-    $script:InfPath = Join-Path (Resolve-Path -LiteralPath $PackageDirectory -ErrorAction Stop).Path $driverInf
+    $package = (Resolve-Path -LiteralPath $PackageDirectory -ErrorAction Stop).Path
+    $script:InfPath = Join-Path $package $childInf
+    $script:BusInfPath = Join-Path $package $busInf
     Assert-True (Test-Path -LiteralPath $script:InfPath -PathType Leaf) `
-        "Driver INF is missing: $script:InfPath"
+        "TAP child INF is missing: $script:InfPath"
+    Assert-True (Test-Path -LiteralPath $script:BusInfPath -PathType Leaf) `
+        "KMDF bus INF is missing: $script:BusInfPath"
     $script:ResolvedDevCon = Resolve-DevCon
 
     # All following preflight checks run before provisioning or network mutation.
@@ -1799,21 +1869,25 @@ function Invoke-DualAdapterHarness {
     Write-Diagnostic "dual: clean environment confirmed"
     $script:DriverPackagesBefore = @(Get-DriverStoreSnapshot "driver-store-before")
     $script:DriverPackageSnapshotTaken = $true
-    Write-Diagnostic "dual: installing first root device"
-    Invoke-DevConInstall $hardwareIdA "devcon-install-wintaprust"
-    $firstDevice = @(Wait-MatchingPnpDeviceCount 1)
-    $script:CreatedPnpInstanceIds = @($firstDevice | ForEach-Object InstanceId)
-    Invoke-DevConInstall $hardwareIdB "devcon-install-wintaprust2"
-    Write-Diagnostic "dual: both root devices installed"
-    $devices = @(Wait-MatchingPnpDeviceCount 2)
-    $script:CreatedPnpInstanceIds = @($devices | ForEach-Object InstanceId)
-    $script:CreatedPnpInstanceIds | Out-File `
-        -LiteralPath (Join-Path $script:DiagnosticsPath "created-pnp-instance-ids.txt") -Encoding utf8 -Force
+    Write-Diagnostic "dual: staging TAP child package"
+    Invoke-RecordedNative "stage-wintap-child" "pnputil.exe" `
+        @("/add-driver", $script:InfPath, "/install") | Out-Null
+    Write-Diagnostic "dual: installing KMDF bus parent"
+    Invoke-RecordedNative "install-wintap-bus" $script:ResolvedDevCon `
+        @("install", $script:BusInfPath, $busHardwareId) | Out-Null
+    $script:BusInstalledByHarness = $true
+    Write-Diagnostic "dual: creating GUID-correlated TAP children"
+    $childA = New-WinTapBusChild $script:ChildGuidA $TimeoutSeconds
+    $childB = New-WinTapBusChild $script:ChildGuidB $TimeoutSeconds
+    $script:CreatedChildGuids = @($script:ChildGuidA, $script:ChildGuidB)
+    $script:controlPathA = $childA.InterfacePath
+    $script:controlPathB = $childB.InterfacePath
+    Assert-True ($script:controlPathA -ne $script:controlPathB) "Manager returned duplicate TAP interface identities."
+    @($childA, $childB) | ConvertTo-Json -Depth 4 | Out-File `
+        -LiteralPath (Join-Path $script:DiagnosticsPath "manager-created-children.json") -Encoding utf8 -Force
 
     Update-AddedDriverPackage "driver-store-after"
-    $adapterInstances = @($devices | ForEach-Object InstanceId)
-    $adapters = Map-Adapters (Wait-WinTapAdapters $adapterInstances)
-    Assert-True ($firstDevice.Count -eq 1) "First DevCon install did not create exactly one device."
+    $adapters = Map-Adapters @($childA, $childB)
 
     $script:Handles.A = Open-ControlHandle $controlPathA
     Assert-ExclusiveHandle $controlPathA
