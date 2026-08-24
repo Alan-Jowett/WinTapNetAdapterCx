@@ -14,7 +14,7 @@ use wdk_sys::{
     DRIVER_OBJECT, GUID, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, UNICODE_STRING,
     WDF_CHILD_IDENTIFICATION_DESCRIPTION_HEADER, WDF_CHILD_LIST_CONFIG, WDF_DRIVER_CONFIG,
     WDF_IO_QUEUE_CONFIG, WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDFCHILDLIST, WDFDEVICE,
-    WDFDEVICE_INIT, WDFDRIVER, WDFOBJECT, WDFQUEUE, WDFREQUEST, WDFSTRING, WDFWAITLOCK,
+    WDFDEVICE_INIT, WDFDRIVER, WDFOBJECT, WDFQUEUE, WDFREQUEST, WDFWAITLOCK,
     call_unsafe_wdf_function_binding,
 };
 
@@ -145,12 +145,6 @@ const CHILD_COMPATIBLE_ID: [u16; 22] = [
     b'd' as u16,
     0,
 ];
-const TAP_INTERFACE_CLASS: GUID = GUID {
-    Data1: 0x25d3_2edf,
-    Data2: 0x7c8c,
-    Data3: 0x4f09,
-    Data4: [0x90, 0x1f, 0x65, 0x0b, 0x23, 0x2e, 0x86, 0x4d],
-};
 
 #[cfg(not(test))]
 #[global_allocator]
@@ -433,25 +427,6 @@ fn child_device_id(guid: &GUID) -> [u16; 64] {
     guid_text(guid, &PREFIX)
 }
 
-fn child_interface_reference(guid: &GUID) -> [u16; 64] {
-    guid_text(guid, &[0])
-}
-
-fn copy_interface(node: &mut ChildNode, interface: &UNICODE_STRING) {
-    let length = core::cmp::min(
-        interface.Length as usize / core::mem::size_of::<u16>(),
-        MAX_INTERFACE_CHARS - 1,
-    );
-    if interface.Buffer.is_null() {
-        return;
-    }
-    unsafe {
-        core::ptr::copy_nonoverlapping(interface.Buffer, node.interface_name.as_mut_ptr(), length);
-    }
-    node.interface_name[length] = 0;
-    node.interface_length = length as u16;
-}
-
 fn write_record(record: &mut ManagerRecord, node: &ChildNode) {
     record.adapter_guid = node.guid;
     record.lifecycle = node.lifecycle;
@@ -547,8 +522,9 @@ extern "C" fn evt_bus_device_add(_driver: WDFDRIVER, device_init: *mut WDFDEVICE
     let mut attributes = WDF_OBJECT_ATTRIBUTES {
         Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
         EvtCleanupCallback: Some(evt_bus_device_cleanup),
-        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive,
-        SynchronizationScope: wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone,
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
         ContextTypeInfo: &raw const BUS_CONTEXT_TYPE_INFO,
         ..WDF_OBJECT_ATTRIBUTES::default()
     };
@@ -569,8 +545,9 @@ extern "C" fn evt_bus_device_add(_driver: WDFDRIVER, device_init: *mut WDFDEVICE
     let mut lock_attributes = WDF_OBJECT_ATTRIBUTES {
         Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
         ParentObject: device.cast(),
-        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive,
-        SynchronizationScope: wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone,
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
         ..WDF_OBJECT_ATTRIBUTES::default()
     };
     let mut lock = core::ptr::null_mut();
@@ -768,8 +745,9 @@ extern "C" fn evt_child_list_create_device(
     let mut attributes = WDF_OBJECT_ATTRIBUTES {
         Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
         EvtCleanupCallback: Some(evt_child_pdo_cleanup),
-        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive,
-        SynchronizationScope: wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone,
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
         ContextTypeInfo: &raw const CHILD_PDO_CONTEXT_TYPE_INFO,
         ..WDF_OBJECT_ATTRIBUTES::default()
     };
@@ -804,70 +782,7 @@ extern "C" fn evt_child_list_create_device(
         (*pdo_context).guid = guid;
     }
 
-    let reference_text = child_interface_reference(&guid);
-    let reference = unicode_string(&reference_text);
-    let status = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceCreateDeviceInterface,
-            pdo,
-            &TAP_INTERFACE_CLASS as *const GUID,
-            &reference as *const UNICODE_STRING,
-        )
-    };
-    if status != STATUS_SUCCESS {
-        unsafe {
-            mark_child_failure(bus_state, &guid, status);
-            call_unsafe_wdf_function_binding!(WdfObjectDelete, pdo.cast());
-        }
-        return status;
-    }
-
-    let mut string_attributes = WDF_OBJECT_ATTRIBUTES {
-        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
-        ParentObject: pdo.cast(),
-        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive,
-        SynchronizationScope: wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone,
-        ..WDF_OBJECT_ATTRIBUTES::default()
-    };
-    let mut interface_string: WDFSTRING = core::ptr::null_mut();
-    let status = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfStringCreate,
-            core::ptr::null::<UNICODE_STRING>(),
-            &mut string_attributes,
-            &mut interface_string,
-        )
-    };
-    if status != STATUS_SUCCESS {
-        unsafe {
-            mark_child_failure(bus_state, &guid, status);
-            call_unsafe_wdf_function_binding!(WdfObjectDelete, pdo.cast());
-        }
-        return status;
-    }
-    let status = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceRetrieveDeviceInterfaceString,
-            pdo,
-            &TAP_INTERFACE_CLASS as *const GUID,
-            &reference as *const UNICODE_STRING,
-            interface_string,
-        )
-    };
-    if status != STATUS_SUCCESS {
-        unsafe {
-            mark_child_failure(bus_state, &guid, status);
-            call_unsafe_wdf_function_binding!(WdfObjectDelete, pdo.cast());
-        }
-        return status;
-    }
-    let mut interface_name = UNICODE_STRING::default();
     unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfStringGetUnicodeString,
-            interface_string,
-            &mut interface_name
-        );
         let Some(_guard) = BusStateGuard::acquire(bus_state) else {
             call_unsafe_wdf_function_binding!(WdfObjectDelete, pdo.cast());
             return STATUS_DEVICE_NOT_READY;
@@ -878,9 +793,6 @@ extern "C" fn evt_child_list_create_device(
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
         (*node).pdo = pdo;
-        (*node).lifecycle = LIFECYCLE_ACTIVE;
-        (*node).terminal_status = STATUS_SUCCESS;
-        copy_interface(&mut *node, &interface_name);
     }
     STATUS_SUCCESS
 }
@@ -1245,6 +1157,10 @@ unsafe fn child_record_for(state: *mut BusState, guid: &GUID) -> (NTSTATUS, Mana
     }
     let mut record = empty_record();
     unsafe {
+        if (*node).lifecycle == LIFECYCLE_CREATING && !(*node).pdo.is_null() {
+            (*node).lifecycle = LIFECYCLE_ACTIVE;
+            (*node).terminal_status = STATUS_SUCCESS;
+        }
         write_record(&mut record, &*node);
         ((*node).terminal_status, record)
     }

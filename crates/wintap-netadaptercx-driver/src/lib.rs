@@ -83,24 +83,12 @@ const FRAME_MINIMUM: usize = 14;
 const FRAME_MAXIMUM: usize = 1514;
 const MAXIMUM_MULTICAST_ADDRESSES: usize = 64;
 const ETHERNET_ADDRESS_LENGTH: usize = 6;
-const CONTROL_SDDL: [u16; 16] = [
-    b'D' as u16,
-    b':' as u16,
-    b'P' as u16,
-    b'(' as u16,
-    b'A' as u16,
-    b';' as u16,
-    b';' as u16,
-    b'G' as u16,
-    b'A' as u16,
-    b';' as u16,
-    b';' as u16,
-    b';' as u16,
-    b'B' as u16,
-    b'A' as u16,
-    b')' as u16,
-    0,
-];
+const TAP_INTERFACE_CLASS: GUID = GUID {
+    Data1: 0x25d3_2edf,
+    Data2: 0x7c8c,
+    Data3: 0x4f09,
+    Data4: [0x90, 0x1f, 0x65, 0x0b, 0x23, 0x2e, 0x86, 0x4d],
+};
 
 static FRAGMENT_VIRTUAL_ADDRESS_NAME: [u16; 27] = [
     109, 115, 95, 102, 114, 97, 103, 109, 101, 110, 116, 95, 118, 105, 114, 116, 117, 97, 108, 97,
@@ -137,6 +125,7 @@ struct InstanceState {
     rx_notification_armed: AtomicBool,
     pending_reads: AtomicUsize,
     pending_writes: AtomicUsize,
+    control_open: AtomicBool,
     lifecycle: core::sync::atomic::AtomicU8,
 }
 
@@ -167,6 +156,7 @@ impl InstanceState {
             rx_notification_armed: AtomicBool::new(false),
             pending_reads: AtomicUsize::new(0),
             pending_writes: AtomicUsize::new(0),
+            control_open: AtomicBool::new(false),
             lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
         }
     }
@@ -475,21 +465,6 @@ extern "C" fn evt_driver_device_add(
             WDF_NO_OBJECT_ATTRIBUTES,
         );
     }
-    let sddl = unicode_string(&CONTROL_SDDL);
-    let status = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceInitAssignSDDLString,
-            device_init,
-            &sddl as *const UNICODE_STRING,
-        )
-    };
-    if status != STATUS_SUCCESS {
-        return status;
-    }
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfDeviceInitSetExclusive, device_init, 1);
-    }
-
     let mut pnp_init = device_init;
     let mut _pnp_device: WDFDEVICE = core::ptr::null_mut();
     let mut device_attributes = WDF_OBJECT_ATTRIBUTES {
@@ -514,6 +489,21 @@ extern "C" fn evt_driver_device_add(
     if status != STATUS_SUCCESS {
         return status;
     }
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceCreateDeviceInterface,
+            _pnp_device,
+            &TAP_INTERFACE_CLASS as *const GUID,
+            core::ptr::null::<UNICODE_STRING>(),
+        )
+    };
+    debug_status(b"WdfDeviceCreateDeviceInterface", status);
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, _pnp_device.cast());
+        }
+        return status;
+    }
     let device_context = unsafe {
         object_context::<DeviceContext>(_pnp_device.cast(), &raw const DEVICE_CONTEXT_TYPE_INFO)
     };
@@ -529,6 +519,7 @@ extern "C" fn evt_driver_device_add(
             unsafe {
                 call_unsafe_wdf_function_binding!(WdfObjectDelete, _pnp_device.cast());
             }
+            debug_status(b"ChildGuidFromHardwareId", status);
             return status;
         }
     };
@@ -640,7 +631,7 @@ fn parse_child_guid_from_hardware_id(hardware_id: &[u16]) -> Option<GUID> {
 }
 
 fn child_guid_from_hardware_id(device: WDFDEVICE) -> Result<GUID, NTSTATUS> {
-    let mut hardware_ids = [0u16; 64];
+    let mut hardware_ids = [0u16; 128];
     let mut result_length: ULONG = 0;
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
@@ -2100,10 +2091,23 @@ unsafe extern "C" fn evt_instance_context_destroy(object: WDFOBJECT) {
 }
 
 extern "C" fn evt_file_create(
-    _device: WDFDEVICE,
+    device: WDFDEVICE,
     request: WDFREQUEST,
     _file_object: WDFFILEOBJECT,
 ) {
+    let Some(state) = (unsafe { instance_from_device(device) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
+    if unsafe {
+        (*state)
+            .control_open
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    } {
+        complete_request(request, STATUS_DEVICE_BUSY);
+        return;
+    }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_SUCCESS);
     }
@@ -2119,6 +2123,7 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         };
         let (was_suspended, read_queue) = {
             let state = &mut *state_guard;
+            state.control_open.store(false, Ordering::Release);
             let was_suspended = state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
             state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
             (was_suspended, state.read_queue)
@@ -2559,23 +2564,5 @@ fn reopen_frame_queues(state: &mut InstanceState) {
             }
             call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
         }
-    }
-}
-
-fn unicode_string(buffer: &[u16]) -> UNICODE_STRING {
-    let length = buffer
-        .iter()
-        .position(|character| *character == 0)
-        .unwrap_or(buffer.len());
-    let byte_length = length * core::mem::size_of::<u16>();
-    let maximum_length = if length < buffer.len() {
-        byte_length + core::mem::size_of::<u16>()
-    } else {
-        byte_length
-    };
-    UNICODE_STRING {
-        Length: byte_length as u16,
-        MaximumLength: maximum_length as u16,
-        Buffer: buffer.as_ptr() as *mut u16,
     }
 }

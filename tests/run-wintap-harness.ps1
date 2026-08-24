@@ -157,8 +157,21 @@ function Invoke-NativeWithTimeout(
     $stdoutPath = Join-Path $script:DiagnosticsPath "$Name-stdout.txt"
     $stderrPath = Join-Path $script:DiagnosticsPath "$Name-stderr.txt"
     Write-Diagnostic "native: starting name=$Name file=$FilePath args=$commandLine timeoutSeconds=$TimeoutSeconds"
-    $process = Start-Process -FilePath $FilePath -ArgumentList $commandLine -PassThru -NoNewWindow `
-        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = $commandLine
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        $process.Dispose()
+        throw "Failed to start $Name."
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     try {
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             $process | Format-List * | Out-File (Join-Path $script:DiagnosticsPath "$Name-timeout-process.txt") `
@@ -170,9 +183,14 @@ function Invoke-NativeWithTimeout(
             }
             throw "$Name did not exit within $TimeoutSeconds seconds."
         }
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        [IO.File]::WriteAllText($stdoutPath, $stdout)
+        [IO.File]::WriteAllText($stderrPath, $stderr)
         $output = @(
-            Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
-            Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue
+            $stdout
+            $stderr
         )
         $output | Out-File (Join-Path $script:DiagnosticsPath "$Name.txt") `
             -Encoding utf8 -Force
@@ -665,17 +683,27 @@ function Get-ValidIcmpRequest(
 
 function Get-WinTapAdapter {
     $dynamicHardwareId = "WINTAPBUS\{$($script:IntegrationChildGuid.ToString().ToUpperInvariant())}"
-    $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
+    $children = @(Get-PnpDevice -PresentOnly -Class Net -ErrorAction Stop | Where-Object {
         $hardwareIds = @(
-            Get-PnpDeviceProperty -InstanceId $_.PnPDeviceID `
+            Get-PnpDeviceProperty -InstanceId $_.InstanceId `
                 -KeyName "DEVPKEY_Device_HardwareIds" -ErrorAction SilentlyContinue
         ).Data | ForEach-Object { [string]$_ }
         $hardwareIds -contains $dynamicHardwareId
     })
-    if ($adapters.Count -ne 1) {
-        throw "Expected exactly one WinTap adapter; found $($adapters.Count)."
+    if ($children.Count -ne 1) {
+        throw "Expected exactly one present WinTap child; found $($children.Count)."
     }
-    return $adapters[0]
+    $instanceId = $children[0].InstanceId
+    $networkClassKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}"
+    $connections = @(Get-ChildItem $networkClassKey -ErrorAction Stop | ForEach-Object {
+        Get-ItemProperty "$($_.PSPath)\Connection" -ErrorAction SilentlyContinue
+    } | Where-Object {
+        $_.PnpInstanceID -eq $instanceId
+    })
+    if ($connections.Count -ne 1) {
+        throw "Expected exactly one network connection for WinTap child $instanceId; found $($connections.Count)."
+    }
+    return Get-NetAdapter -Name $connections[0].Name -IncludeHidden -ErrorAction Stop
 }
 
 function Wait-WinTapAdapter([int]$WaitSeconds = 20) {
@@ -766,6 +794,18 @@ function Add-TestAddress($Adapter) {
         })
     Assert-True ($defaultRoutes.Count -eq 0) `
         "The test adapter has a default route; refusing to alter it."
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        $testAddress = Get-NetIPAddress -InterfaceIndex $Adapter.ifIndex `
+            -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+                $_.IPAddress -eq "192.0.2.1" -and $_.PrefixLength -eq 30
+            }
+        if ($testAddress.AddressState -eq "Preferred") {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "192.0.2.1 did not become Preferred on adapter $($Adapter.Name)."
 }
 
 function Remove-TestAddress($Adapter) {

@@ -292,8 +292,21 @@ function Invoke-RecordedNative(
     $stdoutPath = Join-Path $script:DiagnosticsPath "$Name-stdout.txt"
     $stderrPath = Join-Path $script:DiagnosticsPath "$Name-stderr.txt"
     Write-Diagnostic "native: starting name=$Name file=$FilePath args=$commandLine timeoutSeconds=$TimeoutSeconds"
-    $process = Start-Process -FilePath $FilePath -ArgumentList $commandLine -PassThru -NoNewWindow `
-        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = $commandLine
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        $process.Dispose()
+        throw "Failed to start $Name."
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     try {
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             $process | Format-List * | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name-timeout-process.txt") `
@@ -305,10 +318,12 @@ function Invoke-RecordedNative(
             }
             throw "$Name did not exit within $TimeoutSeconds seconds."
         }
-        $output = @(
-            Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
-            Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue
-        )
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        [IO.File]::WriteAllText($stdoutPath, $stdout)
+        [IO.File]::WriteAllText($stderrPath, $stderr)
+        $output = @($stdout, $stderr)
         $exitCode = $process.ExitCode
         $output | Out-File -LiteralPath (Join-Path $script:DiagnosticsPath "$Name.txt") `
             -Encoding utf8 -Force
@@ -613,13 +628,22 @@ function Get-DynamicAdapterMap([object[]]$Children) {
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
-        $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
-            $hardwareIds = @(
-                Get-PnpDeviceProperty -InstanceId $_.PnPDeviceID `
-                    -KeyName "DEVPKEY_Device_HardwareIds" -ErrorAction SilentlyContinue
-            ).Data | ForEach-Object { [string]$_ }
-            @($hardwareIds | Where-Object { $expectedHardwareIds.Values -contains $_ }).Count -ne 0
+        $devices = @(Get-MatchingPnpDevices | Where-Object {
+            @($_.HardwareIds | Where-Object { $expectedHardwareIds.Values -contains $_ }).Count -ne 0
         })
+        $adapters = @(
+            foreach ($device in $devices) {
+                $networkClassKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}"
+                $connections = @(Get-ChildItem $networkClassKey -ErrorAction Stop | ForEach-Object {
+                    Get-ItemProperty "$($_.PSPath)\Connection" -ErrorAction SilentlyContinue
+                } | Where-Object {
+                    $_.PnpInstanceID -eq $device.InstanceId
+                })
+                if ($connections.Count -eq 1) {
+                    Get-NetAdapter -Name $connections[0].Name -IncludeHidden -ErrorAction SilentlyContinue
+                }
+            }
+        )
         if ($adapters.Count -eq 2 -and @($adapters | Where-Object Status -ne "Up").Count -eq 0) {
             $mapped = @{}
             foreach ($child in $Children) {

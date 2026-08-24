@@ -42,6 +42,148 @@ public static class WinTapBusNative {
 "@
 }
 
+if (-not ("WinTapBusSetupApi" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public sealed class WinTapBusDeviceInterface
+{
+    public string DeviceInstanceId { get; set; }
+    public string DevicePath { get; set; }
+}
+
+public static class WinTapBusSetupApi
+{
+    private const uint DIGCF_PRESENT = 0x2;
+    private const uint DIGCF_DEVICEINTERFACE = 0x10;
+    private const int ERROR_NO_MORE_ITEMS = 259;
+    private const int ERROR_INSUFFICIENT_BUFFER = 122;
+    private static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SP_DEVICE_INTERFACE_DATA
+    {
+        public int cbSize;
+        public Guid InterfaceClassGuid;
+        public int Flags;
+        public IntPtr Reserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SP_DEVINFO_DATA
+    {
+        public int cbSize;
+        public Guid ClassGuid;
+        public int DevInst;
+        public IntPtr Reserved;
+    }
+
+    [DllImport("setupapi.dll", SetLastError = true)]
+    private static extern IntPtr SetupDiGetClassDevs(
+        ref Guid classGuid, IntPtr enumerator, IntPtr hwndParent, uint flags);
+
+    [DllImport("setupapi.dll", SetLastError = true)]
+    private static extern bool SetupDiEnumDeviceInterfaces(
+        IntPtr deviceInfoSet, IntPtr deviceInfoData, ref Guid interfaceClassGuid,
+        uint memberIndex, ref SP_DEVICE_INTERFACE_DATA deviceInterfaceData);
+
+    [DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool SetupDiGetDeviceInterfaceDetail(
+        IntPtr deviceInfoSet, ref SP_DEVICE_INTERFACE_DATA deviceInterfaceData,
+        IntPtr deviceInterfaceDetailData, uint deviceInterfaceDetailDataSize,
+        out uint requiredSize, ref SP_DEVINFO_DATA deviceInfoData);
+
+    [DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool SetupDiGetDeviceInstanceId(
+        IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData,
+        StringBuilder deviceInstanceId, int deviceInstanceIdSize, out int requiredSize);
+
+    [DllImport("setupapi.dll", SetLastError = true)]
+    private static extern bool SetupDiDestroyDeviceInfoList(IntPtr deviceInfoSet);
+
+    public static WinTapBusDeviceInterface[] EnumeratePresentInterfaces(Guid interfaceClassGuid)
+    {
+        IntPtr deviceInfoSet = SetupDiGetClassDevs(
+            ref interfaceClassGuid, IntPtr.Zero, IntPtr.Zero, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (deviceInfoSet == InvalidHandle)
+        {
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        var interfaces = new List<WinTapBusDeviceInterface>();
+        try
+        {
+            for (uint index = 0; ; ++index)
+            {
+                var interfaceData = new SP_DEVICE_INTERFACE_DATA();
+                interfaceData.cbSize = Marshal.SizeOf(typeof(SP_DEVICE_INTERFACE_DATA));
+                if (!SetupDiEnumDeviceInterfaces(
+                    deviceInfoSet, IntPtr.Zero, ref interfaceClassGuid, index, ref interfaceData))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error == ERROR_NO_MORE_ITEMS)
+                    {
+                        break;
+                    }
+                    throw new System.ComponentModel.Win32Exception(error);
+                }
+
+                uint requiredSize;
+                var deviceInfoData = new SP_DEVINFO_DATA();
+                deviceInfoData.cbSize = Marshal.SizeOf(typeof(SP_DEVINFO_DATA));
+                SetupDiGetDeviceInterfaceDetail(
+                    deviceInfoSet, ref interfaceData, IntPtr.Zero, 0, out requiredSize, ref deviceInfoData);
+                if (Marshal.GetLastWin32Error() != ERROR_INSUFFICIENT_BUFFER || requiredSize == 0)
+                {
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                }
+
+                IntPtr detailData = Marshal.AllocHGlobal((int)requiredSize);
+                try
+                {
+                    Marshal.WriteInt32(detailData, IntPtr.Size == 8 ? 8 : 6);
+                    deviceInfoData = new SP_DEVINFO_DATA();
+                    deviceInfoData.cbSize = Marshal.SizeOf(typeof(SP_DEVINFO_DATA));
+                    if (!SetupDiGetDeviceInterfaceDetail(
+                        deviceInfoSet, ref interfaceData, detailData, requiredSize,
+                        out requiredSize, ref deviceInfoData))
+                    {
+                        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                    }
+
+                    string path = Marshal.PtrToStringUni(
+                        IntPtr.Add(detailData, 4));
+                    var instanceId = new StringBuilder(512);
+                    int instanceIdLength;
+                    if (!SetupDiGetDeviceInstanceId(
+                        deviceInfoSet, ref deviceInfoData, instanceId, instanceId.Capacity, out instanceIdLength))
+                    {
+                        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                    }
+                    interfaces.Add(new WinTapBusDeviceInterface {
+                        DeviceInstanceId = instanceId.ToString(),
+                        DevicePath = path
+                    });
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(detailData);
+                }
+            }
+        }
+        finally
+        {
+            SetupDiDestroyDeviceInfoList(deviceInfoSet);
+        }
+        return interfaces.ToArray();
+    }
+}
+"@
+}
+
 function Assert-WinTapBusCondition([bool]$Condition, [string]$Message) {
     if (-not $Condition) {
         throw $Message
@@ -110,6 +252,9 @@ function ConvertFrom-WinTapBusResponse([byte[]]$Buffer, [uint32]$Returned) {
         } else {
             [Text.Encoding]::Unicode.GetString($Buffer, $offset + 36, $interfaceLength * 2)
         }
+        if ($interface.StartsWith('\??\')) {
+            $interface = '\\?\' + $interface.Substring(4)
+        }
         $records += [pscustomobject]@{
             Guid = [Guid]::new($guidBytes)
             Lifecycle = [BitConverter]::ToUInt32($Buffer, $offset + 16)
@@ -160,17 +305,34 @@ function Invoke-WinTapBusRequest(
 }
 
 function Test-WinTapBusInterfaceOpenable([string]$InterfacePath) {
-    try {
-        $stream = [System.IO.File]::Open(
-            $InterfacePath,
-            [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::ReadWrite,
-            [System.IO.FileShare]::None)
-        $stream.Dispose()
+    $handle = [WinTapBusNative]::CreateFile(
+        $InterfacePath,
+        ([WinTapBusNative]::GenericRead -bor [WinTapBusNative]::GenericWrite),
+        0, [IntPtr]::Zero, [WinTapBusNative]::OpenExisting, 0, [IntPtr]::Zero)
+    if ($handle -ne [IntPtr]::new(-1)) {
+        [WinTapBusNative]::CloseHandle($handle) | Out-Null
         return $true
-    } catch {
-        return $false
     }
+    return $false
+}
+
+function Find-WinTapBusChildInterface([Guid]$Guid) {
+    $interfaceClass = [Guid]'25D32EDF-7C8C-4F09-901F-650B232E864D'
+    $instancePrefix = "WINTAPBUS\{$($Guid.ToString().ToUpperInvariant())}\"
+    $matches = @(
+        [WinTapBusSetupApi]::EnumeratePresentInterfaces($interfaceClass) |
+            Where-Object {
+                $_.DeviceInstanceId.StartsWith(
+                    $instancePrefix, [StringComparison]::OrdinalIgnoreCase)
+            }
+    )
+    if ($matches.Count -gt 1) {
+        throw "More than one TAP interface matched dynamic child $Guid."
+    }
+    if ($matches.Count -eq 1) {
+        return $matches[0].DevicePath
+    }
+    return $null
 }
 
 function Wait-WinTapBusChild(
@@ -185,16 +347,21 @@ function Wait-WinTapBusChild(
         $record = @($response.Records | Where-Object Guid -eq $Guid)
         if ($record.Count -eq 1) {
             $record = $record[0]
+            $interfacePath = Find-WinTapBusChildInterface $Guid
             if (($Target -eq "Active" -and
                     $record.Lifecycle -eq $script:LifecycleActive -and
                     $record.TerminalStatus -eq $script:StatusSuccess -and
-                    -not [string]::IsNullOrWhiteSpace($record.InterfacePath) -and
-                    (Test-WinTapBusInterfaceOpenable $record.InterfacePath)) -or
-                ($Target -eq "Absent" -and $record.Lifecycle -eq $script:LifecycleAbsent)) {
+                    -not [string]::IsNullOrWhiteSpace($interfacePath) -and
+                    (Test-WinTapBusInterfaceOpenable $interfacePath)) -or
+                ($Target -eq "Absent" -and
+                    $record.Lifecycle -eq $script:LifecycleAbsent -and
+                    [string]::IsNullOrWhiteSpace($interfacePath))) {
+                $record.InterfacePath = $interfacePath
                 return $record
             }
             if ($record.Lifecycle -eq $script:LifecycleFailed) {
-                throw "WinTap child $Guid reached Failed with NTSTATUS 0x$('{0:X8}' -f [uint32]$record.TerminalStatus)."
+                $status = [uint32]([int64]$record.TerminalStatus -band 0xffffffffL)
+                throw "WinTap child $Guid reached Failed with NTSTATUS 0x$('{0:X8}' -f $status)."
             }
         }
         Start-Sleep -Milliseconds 200
