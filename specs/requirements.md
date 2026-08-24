@@ -902,6 +902,21 @@ exclusion shall require a reviewed policy-manifest change.
 **Invariant impact:** Enforcement strength is independent of directory,
 workflow entry point, or file provenance.
 
+### REQ-045 — Retry transient I/O-ring resource contention
+
+The switch shall classify the Win32 `ERROR_BUSY` HRESULT
+(`0x800700AA`) returned by an I/O-ring read or write completion as transient
+resource contention. It shall reuse the bounded exponential retry behavior
+used for other transient busy statuses, preserving the operation's slot,
+buffer, endpoint, and completion identity. Unrecognized or otherwise fatal
+HRESULTs shall continue to terminate the data plane explicitly.
+
+**Trace:** User-reported switch failure after several packets; extends
+REQ-018 and REQ-020.
+**Invariant impact:** A transient endpoint/resource contention event shall
+not discard a live operation or reuse its buffer prematurely. Retry remains
+bounded and fatal errors remain fail-closed.
+
 ### Dynamic-bus traceability
 
 | Requirement | Design coverage | Validation coverage |
@@ -926,6 +941,7 @@ workflow entry point, or file provenance.
 | REQ-042 | Explicit exclusions and diagnostics | VAL-032; TC-082 |
 | REQ-043 | Contributor-facing SPDX documentation | VAL-035; TC-083 |
 | REQ-044 | Complete repository coverage | VAL-032, VAL-033, VAL-034; TC-084 |
+| REQ-045 | I/O-ring resources and completion state | VAL-036; TC-085 |
 
 ## Open questions requiring user decisions
 

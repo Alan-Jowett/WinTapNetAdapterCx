@@ -33,6 +33,7 @@ mod windows_runtime {
     const IORING_E_SUBMISSION_QUEUE_FULL: HResult = 0x8046_0002u32 as HResult;
     const HRESULT_FROM_NT_STATUS_DEVICE_BUSY: HResult = 0x9000_0011u32 as HResult;
     const HRESULT_FROM_WIN32_INVALID_USER_BUFFER: HResult = 0x8007_06F8u32 as HResult;
+    const HRESULT_FROM_WIN32_ERROR_BUSY: HResult = 0x8007_00AAu32 as HResult;
     const IORING_OP_READ: Dword = 1;
     const IORING_OP_WRITE: Dword = 5;
     const IORING_SQE_FLAG_NONE: Dword = 0;
@@ -1041,6 +1042,7 @@ mod windows_runtime {
     fn is_device_busy(status: HResult) -> bool {
         status == HRESULT_FROM_NT_STATUS_DEVICE_BUSY
             || status == HRESULT_FROM_WIN32_INVALID_USER_BUFFER
+            || status == HRESULT_FROM_WIN32_ERROR_BUSY
     }
 
     fn busy_retry_delay(retries: u32) -> Duration {
