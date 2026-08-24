@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: MIT
+  Copyright (c) 2026 WinTapNetAdapterCx contributors -->
+
 # WinTapNetAdapterCx Requirements
 
 **Workflow:** `/evolve`  
@@ -40,6 +43,10 @@
 - Preserve an endpoint abstraction that can accommodate future dynamically
   provisioned devices without implementing dynamic provisioning in this
   change.
+- Establish a repository-wide SPDX MIT header policy for governed text files,
+  with syntax-preserving rules for source, scripts, metadata, and Markdown.
+- Enforce the SPDX policy at staged-commit time and in required pull-request
+  and push CI checks, rejecting noncompliant commits and pull requests.
 - Do not modify C source, headers, INF files, project files, tests, generated
   artifacts, or build configuration during discovery.
 - Replace the fixed root-enumerated adapter model with a separate-service KMDF
@@ -803,6 +810,96 @@ REQ-019.
 **Invariant impact:** Dynamic discovery cannot change existing endpoint,
 buffer-slot, completion-generation, or source-reflection rules.
 
+### REQ-037 — SPDX headers on governed text files
+
+Every tracked governed text file shall contain the repository-approved
+`SPDX-License-Identifier: MIT` header using the comment syntax assigned by the
+SPDX policy. The policy shall cover all repository source, scripts, build and
+package metadata, workflows, specifications, and Markdown documentation.
+
+**Trace:** UI-024; `specs/design.md` SPDX header policy.
+**Invariant impact:** Headers are comment-only metadata and shall not alter
+build, packaging, runtime, or documentation semantics.
+
+### REQ-038 — Preamble-preserving header placement
+
+Header placement shall preserve required shebangs, encoding declarations, and
+YAML front matter. The SPDX header shall be the first permitted comment after
+such a preamble, and a file shall not pass validation when the identifier is
+present only in an invalid location or comment syntax.
+
+**Trace:** UI-024; `specs/design.md` SPDX header policy.
+**Invariant impact:** Executable scripts, parsers, and front-matter consumers
+continue to interpret files exactly as before.
+
+### REQ-039 — Fail-closed SPDX validation
+
+The repository shall provide one validator with full-tree and staged modes.
+Full-tree mode shall inspect every tracked governed file. Staged mode shall
+inspect added, copied, renamed, and modified governed files from the Git
+index. Both modes shall return nonzero and identify the file and expected
+form for absent, malformed, misplaced, or wrong-syntax headers.
+
+**Trace:** UI-024; `specs/design.md` SPDX header policy.
+**Invariant impact:** Validation cannot silently pass incomplete coverage.
+
+### REQ-040 — Local commit rejection
+
+A repository-provided pre-commit hook shall invoke staged SPDX validation and
+reject a commit before it is created when any staged governed file fails.
+The hook shall validate the index contents, not an unrelated working-tree
+copy, and shall be documented as a required contributor control.
+
+**Trace:** UI-024; `specs/design.md` SPDX header policy.
+**Invariant impact:** Noncompliant local commits are prevented without
+changing commit contents or history.
+
+### REQ-041 — Required remote CI enforcement
+
+CI shall invoke full-tree SPDX validation for pull requests and protected
+branch pushes. The workflow shall expose a stable named check, and branch
+protection shall require that check before merge. A failed check shall block
+the pull request or protected-branch update; local-hook bypasses shall not
+weaken remote enforcement.
+
+**Trace:** UI-024; `specs/design.md` SPDX header policy.
+**Invariant impact:** Repository acceptance is fail-closed even when a local
+hook is unavailable or bypassed.
+
+### REQ-042 — Explicit exclusions and diagnostics
+
+The validator shall maintain an explicit version-controlled exclusion
+manifest for binary files, generated outputs, and formats that cannot safely
+contain comments. Each exclusion shall name its path or deterministic rule
+and reason. Exclusions shall be reported in full-tree diagnostics and shall
+not match source, script, metadata, specification, or documentation files
+implicitly.
+
+**Trace:** UI-024; `specs/design.md` SPDX header policy.
+**Invariant impact:** Unsupported formats remain semantically valid without
+creating an unreviewed enforcement bypass.
+
+### REQ-043 — Contributor-facing policy documentation
+
+Contributor documentation shall define the MIT identifier, supported comment
+forms, preamble rules, governed-file policy, explicit exclusions, local hook
+installation/use, CI check name, and remediation steps for failures.
+
+**Trace:** UI-024; `specs/design.md` SPDX header policy.
+**Invariant impact:** Developers can satisfy the policy consistently across
+all repository components.
+
+### REQ-044 — Complete repository coverage
+
+The full-tree, staged, pre-commit, and CI enforcement paths shall use one
+shared policy and shall cover every governed directory and file category.
+Adding a governed file shall require no directory-specific opt-in, and an
+exclusion shall require a reviewed policy-manifest change.
+
+**Trace:** UI-024; `specs/design.md` SPDX header policy.
+**Invariant impact:** Enforcement strength is independent of directory,
+workflow entry point, or file provenance.
+
 ### Dynamic-bus traceability
 
 | Requirement | Design coverage | Validation coverage |
@@ -819,6 +916,14 @@ buffer-slot, completion-generation, or source-reflection rules.
 | REQ-034 | Migration and diagnostics | VAL-030; TC-075 |
 | REQ-035 | Child lifetime and TAP interface | VAL-030; TC-072 |
 | REQ-036 | Dynamic relay and switch selection | VAL-017, VAL-019; TC-055 |
+| REQ-037 | SPDX headers on governed text files | VAL-032; TC-077 |
+| REQ-038 | Preamble-preserving header placement | VAL-032; TC-078 |
+| REQ-039 | Fail-closed full-tree and staged validation | VAL-032; TC-079 |
+| REQ-040 | Commit-time SPDX rejection | VAL-033; TC-080 |
+| REQ-041 | Required CI SPDX enforcement | VAL-034; TC-081 |
+| REQ-042 | Explicit exclusions and diagnostics | VAL-032; TC-082 |
+| REQ-043 | Contributor-facing SPDX documentation | VAL-035; TC-083 |
+| REQ-044 | Complete repository coverage | VAL-032, VAL-033, VAL-034; TC-084 |
 
 ## Open questions requiring user decisions
 
@@ -876,8 +981,14 @@ buffer-slot, completion-generation, or source-reflection rules.
 25. **Resolved:** Passive READ delivery claims frame/request ownership under
     the state lock but performs WDF buffer access, copying, requeue, and
     request completion only after releasing that lock.
+26. **Resolved:** SPDX enforcement uses MIT identifiers and comment syntax
+    compatible with each governed file type, following the established
+    LexonGraph and ebpf-for-windows patterns.
+27. **Resolved:** Binary files and generated outputs that cannot contain
+    comments are explicit validator exclusions; source, scripts, metadata,
+    specifications, and documentation are not excluded by default.
 
 ## Specification approval gate
 
-REQ-026 through REQ-036 require approval together with their design and
+REQ-026 through REQ-044 require approval together with their design and
 validation coverage before implementation.

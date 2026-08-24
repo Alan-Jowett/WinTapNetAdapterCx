@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 WinTapNetAdapterCx contributors
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 WinTapNetAdapterCx contributors
 [toolchain]
 channel = "1.85.0"
 components = ["rust-src", "rustfmt", "clippy"]

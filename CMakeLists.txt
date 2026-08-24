@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 WinTapNetAdapterCx contributors
 cmake_minimum_required(VERSION 3.25)
 
 project(WinTapNetAdapterCx LANGUAGES NONE)

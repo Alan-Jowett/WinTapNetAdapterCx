@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 WinTapNetAdapterCx contributors
 #define NETADAPTER_VERSION_MAJOR 2
 #define NETADAPTER_VERSION_MINOR 5
 #define NETADAPTER_MINIMUM_VERSION_REQUIRED 4

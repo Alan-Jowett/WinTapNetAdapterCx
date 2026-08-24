@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT
+  Copyright (c) 2026 WinTapNetAdapterCx contributors -->
 # WinTapNetAdapterCx
 
 WinTapNetAdapterCx is a Windows software network adapter project built with the
@@ -6,6 +8,12 @@ framework. Its goal is to implement the core concept of the Linux
 [TUN/TAP](https://docs.kernel.org/networking/tuntap.html) adapter on Windows:
 providing a software device that allows user-mode applications to exchange
 Ethernet frames with the Windows networking stack.
+
+## SPDX headers
+
+All governed source, script, metadata, workflow, specification, and Markdown
+files use the MIT SPDX header policy. See [SPDX.md](SPDX.md) for comment forms,
+preamble rules, explicit exclusions, hook setup, and CI enforcement.
 
 ## Project goals
 

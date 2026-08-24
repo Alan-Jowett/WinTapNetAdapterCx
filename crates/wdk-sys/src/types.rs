@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 WinTapNetAdapterCx contributors
 // Copyright (c) Microsoft Corporation
 // License: MIT OR Apache-2.0
 

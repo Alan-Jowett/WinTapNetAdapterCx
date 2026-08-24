@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT
+  Copyright (c) 2026 WinTapNetAdapterCx contributors -->
 # Current Project Status
 
 **Status date:** 2026-08-19

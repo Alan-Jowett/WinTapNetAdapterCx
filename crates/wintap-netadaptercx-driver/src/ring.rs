@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 WinTapNetAdapterCx contributors
 use core::ffi::c_void;
 
 use netadaptercx_sys::{

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT
+  Copyright (c) 2026 WinTapNetAdapterCx contributors -->
 # Rust NetAdapterCx migration scaffold
 
 This workspace captures the approved Phase 5 Rust migration boundary without
