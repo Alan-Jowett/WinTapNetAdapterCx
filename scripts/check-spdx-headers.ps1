@@ -12,7 +12,15 @@ if (($All -and $Staged) -or (-not $All -and -not $Staged)) {
     throw "Specify exactly one mode: -All or -Staged."
 }
 
-$root = (git rev-parse --show-toplevel).Trim()
+function Invoke-GitText([string[]]$Arguments) {
+    $output = & git @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "git $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
+    }
+    return @($output)
+}
+
+$root = (Invoke-GitText @("rev-parse", "--show-toplevel")).Trim()
 Set-Location $root
 $policyManifest = Import-PowerShellDataFile (Join-Path $root "scripts/spdx-policy.psd1")
 
@@ -29,6 +37,11 @@ function Get-Policy([string]$Path) {
     $normalizedPath = $Path.Replace("\", "/")
     if (@($policyManifest.ExplicitExclusions | Where-Object {
         $normalizedPath -like $_.Pattern -or $name -like $_.Pattern
+    }).Count -gt 0) {
+        return "excluded"
+    }
+    if (@($policyManifest.BinaryExtensions | Where-Object {
+        $extension -eq $_.Extension
     }).Count -gt 0) {
         return "excluded"
     }
@@ -50,7 +63,7 @@ function Get-Policy([string]$Path) {
 
 function Read-File([string]$Path) {
     if ($Staged) {
-        return @(git show ":$Path")
+        return @(Invoke-GitText @("show", ":$Path"))
     }
     return @(Get-Content -LiteralPath $Path)
 }
@@ -86,9 +99,10 @@ function Test-Header([string]$Path, [string[]]$Lines, [string]$Policy) {
         Write-Error "Missing or misplaced SPDX header in $Path. Expected '$expected' after required preamble."
         return $false
     }
-    if ($Policy -in @("slash", "slash-dual") -and $Policy -eq "slash-dual" -and
-        (($index + 3) -ge $Lines.Count -or
-         $Lines[$index + 3].TrimEnd("`r") -ne "// License: MIT OR Apache-2.0")) {
+    if ($Policy -eq "slash-dual" -and
+        (($index + 2) -ge $Lines.Count -or
+         $Lines[$index + 1].TrimEnd("`r") -ne "// Copyright (c) Microsoft Corporation" -or
+         $Lines[$index + 2].TrimEnd("`r") -ne "// License: MIT OR Apache-2.0")) {
         Write-Error "Malformed dual-license SPDX header in $Path."
         return $false
     }
@@ -102,23 +116,26 @@ function Test-Header([string]$Path, [string[]]$Lines, [string]$Policy) {
 }
 
 if ($All) {
-    $paths = @(git ls-files)
+    $paths = @(Invoke-GitText @("ls-files"))
 } else {
-    $paths = @(git diff --cached --name-only --diff-filter=ACMR)
+    $paths = @(Invoke-GitText @("diff", "--cached", "--name-only", "--diff-filter=ACMRT"))
 }
 
 $failed = $false
+if ($All) {
+    foreach ($exclusion in $policyManifest.ExplicitExclusions) {
+        Write-Host "EXCLUDED: $($exclusion.Pattern) ($($exclusion.Reason))"
+    }
+    foreach ($exclusion in $policyManifest.BinaryExtensions) {
+        Write-Host "EXCLUDED: *$($exclusion.Extension) ($($exclusion.Reason))"
+    }
+}
 foreach ($path in $paths) {
     $policy = Get-Policy $path
     if ($null -eq $policy) {
         Write-Error "Unclassified tracked file $path. Add a policy or explicit exclusion."
         $failed = $true
         continue
-    }
-    if ($All) {
-        foreach ($exclusion in $policyManifest.ExplicitExclusions) {
-            Write-Host "EXCLUDED: $($exclusion.Pattern) ($($exclusion.Reason))"
-        }
     }
     if (-not (Test-Header $path (Read-File $path) $policy)) {
         $failed = $true

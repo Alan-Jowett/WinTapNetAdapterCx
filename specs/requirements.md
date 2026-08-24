@@ -79,6 +79,8 @@
   IPv6 Neighbor Discovery frames when permanent neighbors are configured.
 - **UI-023 (KNOWN):** The user supplied an approved dynamic-bus requirements
   baseline and selected separate KMDF bus and TAP-child driver services.
+- **UI-024 (KNOWN):** The user requested SPDX headers on every eligible file
+  and enforcement that rejects noncompliant commits and pull requests.
 
 ## Baseline requirements
 

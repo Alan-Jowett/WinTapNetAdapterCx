@@ -24,4 +24,26 @@
         "crates/wdk-sys/src/*",
         "crates/wdk-sys/build.rs"
     )
+    BinaryExtensions = @(
+        @{
+            Extension = ".cat"
+            Reason = "Catalog files are binary signatures."
+        }
+        @{
+            Extension = ".dll"
+            Reason = "Dynamic-link libraries are binary executables."
+        }
+        @{
+            Extension = ".exe"
+            Reason = "Executables are binary."
+        }
+        @{
+            Extension = ".pdb"
+            Reason = "Debug symbol files are binary."
+        }
+        @{
+            Extension = ".sys"
+            Reason = "Driver binaries are binary."
+        }
+    )
 }

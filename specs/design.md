@@ -29,8 +29,8 @@ All governed repository text files carry `SPDX-License-Identifier: MIT` in a
 comment syntax valid for the file type. The initial governed policy is:
 
 - `*.rs`, `*.c`, `*.h`, `*.cpp`, and `*.hpp`: `//`.
-- `*.ps1`, `*.psm1`, `*.sh`, `*.yml`, `*.yaml`, `*.toml`, `*.ini`, and
-  `CMakeLists.txt`: `#`.
+- `*.ps1`, `*.psm1`, `*.psd1`, `*.sh`, `*.yml`, `*.yaml`, `*.toml`, `*.ini`,
+  `*.txt`, and `CMakeLists.txt`: `#`.
 - `*.md`: an HTML comment.
 - `*.inx`: `;`.
 - `.gitignore`, `.gitattributes`, and other hash-comment metadata:

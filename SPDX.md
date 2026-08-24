@@ -25,8 +25,9 @@ header immediately after its closing delimiter. Strict JSON (`CMakePresets.json`
 `target/*` outputs are explicit exclusions because comments would be invalid
 or the files are generated/license text. These entries, including their
 reasons, are maintained in `scripts/spdx-policy.psd1` and reported by the
-validator in full-tree mode. Binary files are excluded by their explicit
-policy entries when tracked.
+validator in full-tree mode. Binary catalog, driver, executable, library, and
+symbol files are excluded by their explicit extension entries in that same
+manifest when tracked.
 
 Install the repository hook once with:
 
@@ -36,4 +37,5 @@ git config core.hooksPath hooks
 
 The hook validates staged content before commit creation. CI runs the same
 policy in full-tree mode as the required `SPDX headers` check; a local hook
-bypass does not bypass pull-request or protected-branch enforcement.
+bypass does not bypass pull-request or protected-branch enforcement. The hook
+uses PowerShell 7 when available and falls back to Windows PowerShell 5.1.
