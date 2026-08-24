@@ -915,7 +915,7 @@ HRESULTs shall continue to terminate the data plane explicitly.
 REQ-018 and REQ-020.
 **Invariant impact:** A transient endpoint/resource contention event shall
 not discard a live operation or reuse its buffer prematurely. Retry remains
-bounded and fatal errors remain fail-closed.
+bounded to a finite number of attempts and fatal errors remain fail-closed.
 
 ### Dynamic-bus traceability
 

@@ -49,6 +49,7 @@ mod windows_runtime {
     const ENDPOINT_COUNT: usize = 2;
     const DEFAULT_READ_DEPTH: usize = 128;
     const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+    const MAX_BUSY_RETRIES: u32 = 8;
     const SLOT_BITS: u32 = 31;
     const GENERATION_SHIFT: u32 = SLOT_BITS;
     const GENERATION_BITS: u32 = 32;
@@ -796,6 +797,11 @@ mod windows_runtime {
                 if !active.submitted {
                     return Err(format!(
                         "busy completion references inactive operation slot {slot}"
+                    ));
+                }
+                if active.busy_retries >= MAX_BUSY_RETRIES {
+                    return Err(format!(
+                        "I/O-ring busy retry limit exceeded for slot {slot}"
                     ));
                 }
                 active.queued = false;

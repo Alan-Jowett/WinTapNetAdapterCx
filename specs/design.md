@@ -707,10 +707,12 @@ is transient resource contention, equivalent to the existing device-busy
 retry cases. The runtime clears the submitted state without cancelling the
 slot, waits using the bounded exponential backoff, rebuilds the same read or
 write operation with the same completion identity and registered buffer, and
-resubmits it. The retry path shall not allocate a new slot, release the
-buffer, change the endpoint, or hide a retry-build failure. Other
-non-success completion results remain fatal and preserve the primary error
-for shutdown.
+resubmits it. The runtime permits at most eight busy retries for one
+operation; exhaustion reports an explicit error and leaves the operation
+available for normal shutdown cleanup. The retry path shall not allocate a
+new slot, release the buffer, change the endpoint, or hide a retry-build
+failure. Other non-success completion results remain fatal and preserve the
+primary error for shutdown.
 
 Shutdown, endpoint removal, and cancellation stop new reads, submit operation
 cancellation, drain each original completion, and only then deregister buffers
