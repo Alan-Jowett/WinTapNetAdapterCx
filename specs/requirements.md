@@ -1,9 +1,8 @@
 # WinTapNetAdapterCx Requirements
 
 **Workflow:** `/evolve`  
-**Phase:** Phase 8 — Create Deliverable
-**Status:** Specification package approved; implementation and validation
-changes are being delivered
+**Phase:** Phase 2 — Specification Changes
+**Status:** Dynamic-bus specification changes proposed; awaiting approval
 **Evidence scope:** `README.md`, repository layout, and user-provided project purpose
 
 ## Change manifest
@@ -43,6 +42,8 @@ changes are being delivered
   change.
 - Do not modify C source, headers, INF files, project files, tests, generated
   artifacts, or build configuration during discovery.
+- Replace the fixed root-enumerated adapter model with a separate-service KMDF
+  bus and dynamically enumerated, GUID-keyed TAP child adapters.
 
 ## User-intent references
 
@@ -69,6 +70,8 @@ changes are being delivered
   when the current test run added it.
 - **UI-022 (KNOWN):** The user selected validation and suppression of ARP and
   IPv6 Neighbor Discovery frames when permanent neighbors are configured.
+- **UI-023 (KNOWN):** The user supplied an approved dynamic-bus requirements
+  baseline and selected separate KMDF bus and TAP-child driver services.
 
 ## Baseline requirements
 
@@ -181,24 +184,24 @@ configuration rather than producing an ambiguous driver package.
 **Before:** Packet exchange is specified only as generic Ethernet frame
 read/write behavior; no protocol-level test proves traversal through the
 Windows networking stack in both directions.
-**After:** A privileged integration test shall load the test-signed driver,
-identify the resulting TAP Ethernet interface, assign `192.0.2.1/30`
-without creating an unintended default route, and open
-`\\.\WinTapRust` with an overlapped Win32 device handle. It shall
-cause the Windows networking stack to generate an ICMP Echo Request to
-`192.0.2.2`. It shall service the required Ethernet ARP exchange through the
-TAP handle so the stack can resolve the peer, then read and validate the
-Ethernet/IPv4/ICMP request from the TAP handle, write a correctly formed Echo
-Reply through the handle, and verify that the Windows stack receives the
-matching reply. It shall restore addressing, routes, handles, and driver
-state on success and failure.
+**After:** A privileged integration test shall load the test-signed package,
+create one test GUID child through the manager, wait for its GUID-correlated
+TAP interface, assign `192.0.2.1/30` without creating an unintended default
+route, and open that discovered interface with an overlapped Win32 device
+handle. It shall cause the Windows networking stack to generate an ICMP Echo
+Request to `192.0.2.2`. It shall service the required Ethernet ARP exchange
+through the TAP handle so the stack can resolve the peer, then read and
+validate the Ethernet/IPv4/ICMP request from the TAP handle, write a correctly
+formed Echo Reply through the handle, and verify that the Windows stack
+receives the matching reply. It shall restore addressing, routes, handles,
+child, and package state on success and failure.
 
 The test shall use documentation-only TEST-NET space and shall not depend on
 an external peer, internet connectivity, bridge, NAT, or production route.
 
 **Trace:** User-requested `/evolve` change; selected address pair
 `192.0.2.1/30` and `192.0.2.2`; extends REQ-001, REQ-002, REQ-003, REQ-005,
-and REQ-006.
+REQ-006, REQ-029, and REQ-030.
 **Invariant impact:** The test preserves Ethernet framing and driver
 ownership rules, distinguishes timeout from malformed-packet failure, and
 leaves no test-created network or driver state after cleanup.
@@ -661,8 +664,161 @@ request or return the frame to the bounded capture queue.
   from the initial milestone), protocol-specific
   user-mode libraries, packet capture beyond the virtual adapter contract,
   driver-internal peer linking, bridging/NAT/routing policy, and production
-  signing/distribution services, dynamic adapter provisioning, arbitrary-N
-  forwarding, and an overlapped-I/O fallback for the switch.
+  signing/distribution services, arbitrary-N forwarding, and an overlapped-I/O
+  fallback for the switch.
+
+## Dynamic bus amendment
+
+This amendment supersedes the static-root portions of REQ-001, REQ-003,
+REQ-005, REQ-008, REQ-009, REQ-012, REQ-015, REQ-017, and REQ-019. REQ-002,
+REQ-013, REQ-016, REQ-018, REQ-020, REQ-021, REQ-024, and REQ-025 remain
+per-child contracts and are not relaxed.
+
+### REQ-026 — Bus and child topology
+
+**Before:** The package exposes one service bound to the two fixed
+root-enumerated identities `ROOT\WinTapRust` and `ROOT\WinTapRust2`.
+**After:** The package shall install separate KMDF bus and TAP-child driver
+services. The bus shall dynamically enumerate every active TAP adapter as an
+independent PnP child PDO.
+
+**Trace:** UI-023; BUS-REQ-001 and BUS-REQ-009.
+**Invariant impact:** A bus operation does not own packet data, and failure to
+enumerate one child cannot alter another child's packet, queue, or handle
+state.
+
+### REQ-027 — Privileged versioned bus control
+
+The bus shall expose an administrator-only manager interface for create,
+remove, enumerate, and query operations. Every request shall include a
+protocol version and bounded length, and shall be fully validated before
+allocation, child-list mutation, or state publication.
+
+**Trace:** UI-023; BUS-REQ-002.
+**Invariant impact:** An unprivileged or malformed request cannot create,
+remove, enumerate privileged child state, disclose kernel memory, or mutate a
+child lifecycle.
+
+### REQ-028 — Immutable dynamic child identity
+
+Every create request shall contain one unique immutable adapter GUID. The bus
+shall use that GUID as the WDF child-identification key. Duplicate and
+concurrent create requests for the same GUID shall deterministically produce
+at most one child.
+
+**Trace:** UI-023; BUS-REQ-003.
+**Invariant impact:** GUID reuse during create or teardown cannot yield
+ambiguous ownership, interface selection, or cleanup.
+
+### REQ-029 — Asynchronous lifecycle completion
+
+Create and explicit remove shall be asynchronous manager operations correlated
+by request ID and adapter GUID. Create shall not report success until the
+matching child and direct TAP interface are observable. Remove shall not
+report success until the matching child PnP instance and TAP interface are
+gone. Surprise removal and bus teardown shall serialize with these operations
+per GUID.
+
+**Trace:** UI-023; BUS-REQ-004 and BUS-REQ-008.
+**Invariant impact:** Each child I/O request has one terminal completion
+before removal succeeds; no operation can report false success during PnP
+delay or failure.
+
+### REQ-030 — Direct TAP interface discovery
+
+Every child shall publish a unique discoverable TAP device interface. The
+manager shall return the GUID and resolved interface identity; TAP callers
+shall open that child directly and shall not rely on ordinal DOS paths or PnP
+enumeration order.
+
+**Trace:** UI-023; BUS-REQ-005.
+**Invariant impact:** Two or more children retain distinct endpoints and
+independently exclusive owners, without the manager brokering frame I/O.
+
+### REQ-031 — Dynamic child-owned state
+
+Each child shall own its NetAdapterCx adapter, queues, work items, locks,
+filter state, and bounded frame queues. The implementation shall remove fixed
+two-instance global registries and shall not impose an arbitrary adapter-count
+limit. Resource exhaustion shall fail explicitly before partial child
+publication.
+
+**Trace:** UI-023; BUS-REQ-006; repository evidence: two-element
+`INSTANCE_IDS` and `INSTANCE_STATES` arrays.
+**Invariant impact:** At least three concurrent children have isolated TAP
+I/O; no state or frame crosses GUID boundaries.
+
+### REQ-032 — Preserve per-child TAP contracts
+
+Each dynamic child shall preserve the REQ-002, REQ-003, REQ-013, REQ-016,
+REQ-021, REQ-024, and REQ-025 directional frame isolation, bounded queues,
+cancellation, receive filtering, RX-ring ownership, power, IRQL, and teardown
+contracts.
+
+**Trace:** UI-023; BUS-REQ-007.
+**Invariant impact:** Refactoring topology cannot relax packet ownership or
+completion guarantees.
+
+### REQ-033 — Legacy migration and package identity
+
+The package shall use one bus-parent identity and one child
+hardware/compatible identity. `ROOT\WinTapRust` and `ROOT\WinTapRust2` shall
+not remain supported runtime adapter models. Install, upgrade, uninstall, and
+validation shall detect stale legacy devices and remove them only through an
+explicit migration or cleanup operation.
+
+**Trace:** UI-023; BUS-REQ-009.
+**Invariant impact:** A dynamic child cannot bind accidentally to a legacy
+root device or leave an ambiguous service selection.
+
+### REQ-034 — Lifecycle diagnostics
+
+The manager and bus shall record request ID, adapter GUID, PnP state,
+interface identity, and primary cleanup failure. Packet contents shall not be
+recorded by default.
+
+**Trace:** UI-023; BUS-REQ-010.
+**Invariant impact:** Lifecycle failure is diagnosable without TAP payload
+disclosure.
+
+### REQ-035 — Manager restart behavior
+
+Active children shall survive manager exit and restart until explicitly
+removed. A restarted manager shall enumerate and reattach to existing GUIDs.
+This requirement does not require persistence across bus unload or reboot.
+
+**Trace:** UI-023; BUS-REQ-011.
+**Invariant impact:** Manager availability is independent of child packet
+ownership and does not create duplicate children.
+
+### REQ-036 — Dynamic endpoint collection
+
+The switch-facing endpoint contract shall use GUID-correlated interface
+discovery and support a selected dynamic collection. The initial relay and
+switch acceptance topology remains two selected endpoints; arbitrary-N
+forwarding policy is not introduced by this requirement.
+
+**Trace:** UI-023; supersedes the static selection portions of REQ-017 and
+REQ-019.
+**Invariant impact:** Dynamic discovery cannot change existing endpoint,
+buffer-slot, completion-generation, or source-reflection rules.
+
+### Dynamic-bus traceability
+
+| Requirement | Design coverage | Validation coverage |
+| --- | --- | --- |
+| REQ-008 | ICMP/TAP integration-test design; dynamic relay and switch selection | VAL-008; TC-023 through TC-028 |
+| REQ-026 | Package and PnP topology | VAL-024; TC-067 |
+| REQ-027 | Bus manager control plane | VAL-025; TC-068 |
+| REQ-028 | Package and PnP topology; bus manager control plane | VAL-026; TC-069 |
+| REQ-029 | Bus manager control plane; synchronization, IRQL, and teardown | VAL-015, VAL-027; TC-070, TC-071, TC-073 |
+| REQ-030 | Child lifetime and TAP interface | VAL-015, VAL-028; TC-042, TC-072 |
+| REQ-031 | Child lifetime and TAP interface | VAL-026; TC-069 |
+| REQ-032 | Child lifetime and TAP interface; synchronization, IRQL, and teardown | VAL-027, VAL-031; TC-070, TC-071, TC-076 |
+| REQ-033 | Package and PnP topology; migration and diagnostics | VAL-012, VAL-029; TC-038, TC-074 |
+| REQ-034 | Migration and diagnostics | VAL-030; TC-075 |
+| REQ-035 | Child lifetime and TAP interface | VAL-030; TC-072 |
+| REQ-036 | Dynamic relay and switch selection | VAL-017, VAL-019; TC-055 |
 
 ## Open questions requiring user decisions
 
@@ -698,12 +854,13 @@ request or return the frame to the bounded capture queue.
 17. **Resolved:** REQ-015 runs in hosted CI and a manual Hyper-V/WinDbg VM.
 18. **Resolved:** REQ-015 removes a driver-store package only if that test run
     added it.
-19. **Resolved:** The first switch release uses exactly the two existing
-    statically defined adapters.
+19. **Superseded:** Dynamic GUID-correlated endpoint discovery replaces the
+    two static root identities; the initial relay and switch acceptance
+    topology still selects two endpoints.
 20. **Resolved:** Missing required I/O-ring runtime capabilities fail switch
     startup; overlapped I/O is not a switch fallback.
-21. **Resolved:** Endpoint handling is collection-oriented for future dynamic
-    devices, but dynamic provisioning and arbitrary-N forwarding are deferred.
+21. **Superseded:** Dynamic provisioning is required through the bus manager;
+    arbitrary-N forwarding policy remains out of scope.
 22. **Resolved:** Pending reads and writes use one shared positive even total
     depth across both endpoints, with equal per-endpoint capacity. There is no
     artificial fixed maximum; available memory, checked arithmetic, and
@@ -722,7 +879,5 @@ request or return the frame to the bounded capture queue.
 
 ## Specification approval gate
 
-REQ-020, REQ-021, and REQ-024 were propagated to the requirements, design,
-and validation specifications and explicitly approved before implementation.
-REQ-025 is the current specification change and requires approval before
-implementation.
+REQ-026 through REQ-036 require approval together with their design and
+validation coverage before implementation.

@@ -5,7 +5,7 @@ param(
 
     [string]$Configuration = "Release",
 
-    [string]$PackageRoot = ".\out\rust-target",
+    [string]$PackageRoot = ".\out\cmake",
 
     [string]$PackageDirectory
 )
@@ -21,37 +21,47 @@ $artifactRoot = if ($PackageDirectory) {
         "aarch64-pc-windows-msvc"
     }
     $profile = if ($Configuration -eq "Debug") { "debug" } else { "release" }
-    Join-Path $PackageRoot "$target\$profile\wintap_netadaptercx_driver_package"
+    Join-Path $PackageRoot "$Architecture\package\$Architecture\$Configuration"
 }
-$driver = Join-Path $artifactRoot "wintap_netadaptercx_driver.sys"
-$inf = Join-Path $artifactRoot "wintap_netadaptercx_driver.inf"
+$childDriver = Join-Path $artifactRoot "wintap_netadaptercx_driver.sys"
+$childInf = Join-Path $artifactRoot "wintap_netadaptercx_driver.inf"
+$busDriver = Join-Path $artifactRoot "wintap_bus_driver.sys"
+$busInf = Join-Path $artifactRoot "wintap_bus_driver.inf"
 
-if (-not (Test-Path -LiteralPath $driver -PathType Leaf)) {
-    throw "Driver artifact was not produced: $driver"
+if (-not (Test-Path -LiteralPath $childDriver -PathType Leaf)) {
+    throw "TAP-child driver artifact was not produced: $childDriver"
 }
-if (-not (Test-Path -LiteralPath $inf -PathType Leaf)) {
-    throw "INF artifact is missing: $inf"
+if (-not (Test-Path -LiteralPath $busDriver -PathType Leaf)) {
+    throw "Bus driver artifact was not produced: $busDriver"
 }
-
-$infText = Get-Content -Raw -LiteralPath $inf
-foreach ($required in @(
-    "CatalogFile",
-    "WinTap_CopyFiles",
-    "WinTap_Service",
-    "WinTapRust",
-    "ROOT\WinTapRust",
-    "ROOT\WinTapRust2",
-    "NTamd64",
-    "NTarm64"
-)) {
-    if ($infText -notmatch [regex]::Escape($required)) {
-        throw "INF is missing the required package declaration: $required"
+foreach ($inf in @($childInf, $busInf)) {
+    if (-not (Test-Path -LiteralPath $inf -PathType Leaf)) {
+        throw "INF artifact is missing: $inf"
     }
 }
 
-$catalog = Join-Path $artifactRoot "wintap_netadaptercx_driver.cat"
-if (-not (Test-Path -LiteralPath $catalog -PathType Leaf)) {
-    throw "Catalog artifact was not produced: $catalog"
+$childInfText = Get-Content -Raw -LiteralPath $childInf
+$busInfText = Get-Content -Raw -LiteralPath $busInf
+foreach ($required in @("CatalogFile", "WinTapChild", "WINTAPBUS\WinTapChild", "NTamd64", "NTarm64")) {
+    if ($childInfText -notmatch [regex]::Escape($required)) {
+        throw "TAP-child INF is missing the required package declaration: $required"
+    }
+}
+foreach ($required in @("CatalogFile", "WinTapBus", "ROOT\WinTapBus", "NTamd64", "NTarm64")) {
+    if ($busInfText -notmatch [regex]::Escape($required)) {
+        throw "Bus INF is missing the required package declaration: $required"
+    }
+}
+if ($childInfText -match 'ROOT\\WinTapRust' -or $busInfText -match 'ROOT\\WinTapRust') {
+    throw "Legacy WinTapRust root identities must not remain in dynamic runtime package INF files."
+}
+foreach ($catalog in @(
+        (Join-Path $artifactRoot "wintap_netadaptercx_driver.cat"),
+        (Join-Path $artifactRoot "wintap_bus_driver.cat")
+    )) {
+    if (-not (Test-Path -LiteralPath $catalog -PathType Leaf)) {
+        throw "Catalog artifact was not produced: $catalog"
+    }
 }
 
 Write-Host "Package artifacts validated for $Architecture/$Configuration."

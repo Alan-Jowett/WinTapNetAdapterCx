@@ -27,6 +27,12 @@ change. `CHG-032` keeps stack-RX injection and stack-TX capture in separate
 frame queues so a successful TAP write cannot complete a TAP read. `CHG-033`
 restarts purged manual control queues before a recovered owner or D0 lifecycle
 re-enters the open state.
+The approved dynamic topology replaces static runtime adapters: a
+`ROOT\WinTapBus` KMDF parent hosts GUID-keyed `WinTapChild` PDOs, and the
+administrator-only versioned manager is `\\.\Global\WinTapBusMgr`.
+`ROOT\WinTapRust` and `ROOT\WinTapRust2` are legacy migration inputs only.
+Use `.\scripts\migrate-wintap-legacy.ps1` to report stale legacy instances;
+only `-CleanupLegacy` performs their explicit removal.
 Hosted validation covers repository artifacts, Rust WDK tool provisioning,
 CMake configure/build/package, and package shape for x64 and ARM64. The hosted
 workflow runs the existing ICMP TAP and routed dual-adapter harnesses, uploading
@@ -43,14 +49,15 @@ opt-in Ethernet/ICMP round trip:
 ```powershell
 .\tests\run-wintap-harness.ps1 -Integration `
   -InstallDriver -RequireTestSigning `
-  -PackageDirectory .\out\rust-target\x86_64-pc-windows-msvc\release\wintap_netadaptercx_driver_package `
+  -PackageDirectory .\out\cmake\x64\package\x64\Release `
   -DiagnosticsPath .\artifacts\wintap-harness
 ```
 
-The integration path discovers the root-enumerated adapter, assigns only
-`192.0.2.1/30`, services ARP for `192.0.2.2`, validates and replies to ICMP
-Echo, verifies the Windows `Ping` result, and removes only the address/device
-state it created. Run it elevated in a Hyper-V VM with test signing enabled.
+The integration path creates a disposable GUID child through the manager,
+waits for its returned TAP interface, assigns only `192.0.2.1/30`, services
+ARP for `192.0.2.2`, validates and replies to ICMP Echo, verifies the Windows
+`Ping` result, and removes only the address/child state it created. Run it
+elevated in a Hyper-V VM with test signing enabled.
 
 This repository's `windows-latest` and `windows-2022` hosted runners are
 already test-signed. If that runner configuration regresses, the harness fails
@@ -58,16 +65,17 @@ explicitly rather than reporting a capability-only pass.
 
 ## Routed dual-adapter relay harness
 
-The DuoNIC-style integration harness provisions two disposable root-enumerated
-WinTap adapters, installs reciprocal endpoint host routes, and relays Ethernet
-frames between their independently exclusive TAP handles. It tests unbound
+The DuoNIC-style integration harness installs one bus, creates two disposable
+GUID-keyed WinTap children through its manager, installs reciprocal endpoint
+host routes, and relays Ethernet frames between their independently exclusive
+TAP handles. It tests unbound
 IPv4 ICMP and IPv6 ICMPv6 traffic through the adapter datapaths rather than
 loopback, detects byte-identical reflected injections, and validates/counts
 then suppresses ARP and IPv6 Neighbor Discovery/DAD control frames:
 
 ```powershell
 .\tests\run-wintap-dual-adapter-harness.ps1 `
-  -PackageDirectory .\out\rust-target\x86_64-pc-windows-msvc\release\wintap_netadaptercx_driver_package `
+  -PackageDirectory .\out\cmake\x64\package\x64\Release `
   -Architecture x64 `
   -DiagnosticsPath .\artifacts\wintap-dual-adapter-harness
 ```
@@ -83,10 +91,10 @@ select a bounded alternative.
 ## Two-TAP switch core
 
 The `wintap-switch-core` crate implements the first-release switch contract
-above the two existing control endpoints. It provides collection-oriented
-endpoint identities, MAC/VLAN learning with a bounded 4,096-entry FDB,
-peer-only forwarding decisions, and generation-protected bounded buffer-slot
-state. Dynamic PnP provisioning and arbitrary-N forwarding remain deferred.
+above two selected manager-returned GUID/interface pairs. It provides
+collection-oriented endpoint identities, MAC/VLAN learning with a bounded
+4,096-entry FDB, peer-only forwarding decisions, and generation-protected
+bounded buffer-slot state. Arbitrary-N forwarding remains deferred.
 
 ## Deploying to a test VM
 
@@ -106,7 +114,7 @@ cargo build -p wintap-switch --release
 ```
 
 The driver package is normally under
-`out\rust-target\x86_64-pc-windows-msvc\release\wintap_netadaptercx_driver_package`.
+`out\cmake\x64\package\x64\Release`.
 The switch executable is under
 `target\release\wintap-switch.exe` unless the WDK build configuration redirects
 Cargo output to `out\rust-target`.
@@ -146,7 +154,7 @@ this procedure.
 $RemoteRoot = 'C:/Temp/WinTapSwitch'
 ssh "$VmUser@$VmIp" "cmd /c if not exist C:\Temp\WinTapSwitch\package mkdir C:\Temp\WinTapSwitch\package"
 
-scp -r .\out\rust-target\x86_64-pc-windows-msvc\release\wintap_netadaptercx_driver_package\* `
+scp -r .\out\cmake\x64\package\x64\Release\* `
     "$VmUser@${VmIp}:$RemoteRoot/package/"
 scp $DevCon "$VmUser@${VmIp}:$RemoteRoot/devcon.exe"
 
@@ -166,20 +174,14 @@ ssh "$VmUser@$VmIp" `
     "powershell -NoProfile -Command Get-FileHash -LiteralPath C:\Temp\WinTapSwitch\wintap-switch.exe -Algorithm SHA256"
 ```
 
-### 4. Provision the two static adapters
+### 4. Provision two GUID-keyed children
 
-The first release intentionally provisions exactly `ROOT\WinTapRust` and
-`ROOT\WinTapRust2`; it does not dynamically create arbitrary adapters:
-
-```powershell
-ssh "$VmUser@$VmIp" `
-    "C:\Temp\WinTapSwitch\devcon.exe install C:\Temp\WinTapSwitch\package\wintap_netadaptercx_driver.inf ROOT\WinTapRust"
-ssh "$VmUser@$VmIp" `
-    "C:\Temp\WinTapSwitch\devcon.exe install C:\Temp\WinTapSwitch\package\wintap_netadaptercx_driver.inf ROOT\WinTapRust2"
-```
-
-If either device already exists, stop and use the cleanup commands below
-instead of replacing an unrelated test instance.
+Copy `tests\wintap-bus-manager.psm1` with the harness. Stage the child INF,
+install one `ROOT\WinTapBus` parent, then create two GUIDs through its
+administrator-only manager. The returned `Guid` and `InterfacePath` values
+are the only valid TAP selection inputs; do not infer device order or use
+fixed DOS paths. The routed harness performs these steps and records the
+mapping in `manager-created-children.json`.
 
 ### 5. Run the switch startup and shutdown smoke test
 
@@ -188,7 +190,8 @@ read/write operations, registers its handles and buffers, and remains in its
 completion loop until Ctrl+C or console close. Start it in the VM:
 
 ```powershell
-ssh "$VmUser@$VmIp" C:\Temp\WinTapSwitch\wintap-switch.exe --read-depth 128
+ssh "$VmUser@$VmIp" `
+  "C:\Temp\WinTapSwitch\wintap-switch.exe --endpoint <GUID-A>=<InterfacePath-A> --endpoint <GUID-B>=<InterfacePath-B> --read-depth 128"
 ```
 
 `--read-depth` controls the shared total number of pending read/write buffers.
@@ -225,27 +228,11 @@ with `scp -r` before cleaning the VM.
 
 ### 7. Clean up the VM
 
-If the harness was not used, remove only the two devices created for this
-test:
-
-```powershell
-ssh "$VmUser@$VmIp" `
-    "C:\Temp\WinTapSwitch\devcon.exe remove ROOT\WinTapRust"
-ssh "$VmUser@$VmIp" `
-    "C:\Temp\WinTapSwitch\devcon.exe remove ROOT\WinTapRust2"
-```
-
-Confirm both identities are gone:
-
-```powershell
-ssh "$VmUser@$VmIp" "C:\Temp\WinTapSwitch\devcon.exe find ROOT\WinTapRust"
-ssh "$VmUser@$VmIp" "C:\Temp\WinTapSwitch\devcon.exe find ROOT\WinTapRust2"
-```
-
-The harness performs this cleanup automatically, including addresses, routes,
-neighbors, firewall rules, PnP instances, and any driver-store package added
-by that invocation. Do not remove a pre-existing Driver Store package by
-hand.
+If the harness was not used, call `Remove-WinTapBusChild` for each recorded
+GUID and wait for `Absent` before removing the recorded bus parent. The
+harness performs this cleanup automatically, including addresses, routes,
+neighbors, firewall rules, child PnP state, and any driver-store package added
+by that invocation. Do not remove a pre-existing Driver Store package by hand.
 
 ## Intended platform
 

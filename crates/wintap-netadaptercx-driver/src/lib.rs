@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{
-    DRIVER_OBJECT, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_DEVICE_BUSY, ULONG,
+    DRIVER_OBJECT, GUID, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_DEVICE_BUSY, ULONG,
     UNICODE_STRING, WDF_DRIVER_CONFIG, WDF_FILEOBJECT_CONFIG, WDF_IO_QUEUE_CONFIG,
     WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
     WDF_WORKITEM_CONFIG, WDFCMRESLIST, WDFDEVICE, WDFDEVICE_INIT, WDFDRIVER, WDFFILEOBJECT,
@@ -83,41 +83,28 @@ const FRAME_MINIMUM: usize = 14;
 const FRAME_MAXIMUM: usize = 1514;
 const MAXIMUM_MULTICAST_ADDRESSES: usize = 64;
 const ETHERNET_ADDRESS_LENGTH: usize = 6;
-const CONTROL_SDDL: [u16; 16] = [
-    b'D' as u16,
-    b':' as u16,
-    b'P' as u16,
-    b'(' as u16,
-    b'A' as u16,
-    b';' as u16,
-    b';' as u16,
-    b'G' as u16,
-    b'A' as u16,
-    b';' as u16,
-    b';' as u16,
-    b';' as u16,
-    b'B' as u16,
-    b'A' as u16,
-    b')' as u16,
-    0,
-];
+const TAP_INTERFACE_CLASS: GUID = GUID {
+    Data1: 0x25d3_2edf,
+    Data2: 0x7c8c,
+    Data3: 0x4f09,
+    Data4: [0x90, 0x1f, 0x65, 0x0b, 0x23, 0x2e, 0x86, 0x4d],
+};
 
-static INSTANCE_IDS: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
-static INSTANCE_STATES: [core::sync::atomic::AtomicPtr<InstanceState>; 2] =
-    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; 2];
 static FRAGMENT_VIRTUAL_ADDRESS_NAME: [u16; 27] = [
     109, 115, 95, 102, 114, 97, 103, 109, 101, 110, 116, 95, 118, 105, 114, 116, 117, 97, 108, 97,
     100, 100, 114, 101, 115, 115, 0,
 ];
 static QUEUE_CONTEXT_NAME: &[u8] = b"WINTAP_QUEUE_CONTEXT\0";
 static DEVICE_CONTEXT_NAME: &[u8] = b"WINTAP_DEVICE_CONTEXT\0";
+static ADAPTER_CONTEXT_NAME: &[u8] = b"WINTAP_ADAPTER_CONTEXT\0";
+static WORK_ITEM_CONTEXT_NAME: &[u8] = b"WINTAP_WORK_ITEM_CONTEXT\0";
 
 #[repr(C)]
 struct InstanceState {
-    instance_id: usize,
+    guid: GUID,
+    mac_address: [u8; ETHERNET_ADDRESS_LENGTH],
     pnp_device: WDFDEVICE,
     adapter: netadaptercx_sys::NETADAPTER,
-    control_device: WDFDEVICE,
     read_queue: WDFQUEUE,
     frame_lock: WDFSPINLOCK,
     state_lock: WDFSPINLOCK,
@@ -138,16 +125,17 @@ struct InstanceState {
     rx_notification_armed: AtomicBool,
     pending_reads: AtomicUsize,
     pending_writes: AtomicUsize,
+    control_open: AtomicBool,
     lifecycle: core::sync::atomic::AtomicU8,
 }
 
 impl InstanceState {
-    fn new(instance_id: usize) -> Self {
+    fn new(guid: GUID) -> Self {
         Self {
-            instance_id,
+            guid,
+            mac_address: mac_address_from_guid(&guid),
             pnp_device: core::ptr::null_mut(),
             adapter: core::ptr::null_mut(),
-            control_device: core::ptr::null_mut(),
             read_queue: core::ptr::null_mut(),
             frame_lock: core::ptr::null_mut(),
             state_lock: core::ptr::null_mut(),
@@ -168,12 +156,13 @@ impl InstanceState {
             rx_notification_armed: AtomicBool::new(false),
             pending_reads: AtomicUsize::new(0),
             pending_writes: AtomicUsize::new(0),
+            control_open: AtomicBool::new(false),
             lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
         }
     }
 }
 
-fn allocate_instance_state(instance_id: usize) -> *mut InstanceState {
+fn allocate_instance_state(guid: GUID) -> *mut InstanceState {
     let layout = Layout::new::<InstanceState>();
     let state = unsafe {
         // SAFETY: The layout exactly describes the InstanceState allocation.
@@ -182,7 +171,7 @@ fn allocate_instance_state(instance_id: usize) -> *mut InstanceState {
     if !state.is_null() {
         unsafe {
             // SAFETY: The allocation is uniquely owned and properly aligned for InstanceState.
-            state.write(InstanceState::new(instance_id));
+            state.write(InstanceState::new(guid));
         }
     }
     state
@@ -249,6 +238,24 @@ static mut DEVICE_CONTEXT_TYPE_INFO: wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO =
         EvtDriverGetUniqueContextType: None,
     };
 
+static mut ADAPTER_CONTEXT_TYPE_INFO: wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO =
+    wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO {
+        Size: core::mem::size_of::<wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO>() as ULONG,
+        ContextName: ADAPTER_CONTEXT_NAME.as_ptr() as *const i8,
+        ContextSize: core::mem::size_of::<AdapterContext>(),
+        UniqueType: &raw const ADAPTER_CONTEXT_TYPE_INFO,
+        EvtDriverGetUniqueContextType: None,
+    };
+
+static mut WORK_ITEM_CONTEXT_TYPE_INFO: wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO =
+    wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO {
+        Size: core::mem::size_of::<wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO>() as ULONG,
+        ContextName: WORK_ITEM_CONTEXT_NAME.as_ptr() as *const i8,
+        ContextSize: core::mem::size_of::<WorkItemContext>(),
+        UniqueType: &raw const WORK_ITEM_CONTEXT_TYPE_INFO,
+        EvtDriverGetUniqueContextType: None,
+    };
+
 #[repr(C)]
 struct QueueContext {
     is_transmit: bool,
@@ -263,38 +270,14 @@ struct DeviceContext {
     instance: *mut InstanceState,
 }
 
-struct InstanceRegistry {
-    adapter: core::sync::atomic::AtomicPtr<c_void>,
-    state: core::sync::atomic::AtomicPtr<InstanceState>,
+#[repr(C)]
+struct AdapterContext {
+    instance: *mut InstanceState,
 }
 
-impl InstanceRegistry {
-    const fn new() -> Self {
-        Self {
-            adapter: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            state: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        }
-    }
-}
-
-static INSTANCE_REGISTRY: [InstanceRegistry; 2] = [const { InstanceRegistry::new() }; 2];
-
-fn reserve_instance_id() -> Option<usize> {
-    for (index, in_use) in INSTANCE_IDS.iter().enumerate() {
-        if in_use
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return Some(index + 1);
-        }
-    }
-    None
-}
-
-fn release_instance_id(instance_id: usize) {
-    if let Some(in_use) = INSTANCE_IDS.get(instance_id.saturating_sub(1)) {
-        in_use.store(false, Ordering::Release);
-    }
+#[repr(C)]
+struct WorkItemContext {
+    instance: *mut InstanceState,
 }
 
 const _: usize = core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_STATE>();
@@ -332,72 +315,30 @@ unsafe fn object_context<T>(
 }
 
 unsafe fn instance_from_device(device: WDFDEVICE) -> Option<*mut InstanceState> {
-    for entry in &INSTANCE_STATES {
-        let state = entry.load(Ordering::Acquire);
-        if !state.is_null()
-            && (unsafe { (*state).pnp_device == device }
-                || unsafe { (*state).control_device == device })
-        {
-            return Some(state);
-        }
+    let context = unsafe {
+        object_context::<DeviceContext>(device.cast(), &raw const DEVICE_CONTEXT_TYPE_INFO)
+    };
+    if context.is_null() || unsafe { (*context).instance.is_null() } {
+        None
+    } else {
+        Some(unsafe { (*context).instance })
     }
-    None
 }
 
 unsafe fn instance_from_pnp_device(device: WDFDEVICE) -> Option<*mut InstanceState> {
-    for entry in &INSTANCE_STATES {
-        let state = entry.load(Ordering::Acquire);
-        if !state.is_null() && unsafe { (*state).pnp_device == device } {
-            return Some(state);
-        }
-    }
-    None
+    unsafe { instance_from_device(device) }
 }
 
 unsafe fn instance_from_adapter(
     adapter: netadaptercx_sys::NETADAPTER,
 ) -> Option<*mut InstanceState> {
-    let adapter = adapter.cast::<c_void>();
-    for entry in &INSTANCE_REGISTRY {
-        if entry.adapter.load(Ordering::Acquire) == adapter {
-            let state = entry.state.load(Ordering::Acquire);
-            if !state.is_null() {
-                return Some(state);
-            }
-        }
-    }
-    None
-}
-
-fn register_instance(state: &mut InstanceState) -> bool {
-    let adapter = state.adapter.cast::<c_void>();
-    for entry in &INSTANCE_REGISTRY {
-        if entry
-            .adapter
-            .compare_exchange(
-                core::ptr::null_mut(),
-                adapter,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            entry.state.store(state, Ordering::Release);
-            return true;
-        }
-    }
-    false
-}
-
-fn unregister_instance(adapter: netadaptercx_sys::NETADAPTER) {
-    let adapter = adapter.cast::<c_void>();
-    for entry in &INSTANCE_REGISTRY {
-        if entry.adapter.load(Ordering::Acquire) == adapter {
-            entry.state.store(core::ptr::null_mut(), Ordering::Release);
-            entry
-                .adapter
-                .store(core::ptr::null_mut(), Ordering::Release);
-        }
+    let context = unsafe {
+        object_context::<AdapterContext>(adapter.cast(), &raw const ADAPTER_CONTEXT_TYPE_INFO)
+    };
+    if context.is_null() || unsafe { (*context).instance.is_null() } {
+        None
+    } else {
+        Some(unsafe { (*context).instance })
     }
 }
 
@@ -407,13 +348,14 @@ unsafe fn instance_from_io_queue(queue: WDFQUEUE) -> Option<*mut InstanceState> 
 }
 
 unsafe fn instance_from_work_item(work_item: WDFWORKITEM) -> Option<*mut InstanceState> {
-    for entry in &INSTANCE_STATES {
-        let state = entry.load(Ordering::Acquire);
-        if !state.is_null() && unsafe { (*state).read_work_item == work_item } {
-            return Some(state);
-        }
+    let context = unsafe {
+        object_context::<WorkItemContext>(work_item.cast(), &raw const WORK_ITEM_CONTEXT_TYPE_INFO)
+    };
+    if context.is_null() || unsafe { (*context).instance.is_null() } {
+        None
+    } else {
+        Some(unsafe { (*context).instance })
     }
-    None
 }
 
 unsafe fn instance_from_packet_queue(
@@ -477,24 +419,9 @@ pub unsafe extern "system" fn driver_entry(
 /// implementation slice; the device is deliberately not exposed as a
 /// functional data path until those callbacks are complete.
 extern "C" fn evt_driver_device_add(
-    driver: WDFDRIVER,
+    _driver: WDFDRIVER,
     device_init: *mut WDFDEVICE_INIT,
 ) -> NTSTATUS {
-    let Some(instance_id) = reserve_instance_id() else {
-        debug_status(b"EvtDriverDeviceAdd instance limit", STATUS_DEVICE_BUSY);
-        return STATUS_DEVICE_BUSY;
-    };
-    let state = allocate_instance_state(instance_id);
-    if state.is_null() {
-        release_instance_id(instance_id);
-        debug_status(
-            b"EvtDriverDeviceAdd state allocation",
-            STATUS_INSUFFICIENT_RESOURCES,
-        );
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    INSTANCE_STATES[instance_id - 1].store(state, Ordering::Release);
-
     debug_marker(b"EvtDriverDeviceAdd enter");
     let status = unsafe {
         // SAFETY: NetDeviceInitConfig is called once at PASSIVE_LEVEL before
@@ -503,11 +430,6 @@ extern "C" fn evt_driver_device_add(
     };
     debug_status(b"NetDeviceInitConfig", status);
     if status != STATUS_SUCCESS {
-        INSTANCE_STATES[instance_id - 1].store(core::ptr::null_mut(), Ordering::Release);
-        release_instance_id(instance_id);
-        unsafe {
-            drop(Box::from_raw(state));
-        }
         return status;
     }
 
@@ -543,7 +465,6 @@ extern "C" fn evt_driver_device_add(
             WDF_NO_OBJECT_ATTRIBUTES,
         );
     }
-
     let mut pnp_init = device_init;
     let mut _pnp_device: WDFDEVICE = core::ptr::null_mut();
     let mut device_attributes = WDF_OBJECT_ATTRIBUTES {
@@ -566,10 +487,20 @@ extern "C" fn evt_driver_device_add(
     };
     debug_status(b"WdfDeviceCreate", status);
     if status != STATUS_SUCCESS {
-        INSTANCE_STATES[instance_id - 1].store(core::ptr::null_mut(), Ordering::Release);
-        release_instance_id(instance_id);
+        return status;
+    }
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceCreateDeviceInterface,
+            _pnp_device,
+            &TAP_INTERFACE_CLASS as *const GUID,
+            core::ptr::null::<UNICODE_STRING>(),
+        )
+    };
+    debug_status(b"WdfDeviceCreateDeviceInterface", status);
+    if status != STATUS_SUCCESS {
         unsafe {
-            drop(Box::from_raw(state));
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, _pnp_device.cast());
         }
         return status;
     }
@@ -579,21 +510,33 @@ extern "C" fn evt_driver_device_add(
     if device_context.is_null() {
         unsafe {
             call_unsafe_wdf_function_binding!(WdfObjectDelete, _pnp_device.cast());
-            INSTANCE_STATES[instance_id - 1].store(core::ptr::null_mut(), Ordering::Release);
-            release_instance_id(instance_id);
-            drop(Box::from_raw(state));
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    let guid = match child_guid_from_hardware_id(_pnp_device) {
+        Ok(guid) => guid,
+        Err(status) => {
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, _pnp_device.cast());
+            }
+            debug_status(b"ChildGuidFromHardwareId", status);
+            return status;
+        }
+    };
+    let state = allocate_instance_state(guid);
+    if state.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, _pnp_device.cast());
         }
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     unsafe {
         (*device_context).instance = state;
-    }
-    unsafe {
         (*state).pnp_device = _pnp_device;
     }
 
-    let status = create_control_device(driver, unsafe { &mut *state });
-    debug_status(b"CreateControlDevice", status);
+    let status = create_tap_device(_pnp_device, unsafe { &mut *state });
+    debug_status(b"CreateTapDevice", status);
     if status != STATUS_SUCCESS {
         return status;
     }
@@ -603,6 +546,130 @@ extern "C" fn evt_driver_device_add(
     let status = unsafe { create_adapter(_pnp_device, &mut *state) };
     debug_status(b"CreateAdapter", status);
     status
+}
+
+fn mac_address_from_guid(guid: &GUID) -> [u8; ETHERNET_ADDRESS_LENGTH] {
+    [
+        0x02,
+        guid.Data4[0],
+        guid.Data4[1],
+        guid.Data4[2],
+        guid.Data4[3],
+        guid.Data4[4],
+    ]
+}
+
+fn hex_nibble(character: u16) -> Option<u8> {
+    if (b'0' as u16..=b'9' as u16).contains(&character) {
+        Some((character - b'0' as u16) as u8)
+    } else if (b'a' as u16..=b'f' as u16).contains(&character) {
+        Some((character - b'a' as u16 + 10) as u8)
+    } else if (b'A' as u16..=b'F' as u16).contains(&character) {
+        Some((character - b'A' as u16 + 10) as u8)
+    } else {
+        None
+    }
+}
+
+fn parse_child_guid_from_hardware_id(hardware_id: &[u16]) -> Option<GUID> {
+    const PREFIX: [u16; 11] = [
+        b'W' as u16,
+        b'I' as u16,
+        b'N' as u16,
+        b'T' as u16,
+        b'A' as u16,
+        b'P' as u16,
+        b'B' as u16,
+        b'U' as u16,
+        b'S' as u16,
+        b'\\' as u16,
+        b'{' as u16,
+    ];
+    if !hardware_id.starts_with(&PREFIX) {
+        return None;
+    }
+    let mut digits = [0u8; 32];
+    let mut digit_count = 0;
+    for character in hardware_id[11..].iter() {
+        if *character == b'}' as u16 {
+            if digit_count != digits.len() {
+                return None;
+            }
+            let byte = |index: usize| (digits[index] << 4) | digits[index + 1];
+            return Some(GUID {
+                Data1: ((byte(0) as u32) << 24)
+                    | ((byte(2) as u32) << 16)
+                    | ((byte(4) as u32) << 8)
+                    | byte(6) as u32,
+                Data2: ((byte(8) as u16) << 8) | byte(10) as u16,
+                Data3: ((byte(12) as u16) << 8) | byte(14) as u16,
+                Data4: [
+                    byte(16),
+                    byte(18),
+                    byte(20),
+                    byte(22),
+                    byte(24),
+                    byte(26),
+                    byte(28),
+                    byte(30),
+                ],
+            });
+        }
+        if *character == b'-' as u16 {
+            continue;
+        }
+        let Some(value) = hex_nibble(*character) else {
+            return None;
+        };
+        if digit_count == digits.len() {
+            return None;
+        }
+        digits[digit_count] = value;
+        digit_count += 1;
+    }
+    None
+}
+
+fn child_guid_from_hardware_id(device: WDFDEVICE) -> Result<GUID, NTSTATUS> {
+    let mut hardware_ids = [0u16; 128];
+    let mut result_length: ULONG = 0;
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceQueryProperty,
+            device,
+            wdk_sys::DEVICE_REGISTRY_PROPERTY::DevicePropertyHardwareID,
+            (hardware_ids.len() * core::mem::size_of::<u16>()) as ULONG,
+            hardware_ids.as_mut_ptr().cast::<c_void>(),
+            &mut result_length,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return Err(status);
+    }
+    if result_length as usize % core::mem::size_of::<u16>() != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let character_count =
+        (result_length as usize / core::mem::size_of::<u16>()).min(hardware_ids.len());
+    let mut offset = 0;
+    while offset < character_count {
+        let Some(length) = hardware_ids[offset..character_count]
+            .iter()
+            .position(|character| *character == 0)
+        else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if length == 0 {
+            break;
+        }
+        if let Some(guid) =
+            parse_child_guid_from_hardware_id(&hardware_ids[offset..offset + length])
+        {
+            return Ok(guid);
+        }
+        offset += length + 1;
+    }
+    Err(STATUS_INVALID_PARAMETER)
 }
 
 unsafe fn net_function<T: Copy>(index: usize) -> T {
@@ -660,6 +727,14 @@ unsafe fn create_adapter(device: WDFDEVICE, state: &mut InstanceState) -> NTSTAT
         );
     }
 
+    let mut adapter_attributes = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ContextTypeInfo: &raw const ADAPTER_CONTEXT_TYPE_INFO,
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ..WDF_OBJECT_ATTRIBUTES::default()
+    };
     let create: unsafe extern "system" fn(
         netadaptercx_sys::PNET_DRIVER_GLOBALS,
         *mut netadaptercx_sys::NETADAPTER_INIT,
@@ -673,7 +748,7 @@ unsafe fn create_adapter(device: WDFDEVICE, state: &mut InstanceState) -> NTSTAT
         create(
             netadaptercx_sys::NetDriverGlobals,
             adapter_init,
-            core::ptr::null_mut(),
+            &mut adapter_attributes,
             &mut adapter,
         )
     };
@@ -692,13 +767,22 @@ unsafe fn create_adapter(device: WDFDEVICE, state: &mut InstanceState) -> NTSTAT
     }
 
     state.adapter = adapter;
-    if !register_instance(state) {
-        return STATUS_DEVICE_BUSY;
+    let adapter_context = unsafe {
+        object_context::<AdapterContext>(adapter.cast(), &raw const ADAPTER_CONTEXT_TYPE_INFO)
+    };
+    if adapter_context.is_null() {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    unsafe {
+        (*adapter_context).instance = state;
     }
     STATUS_SUCCESS
 }
 
-fn configure_adapter_link_state(adapter: netadaptercx_sys::NETADAPTER, instance_id: usize) {
+fn configure_adapter_link_state(
+    adapter: netadaptercx_sys::NETADAPTER,
+    mac_address: [u8; ETHERNET_ADDRESS_LENGTH],
+) {
     let mut link_layer = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES {
         Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES>()
             as ULONG,
@@ -738,12 +822,12 @@ fn configure_adapter_link_state(adapter: netadaptercx_sys::NETADAPTER, instance_
     let address = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS {
         Length: 6,
         Address: [
-            0x02,
-            0x57,
-            0x54,
-            0x41,
-            0x50,
-            instance_id as u8,
+            mac_address[0],
+            mac_address[1],
+            mac_address[2],
+            mac_address[3],
+            mac_address[4],
+            mac_address[5],
             0,
             0,
             0,
@@ -1670,17 +1754,17 @@ extern "C" fn evt_device_prepare_hardware(
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    let (adapter, instance_id) = {
+    let (adapter, mac_address) = {
         let state = &mut *state_guard;
         state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
-        (state.adapter, state.instance_id)
+        (state.adapter, state.mac_address)
     };
     drop(state_guard);
     if adapter.is_null() {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    configure_adapter_link_state(adapter, instance_id);
+    configure_adapter_link_state(adapter, mac_address);
 
     // Match NET_ADAPTER_TX_CAPABILITIES_INIT: this is a system-managed,
     // non-DMA path with no fragment-count limit.
@@ -1824,87 +1908,13 @@ extern "C" fn evt_device_release_hardware(
     state.tx_queue_started.store(false, Ordering::Release);
     state.rx_queue_started.store(false, Ordering::Release);
     state.rx_notification_armed.store(false, Ordering::Release);
-    unregister_instance(adapter);
     state.adapter = core::ptr::null_mut();
     state.lifecycle.store(INSTANCE_CLOSED, Ordering::Release);
 
     STATUS_SUCCESS
 }
 
-fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTATUS {
-    let sddl = unicode_string(&CONTROL_SDDL);
-    let mut control_init = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfControlDeviceInitAllocate,
-            driver,
-            &sddl as *const UNICODE_STRING,
-        )
-    };
-    if control_init.is_null() {
-        debug_status(
-            b"WdfControlDeviceInitAllocate",
-            STATUS_INSUFFICIENT_RESOURCES,
-        );
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    debug_marker(b"WdfControlDeviceInitAllocate");
-
-    let mut file_config = WDF_FILEOBJECT_CONFIG {
-        Size: core::mem::size_of::<WDF_FILEOBJECT_CONFIG>() as ULONG,
-        EvtDeviceFileCreate: Some(evt_file_create),
-        EvtFileClose: Some(evt_file_close),
-        EvtFileCleanup: Some(evt_file_cleanup),
-        FileObjectClass: wdk_sys::_WDF_FILEOBJECT_CLASS::WdfFileObjectWdfCannotUseFsContexts,
-        AutoForwardCleanupClose: wdk_sys::_WDF_TRI_STATE::WdfUseDefault,
-        ..WDF_FILEOBJECT_CONFIG::default()
-    };
-    unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceInitSetFileObjectConfig,
-            control_init,
-            &mut file_config,
-            WDF_NO_OBJECT_ATTRIBUTES,
-        );
-    }
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfDeviceInitSetExclusive, control_init, 1);
-    }
-
-    let device_name_buffer = control_name(state.instance_id, false);
-    let device_name = unicode_string(&device_name_buffer);
-    let status = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceInitAssignName,
-            control_init,
-            &device_name as *const UNICODE_STRING,
-        )
-    };
-    debug_status(b"WdfDeviceInitAssignName", status);
-    if status != STATUS_SUCCESS {
-        unsafe {
-            call_unsafe_wdf_function_binding!(WdfDeviceInitFree, control_init);
-        }
-        return status;
-    }
-
-    let mut device: WDFDEVICE = core::ptr::null_mut();
-    let status = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceCreate,
-            &mut control_init,
-            WDF_NO_OBJECT_ATTRIBUTES,
-            &mut device,
-        )
-    };
-    debug_status(b"WdfControlDeviceCreate", status);
-    if status != STATUS_SUCCESS {
-        if !control_init.is_null() {
-            unsafe {
-                call_unsafe_wdf_function_binding!(WdfDeviceInitFree, control_init);
-            }
-        }
-        return status;
-    }
+fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
     let injection_queue = match FrameQueue::try_new(FRAME_QUEUE_LIMIT) {
         Ok(queue) => queue,
         Err(_) => {
@@ -1990,6 +2000,7 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
     let mut work_item_attributes = WDF_OBJECT_ATTRIBUTES {
         Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
         ParentObject: device.cast(),
+        ContextTypeInfo: &raw const WORK_ITEM_CONTEXT_TYPE_INFO,
         ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
         SynchronizationScope:
             wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
@@ -2014,6 +2025,21 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
             call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
         }
         return status;
+    }
+    let work_item_context = unsafe {
+        object_context::<WorkItemContext>(
+            read_work_item.cast(),
+            &raw const WORK_ITEM_CONTEXT_TYPE_INFO,
+        )
+    };
+    if work_item_context.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    unsafe {
+        (*work_item_context).instance = state;
     }
     state.read_work_item = read_work_item;
 
@@ -2041,32 +2067,12 @@ fn create_control_device(driver: WDFDRIVER, state: &mut InstanceState) -> NTSTAT
         return status;
     }
 
-    let symbolic_link_buffer = control_name(state.instance_id, true);
-    let symbolic_link = unicode_string(&symbolic_link_buffer);
-    let status = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceCreateSymbolicLink,
-            device,
-            &symbolic_link as *const UNICODE_STRING,
-        )
-    };
-    if status != STATUS_SUCCESS {
-        unsafe {
-            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
-        }
-        return status;
-    }
-
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfControlFinishInitializing, device);
-        state.control_device = device;
-        state.read_queue = read_queue;
-        state.frame_lock = frame_lock;
-        state.state_lock = state_lock;
-        state.injection_queue = Some(injection_queue);
-        state.capture_queue = Some(capture_queue);
-        state.read_work_item = read_work_item;
-    }
+    state.read_queue = read_queue;
+    state.frame_lock = frame_lock;
+    state.state_lock = state_lock;
+    state.injection_queue = Some(injection_queue);
+    state.capture_queue = Some(capture_queue);
+    state.read_work_item = read_work_item;
     STATUS_SUCCESS
 }
 
@@ -2078,63 +2084,30 @@ unsafe extern "C" fn evt_instance_context_destroy(object: WDFOBJECT) {
         unsafe {
             (*context).instance = core::ptr::null_mut();
         }
-        let control_device = unsafe { (*state).control_device };
-        unsafe {
-            (*state).control_device = core::ptr::null_mut();
-        }
-        if !control_device.is_null() {
-            // Control devices cannot use a PnP device as their WDF parent.
-            unsafe {
-                call_unsafe_wdf_function_binding!(WdfObjectDelete, control_device.cast());
-            }
-        }
-        if !unsafe { (*state).adapter.is_null() } {
-            unsafe {
-                unregister_instance((*state).adapter);
-            }
-        }
-        INSTANCE_STATES[unsafe { (*state).instance_id } - 1]
-            .compare_exchange(
-                state,
-                core::ptr::null_mut(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok();
-        unsafe {
-            release_instance_id((*state).instance_id);
-        }
         unsafe {
             drop(Box::from_raw(state));
         }
     }
 }
 
-fn control_name(instance_id: usize, symbolic: bool) -> [u16; 32] {
-    let prefix: &[u8] = if symbolic {
-        b"\\DosDevices\\Global\\WinTapRust"
-    } else {
-        b"\\Device\\WinTapRust"
-    };
-    let mut result = [0u16; 32];
-    let mut length = 0;
-    for byte in prefix {
-        result[length] = *byte as u16;
-        length += 1;
-    }
-    if instance_id > 1 {
-        result[length] = b'0' as u16 + instance_id as u16;
-        length += 1;
-    }
-    result[length] = 0;
-    result
-}
-
 extern "C" fn evt_file_create(
-    _device: WDFDEVICE,
+    device: WDFDEVICE,
     request: WDFREQUEST,
     _file_object: WDFFILEOBJECT,
 ) {
+    let Some(state) = (unsafe { instance_from_device(device) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
+    if unsafe {
+        (*state)
+            .control_open
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    } {
+        complete_request(request, STATUS_DEVICE_BUSY);
+        return;
+    }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_SUCCESS);
     }
@@ -2167,21 +2140,23 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
             !state.adapter.is_null() && !was_suspended
         };
         drop(state_guard);
-        if !should_resume {
-            return;
+        if should_resume {
+            // WdfIoQueueStart can synchronously dispatch request handlers.
+            resume_manual_queue(read_queue);
         }
-
-        // WdfIoQueueStart can synchronously dispatch request handlers.
-        resume_manual_queue(read_queue);
 
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
         let state = &mut *state_guard;
-        if state.lifecycle.load(Ordering::Acquire) == INSTANCE_CLOSING && !state.adapter.is_null() {
+        if should_resume
+            && state.lifecycle.load(Ordering::Acquire) == INSTANCE_CLOSING
+            && !state.adapter.is_null()
+        {
             reopen_frame_queues(state);
             state.lifecycle.store(INSTANCE_OPEN, Ordering::Release);
         }
+        state.control_open.store(false, Ordering::Release);
     }
 }
 
@@ -2209,7 +2184,7 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
 
         let status = complete_captured_frame_to_read(request, &frame);
         if status != STATUS_SUCCESS {
-            if let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) {
+            if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
                 let state = &mut *state_guard;
                 let _ = enqueue_existing_capture_frame(state, frame);
                 drop(state_guard);
@@ -2465,7 +2440,7 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
         };
         let status = complete_captured_frame_to_read(request, &frame);
         if status != STATUS_SUCCESS {
-            if let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) {
+            if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
                 let state = &mut *state_guard;
                 let _ = enqueue_existing_capture_frame(state, frame);
             }
@@ -2561,22 +2536,6 @@ fn has_queued_injection_frame(state: &mut InstanceState) -> bool {
     }
 }
 
-fn has_queued_capture_frame(state: &mut InstanceState) -> bool {
-    let lock = state.frame_lock;
-    if lock.is_null() {
-        return false;
-    }
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let has_frame = state
-            .capture_queue
-            .as_ref()
-            .is_some_and(|queue| !queue.is_empty());
-        call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
-        has_frame
-    }
-}
-
 fn clear_frame_queues(state: &mut InstanceState) {
     let lock = state.frame_lock;
     if !lock.is_null() {
@@ -2606,23 +2565,5 @@ fn reopen_frame_queues(state: &mut InstanceState) {
             }
             call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
         }
-    }
-}
-
-fn unicode_string(buffer: &[u16]) -> UNICODE_STRING {
-    let length = buffer
-        .iter()
-        .position(|character| *character == 0)
-        .unwrap_or(buffer.len());
-    let byte_length = length * core::mem::size_of::<u16>();
-    let maximum_length = if length < buffer.len() {
-        byte_length + core::mem::size_of::<u16>()
-    } else {
-        byte_length
-    };
-    UNICODE_STRING {
-        Length: byte_length as u16,
-        MaximumLength: maximum_length as u16,
-        Buffer: buffer.as_ptr() as *mut u16,
     }
 }

@@ -11,14 +11,12 @@ PnpLockdown = 1
 %ProviderName% = Standard,NTamd64.10.0...19041,NTarm64.10.0...19041
 
 [Standard.NTamd64.10.0...19041]
-%WinTapDeviceDesc% = WinTap_Install, Root\WinTapRust
-%WinTapDeviceDesc% = WinTap_Install, Root\WinTapRust2
+%WinTapDeviceDesc% = WinTapChild_Install, WINTAPBUS\WinTapChild
 
 [Standard.NTarm64.10.0...19041]
-%WinTapDeviceDesc% = WinTap_Install, Root\WinTapRust
-%WinTapDeviceDesc% = WinTap_Install, Root\WinTapRust2
+%WinTapDeviceDesc% = WinTapChild_Install, WINTAPBUS\WinTapChild
 
-[WinTap_Install]
+[WinTapChild_Install]
 Characteristics = 0x1
 *IfType = 0x6
 *MediaType = 0x0
@@ -27,17 +25,17 @@ Characteristics = 0x1
 *ConnectionType = 1
 *DirectionType = 0
 *IfConnectorPresent = 0
-CopyFiles = WinTap_CopyFiles
-AddReg = WinTap_AddReg
+CopyFiles = WinTapChild_CopyFiles
+AddReg = WinTapChild_AddReg
 
-[WinTap_Install.Services]
-AddService = WinTapRust, 2, WinTap_Service
+[WinTapChild_Install.Services]
+AddService = WinTapChild, 2, WinTapChild_Service
 
-[WinTap_CopyFiles]
+[WinTapChild_CopyFiles]
 wintap_netadaptercx_driver.sys
 
 [DestinationDirs]
-WinTap_CopyFiles = 13
+WinTapChild_CopyFiles = 13
 
 [SourceDisksNames]
 1 = %DiskName%,,
@@ -45,22 +43,22 @@ WinTap_CopyFiles = 13
 [SourceDisksFiles]
 wintap_netadaptercx_driver.sys = 1
 
-[WinTap_Service]
-DisplayName = %WinTapServiceDesc%
+[WinTapChild_Service]
+DisplayName = %WinTapChildServiceDesc%
 ServiceType = 1
 StartType = 3
 ErrorControl = 1
 ServiceBinary = %13%\wintap_netadaptercx_driver.sys
 LoadOrderGroup = NDIS
 
-[WinTap_AddReg]
-HKR, Ndi, Service, 0, "WinTapRust"
+[WinTapChild_AddReg]
+HKR,,Security,,"D:P(A;;GA;;;BA)"
+HKR, Ndi, Service, 0, "WinTapChild"
 HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
 HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
-HKR, , NetworkAddress, 0, "02-57-54-41-50-01"
 
 [Strings]
 ProviderName = "WinTapRust contributors"
-DiskName = "WinTapRust installation media"
-WinTapDeviceDesc = "WinTapRust Virtual Ethernet Adapter"
-WinTapServiceDesc = "WinTapRust Driver"
+DiskName = "WinTap child installation media"
+WinTapDeviceDesc = "WinTap dynamic Virtual Ethernet Adapter"
+WinTapChildServiceDesc = "WinTap TAP Child Driver"

@@ -1,9 +1,8 @@
 # WinTapNetAdapterCx Validation Specification
 
 **Workflow:** `/evolve`  
-**Phase:** Phase 8 — Create Deliverable
-**Status:** REQ-021 implementation and validation changes approved and
-delivered
+**Phase:** Phase 2 — Specification Changes
+**Status:** Dynamic-bus validation changes proposed; awaiting approval
 **Trace source:** `specs/requirements.md` and `specs/design.md`
 
 ## Acceptance criteria
@@ -17,22 +16,30 @@ delivered
 | VAL-005 | REQ-005 | Verify non-administrator open/control attempts fail; verify malformed nonzero lengths complete with error 87 and invalid I/O requests cannot corrupt memory or disclose data. |
 | VAL-006 | REQ-006 | Run the complete build, install, packet-path, concurrency, cancellation, power, malformed-input, and cleanup suite with Driver Verifier-compatible settings. |
 | VAL-007 | REQ-007 | Configure and build from a clean environment with CMake and the Visual Studio generator for x64 and ARM64; verify NuGet WDK/SDK dependencies resolve reproducibly and missing prerequisites fail at configuration. |
-| VAL-008 | REQ-008 | Run the complete privileged ICMP Echo Request/Echo Reply round trip through the Ethernet/TAP handle using `192.0.2.1/30` and `192.0.2.2`; verify packet fields, checksums, stack completion, timeout behavior, and cleanup. |
+| VAL-008 | REQ-008, REQ-029, REQ-030 | Create one test GUID child through the manager and run the complete privileged ICMP Echo Request/Echo Reply round trip through its discovered Ethernet/TAP interface using `192.0.2.1/30` and `192.0.2.2`; verify packet fields, checksums, stack completion, timeout behavior, and cleanup. |
 | VAL-009 | REQ-009 | Execute the full REQ-008, REQ-015, and REQ-016 assertion sets in a GitHub-hosted Windows job and manually in a Hyper-V-capable Windows VM using the same entry points; fail on unavailable privileged operations rather than skipping. |
 | VAL-010 | REQ-010 | Build the Rust driver and generated NetAdapterCx bindings from a clean pinned environment for x64 and ARM64; verify binding regeneration, ABI/layout checks, panic-abort configuration, and package production. |
 | VAL-011 | REQ-011 | Verify the repository, CMake targets, workflow, harness, and package validation contain no C/C++ driver source, project, INF, fallback, or selector. |
-| VAL-012 | REQ-012 | Build each package and verify `wintap_netadaptercx_driver.inf`, `wintap_netadaptercx_driver.cat`, service `WinTapRust`, and hardware IDs `ROOT\WinTapRust` and `ROOT\WinTapRust2`. |
+| VAL-012 | REQ-033 | Build each package and verify separate bus and child services, their intended parent/child identities, and the absence of supported legacy root runtime identities. |
 | VAL-013 | REQ-013 | Load the test-signed Rust package with NetAdapterCx verifier enabled; verify directed, broadcast, multicast, all-multicast, and promiscuous capability initialization with a nonzero multicast capacity does not trigger `0x19E/0xB`, and TCP/IP binds successfully. |
 | VAL-014 | REQ-014 | Verify the harness captures native overlapped-I/O errors within its C# wrappers and reports pending and cancelled requests accurately. |
-| VAL-015 | REQ-015 | In a clean elevated environment, provision two WinTap adapters, verify their identity and independently exclusive TAP handles, install reciprocal IPv4/IPv6 host routes and static neighbors, relay frames in both directions, and verify unbound IPv4 ICMP and IPv6 ICMPv6 round trips plus complete cleanup. |
+| VAL-015 | REQ-015, REQ-029, REQ-030 | In a clean elevated environment, create two GUID-keyed children through the manager, discover their distinct TAP interfaces, verify independent exclusive handles, install reciprocal IPv4/IPv6 routes and static neighbors, relay frames in both directions, and verify complete removal. |
 | VAL-016 | REQ-016 | With a destination TAP read already pending, inject a routed request into that destination and fail if the destination's reverse-direction TAP read returns the byte-identical injected request. Record/rearm unrelated traffic; accept only a validated stack-originated reply for the round trip. Exercise notification arming across owner close/reopen, RX ring-capacity boundaries, cancellation, and teardown under NetAdapterCx verifier without a bugcheck or ownership violation. |
-| VAL-017 | REQ-017 | Run the two-TAP switch with the two existing static endpoints; verify source MAC/VLAN learning, known-unicast forwarding, unknown-unicast/broadcast/multicast flooding to only the peer, immediate source movement, no source reflection, and fixed 4,096-entry full-table preservation behavior. |
+| VAL-017 | REQ-017, REQ-036 | Run the two-TAP switch with two GUID-selected dynamic endpoints; verify source MAC/VLAN learning, known-unicast forwarding, peer-only flooding, immediate source movement, no reflection, and fixed 4,096-entry full-table preservation behavior. |
 | VAL-018 | REQ-018 | On every target OS, record I/O-ring maximum version and read/write/scatter/gather support, require successful read/write capability probes before startup, verify bounded registered buffers and operation depths, and verify explicit startup failure when required support is absent. Exercise slot generations, terminal completions, cancellation, endpoint removal, and resource release ordering. |
-| VAL-019 | REQ-019 | Verify the first release discovers and opens exactly the two existing static endpoints through a collection-oriented endpoint model, and confirm the model has no dynamic provisioning or arbitrary-N behavior while preserving stable endpoint identity and teardown isolation. |
+| VAL-019 | REQ-036 | Verify GUID/interface discovery populates a selected endpoint collection without static paths or PnP-order assumptions, preserving stable identity and teardown isolation; arbitrary-N forwarding remains out of scope. |
 | VAL-020 | REQ-020 | Verify one positive even shared depth is split equally between both endpoints, completion metadata uniquely represents every allocated slot and operation state, and startup fails explicitly for zero, odd, overflowed, unrepresentable, unallocatable, unsupported, or unregistered depths without silently reducing the request. |
 | VAL-021 | REQ-021 | Verify valid writes are captured and completed entirely in the write callback without entering a WDF write queue or scheduling a write work item; verify callback execution level, nonpaged allocation, queue ownership, notification reentrancy, teardown synchronization, and explicit initialization failure when the required inline contract is unavailable. |
 | VAL-022 | REQ-024 | Verify passive-level TX callbacks deliver complete frames directly to compatible pending READ IRPs before returning ring entries; verify elevated-level callbacks use nonpaged capture and passive deferred completion, no TX entry is held indefinitely, too-small reads preserve frame ownership, and cancellation/teardown complete each request exactly once. |
 | VAL-023 | REQ-025 | Verify passive READ delivery claims frame/request ownership under the state lock but performs WDF buffer access, copying, requeue, and completion only after releasing it; verify no duplicate claims across packet callbacks, `evt_io_read`, and the work item, including too-small-buffer, cancellation, stop, and teardown races. |
+| VAL-024 | REQ-026 | Install the bus and child packages; create, enumerate, and remove children; verify one bus parent and independently managed adapters per active child. |
+| VAL-025 | REQ-027 | Verify non-administrator manager requests and malformed version, length, opcode, and GUID fields fail without child-list mutation, disclosure, leak, or bugcheck. |
+| VAL-026 | REQ-028, REQ-031 | Create at least three distinct GUID children concurrently; verify one child per GUID, isolated TAP I/O, and explicit resource-exhaustion failure without partial publication. |
+| VAL-027 | REQ-029, REQ-032 | Race create, explicit remove, surprise removal, and bus teardown; verify terminal operation correlation, interface withdrawal, and exactly-once child I/O completion. |
+| VAL-028 | REQ-030 | Verify distinct GUID-correlated TAP interfaces and independent exclusive owners; reject fixed-path and ordinal-discovery assumptions. |
+| VAL-029 | REQ-033 | Verify legacy root devices are neither adopted nor bound as dynamic children; verify explicit migration/cleanup and package service selection. |
+| VAL-030 | REQ-034, REQ-035 | Verify lifecycle diagnostics omit packet data and manager restart preserves, enumerates, and reattaches active children without duplication. |
+| VAL-031 | REQ-032 | On independently created children, execute the REQ-002, REQ-013, REQ-016, REQ-021, REQ-024, and REQ-025 packet-path, IRQL, RX-ring, cancellation, power, and teardown regressions while create/remove operations occur on other children. |
 
 | Test | Coverage |
 |---|---|
@@ -43,7 +50,7 @@ delivered
 | TC-019 | Verify D0 exit/entry request, frame, callback, and work-item transitions. |
 | TC-020 | Verify an undersized pending read fails without losing the queued frame. |
 | TC-022 | Verify hosted/runtime readiness status matches the evidence actually available. |
-| TC-023 | Verify the test-signed driver loads, the intended TAP interface is uniquely identified, and `192.0.2.1/30` is assigned without an unintended default route. |
+| TC-023 | Create one test GUID child, verify its TAP interface is uniquely identified by GUID, and assign `192.0.2.1/30` without an unintended default route. |
 | TC-024 | Generate the ARP request for `192.0.2.2`, read it from the Win32 handle, validate it, write the matching ARP reply, then read and validate the resulting Ethernet/IPv4/ICMP Echo Request and checksums. |
 | TC-025 | Construct and write the matching ICMP Echo Reply, then verify the Windows networking stack reports the successful reply within the bounded timeout. |
 | TC-026 | Exercise malformed, unrelated, truncated, invalid-ARP, fragmented, mismatched, and checksum-invalid frames during the ICMP test and verify deterministic rejection or filtering. |
@@ -56,15 +63,15 @@ delivered
 | TC-036 | Install the test-signed root-enumerated adapter with NetAdapterCx verifier enabled; verify `WintapEvtPrepareHardware` succeeds without bugcheck `0x19E/0xB`, the capability structure advertises directed, broadcast, multicast, all-multicast, and promiscuous filtering with capacity 64, and TCP/IP appears in the adapter's active NDIS protocol bindings. |
 | TC-039 | Set directed, broadcast, multicast, all-multicast, and promiscuous receive-filter configurations through the Windows stack; verify the driver accepts each supported configuration and stores no more than 64 multicast addresses without corrupting active filter state. |
 | TC-037 | Build Rust x64 and ARM64 packages through CMake and verify each contains the Rust driver binary, `wintap_netadaptercx_driver.inf`, and `wintap_netadaptercx_driver.cat`. |
-| TC-038 | Install `ROOT\WinTapRust` after removing any stale C package; verify service `WinTapRust` starts and no C device or service is selected. |
+| TC-038 | Install the separate bus and child packages after identifying stale legacy root devices; verify only the intended bus and child services bind dynamic children. |
 | TC-040 | Issue an empty-queue overlapped read and verify `ReadFile` returns false with error 997; cancel it and verify `GetOverlappedResult` returns false with error 995. Repeat this error-observation path before ARP/ICMP assertions. |
 | TC-041 | Verify a 0-byte overlapped write completes as a Win32 no-op. Issue 1-byte, 13-byte, and 1515-byte overlapped writes; verify each completes with error 87, transfers no bytes, leaves no queued frame or retained pending request, and is followed by a successful valid-frame write. |
-| TC-042 | In a clean environment, use the pinned WDK DevCon tool to create `ROOT\WinTapRust` and `ROOT\WinTapRust2`; verify exactly two adapters, MAC/control-endpoint mapping, service identity, and independent exclusive opens. Verify any pre-existing matching adapter causes a non-destructive failure. |
+| TC-042 | In a clean environment, use the manager control interface to create two test GUID children; verify terminal create results, GUID/interface mapping, service identity, and independent exclusive opens. |
 | TC-043 | Assign the REQ-015 IPv4 and IPv6 test addresses, static peer neighbors, exact reciprocal `/32` and `/128` active-store routes, and run-scoped firewall rules. Verify no default route is created and the exact host routes select the opposite egress interface. |
 | TC-044 | Start an unbound IPv4 ICMP Echo to B. Verify the request is read from A, relayed to B, the reply is read from B, relayed to A, and the stack reports success with matching Ethernet/IP/ICMP identities, payload, and checksums. |
 | TC-045 | Start an unbound IPv6 ICMPv6 Echo to B. Verify the same A-to-B and B-to-A relay path, IPv6 endpoint identities, payload, and ICMPv6 pseudo-header checksum. |
 | TC-046 | Exercise malformed/truncated frames, write/read cancellation, route/neighbor/firewall/address failure, partial provisioning, timeout, and device removal. Verify both handles complete before release, only created state is removed, diagnostics persist, and primary failure is retained. |
-| TC-047 | Execute TC-042 through TC-046 using `tests\run-wintap-dual-adapter-harness.ps1` on a GitHub-hosted Windows job and a manual Hyper-V/WinDbg VM; verify shared assertions and no capability-only skip. |
+| TC-047 | Execute TC-042 through TC-046 using the manager-based dual-adapter harness on a GitHub-hosted Windows job and a manual Hyper-V/WinDbg VM; verify shared assertions and no capability-only skip. |
 | TC-048 | Pre-post a TAP read on B, relay A's valid IPv4 Echo Request into B, and fail if B's reverse-direction read returns that byte-identical request. Record/rearm unrelated frames; require B's valid Echo Reply to be relayed to A and reported successful by the unbound Ping client. Repeat for ICMPv6. |
 | TC-049 | Exercise injection while RX polling is active and while receive notification is armed. Close and reopen the TAP owner while RX remains running, then verify a later write requests a new RX advance. Send enough valid routed frames to cross at least one RX-ring capacity handoff, then cancel/stop during queued injection. Under NetAdapterCx verifier, verify packet and fragment ownership remains synchronized, no ring entry is returned twice, and no frame leaks into the TAP read path. |
 | TC-050 | With static peer neighbors installed, present valid ARP, multicast Neighbor Solicitation, unicast Neighbor Unreachability Detection Solicitation without a source link-layer option, and Duplicate Address Detection frames to each relay direction. Verify the harness validates and counts them, performs no peer write, remains free of a reflection loop, and still completes the IPv4 and IPv6 Echo tests. |
@@ -72,7 +79,7 @@ delivered
 | TC-052 | Probe I/O-ring capabilities on each target OS, verify required contiguous read/write operations before starting, record the selected version, and verify v4 scatter/gather is used only when separately supported and validated. |
 | TC-053 | Saturate configured read/write slots and the 4,096-entry FDB; verify deterministic bounded backpressure or rejection, slot-generation protection, no cross-frame corruption, and recovery after terminal completions. |
 | TC-054 | Cancel and remove either endpoint during pending reads and peer writes; verify no new reads are posted, every original completion is consumed before deregistration/close, stale generations cannot free reused slots, and cleanup preserves the primary failure. |
-| TC-055 | Verify the endpoint collection accepts the two existing static identities without provisioning additional devices, and inspect the endpoint-selection path for collection-based identity lookup rather than a two-branch-only contract. |
+| TC-055 | Verify the endpoint collection accepts two GUID-correlated interfaces created through the manager and selects by identity rather than fixed path or two-branch-only logic. |
 | TC-056 | Configure several positive even shared depths, including a value greater than 256, and verify equal per-endpoint capacity, successful allocation/registration, saturation behavior, and recovery after terminal completions. |
 | TC-057 | Exercise zero, odd, maximum-integer, arithmetic-overflow, and otherwise unrepresentable depth values; verify deterministic explicit startup errors and no partially published ring, endpoint, or buffer state. |
 | TC-058 | Force buffer allocation failure and I/O-ring depth/resource-limit failure; verify the requested depth is not clamped or wrapped, all partial resources unwind, and the primary failure is preserved. |
@@ -84,6 +91,16 @@ delivered
 | TC-064 | Race inline writes with adapter stop, owner close, cancellation, surprise removal, injection-queue close, and notification enable/disable; verify no use-after-free, double completion, retained request, stale notification, or frame leak under NetAdapterCx verifier. |
 | TC-065 | Exercise TX capture with a pending compatible READ at `PASSIVE_LEVEL`; verify direct fragment-to-output-buffer delivery and ring advancement. Repeat at elevated IRQL and verify nonpaged capture, passive work-item delivery, bounded backpressure, no indefinite ring retention, too-small-buffer retry behavior, cancellation, and teardown. |
 | TC-066 | Instrument `evt_io_read` and passive completion paths while a captured frame and READ request are available; verify ownership is claimed under the state lock, the lock is released before WDF buffer retrieval/copy/completion, too-small or failed retrieval requeues the frame under the lock, and concurrent callback/work-item/cancellation/teardown races complete exactly once. |
+| TC-067 | Install the separate bus and child packages; verify one bus parent appears, manager create produces one child PDO and one NetAdapterCx adapter per GUID, and remove returns both to absent state. |
+| TC-068 | Send manager create, remove, enumerate, and query requests as a standard user and with malformed version, opcode, length, request ID, and GUID values. Verify explicit failure before allocation or child-list mutation. |
+| TC-069 | Submit duplicate and concurrent creates for one GUID, then concurrent creates for at least three distinct GUIDs. Verify one child per GUID, stable identity, isolated interfaces, and explicit failure rather than partial publication on exhaustion. |
+| TC-070 | For one active child with pending TAP reads, writes, frames, and callbacks, request explicit remove. Verify operation correlation, rejection of duplicate lifecycle requests, exactly-once I/O terminal completion, child PDO removal, and interface withdrawal before successful remove completion. |
+| TC-071 | Trigger surprise removal and bus teardown while create or remove is pending and while independent children remain active. Verify per-GUID serialization, no cross-child teardown, primary-failure preservation, and complete cleanup. |
+| TC-072 | Open two or more GUID-correlated TAP interfaces independently, reject a second owner per interface, and verify manager restart followed by enumerate/reattach neither removes nor duplicates active children. |
+| TC-073 | Verify manager create does not report success before the child interface is observable, and remove does not report success while the child PnP instance or interface remains observable. |
+| TC-074 | Install with stale `ROOT\WinTapRust` and `ROOT\WinTapRust2` devices. Verify the bus does not adopt them; exercise explicit migration/cleanup and verify no legacy device is selected as a dynamic child. |
+| TC-075 | Capture manager and bus diagnostics across invalid requests, create failure, remove failure, surprise removal, and cleanup failure. Verify request ID, GUID, PnP state, interface identity, and primary cleanup failure are present while packet payload bytes are absent. |
+| TC-076 | Create at least three children. Exercise valid and invalid TAP I/O, receive filtering, directional isolation, notification arming, passive/elevated TX delivery, cancellation, D0 transition, and teardown on one child while creating and removing the others. Verify no cross-child frame, queue, completion, lock, or callback state. |
 
 ## Functional tests
 
@@ -108,11 +125,12 @@ delivered
    no-op; test undersized, oversized, malformed, and partially invalid
    requests; verify invalid nonzero write lengths complete with error 87,
    transfer no bytes, and cause no state damage.
-8. **Routed dual-adapter relay:** provision two clean root-enumerated
-   adapters, relay complete frames between their independent TAP handles, and
-   verify IPv4 and IPv6 stack round trips use the configured adapter routes
-   rather than loopback. With permanent neighbors, validate/count and suppress
-   ARP and IPv6 Neighbor Discovery rather than relaying those control frames.
+8. **Routed dual-adapter relay:** create two clean GUID-keyed children through
+   the manager, relay complete frames between their independently discovered
+   TAP interfaces, and verify IPv4 and IPv6 stack round trips use the
+   configured adapter routes rather than loopback. With permanent neighbors,
+   validate/count and suppress ARP and IPv6 Neighbor Discovery rather than
+   relaying those control frames.
 
 ## Lifecycle and concurrency tests
 
@@ -178,17 +196,17 @@ cancellation, and successful overlapped writes. REQ-008 remains implemented
 through that harness.
 
 The dedicated REQ-015 entry point is
-`tests/run-wintap-dual-adapter-harness.ps1`. It shall resolve `devcon.exe`
-from the pinned WDK package, create both root devices, map their identities to
-the two control endpoints, configure the routed IPv4/IPv6 topology, run the
-bidirectional relay, preserve diagnostics, and clean up its devices and any
-driver package it added.
+`tests/run-wintap-dual-adapter-harness.ps1`. It shall use the administrator
+manager interface to create two test GUID children, map their returned GUIDs
+to distinct TAP interfaces, configure the routed IPv4/IPv6 topology, run the
+bidirectional relay, preserve diagnostics, and remove only the children and
+package state it created.
 
-The first-release switch validation uses the same two statically defined
-control endpoints but a collection-oriented endpoint model. It must not add
-dynamic PnP provisioning, arbitrary-N forwarding, or an overlapped-I/O
-fallback. Its I/O-ring capability and completion tests are separate from the
-existing driver overlapped-I/O harness.
+The first-release switch validation uses two manager-created GUID-correlated
+interfaces through a collection-oriented endpoint model. It does not add
+arbitrary-N forwarding or an overlapped-I/O fallback. Its I/O-ring capability
+and completion tests are separate from the existing driver overlapped-I/O
+harness.
 
 The implementation shall use CMake 3.25 or later and a supported Visual
 Studio generator. The repository presets target Visual Studio 18 2026; hosted

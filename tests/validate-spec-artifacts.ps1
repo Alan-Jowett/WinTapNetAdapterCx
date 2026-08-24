@@ -8,10 +8,14 @@ $required = @(
     "specs\current-status.md",
     "CMakeLists.txt",
     "CMakePresets.json",
+    "crates\wintap-bus-driver\wintap_bus_driver.inx",
+    "crates\wintap-bus-driver\src\lib.rs",
     "crates\wintap-netadaptercx-driver\wintap_netadaptercx_driver.inx",
     "crates\wintap-netadaptercx-driver\src\lib.rs",
     "tests\run-wintap-harness.ps1",
     "tests\run-wintap-dual-adapter-harness.ps1",
+    "tests\wintap-bus-manager.psm1",
+    "scripts\migrate-wintap-legacy.ps1",
     "tests\validate-package.ps1",
     "scripts\prepare-wdk-tools.ps1",
     "scripts\build-rust-driver.ps1"
@@ -41,7 +45,8 @@ if ($harness -notmatch 'CreateFile' -or
 
 $dualHarness = Get-Content -Raw tests\run-wintap-dual-adapter-harness.ps1
 if ($dualHarness -notmatch 'devcon.exe' -or
-    $dualHarness -notmatch 'ROOT\\WinTapRust2' -or
+    $dualHarness -notmatch 'New-WinTapBusChild' -or
+    $dualHarness -notmatch 'Remove-WinTapBusChild' -or
     $dualHarness -notmatch 'New-NetNeighbor' -or
     $dualHarness -notmatch 'New-NetRoute' -or
     $dualHarness -notmatch 'ICMPv6' -or
@@ -59,6 +64,15 @@ if ($dualHarness -notmatch 'devcon.exe' -or
     $dualHarness -notmatch 'ControlFrames' -or
     $dualHarness -notmatch '(?s)if \(\$script:PnpRemovalConfirmed\) \{.*?/delete-driver') {
     throw "The routed dual-adapter harness is incomplete."
+}
+
+$busSource = Get-Content -Raw crates\wintap-bus-driver\src\lib.rs
+if ($busSource -notmatch 'WdfFdoInitSetDefaultChildListConfig' -or
+    $busSource -notmatch 'WdfPdoInitAssignDeviceID' -or
+    $busSource -notmatch 'WdfChildListAddOrUpdateChildDescriptionAsPresent' -or
+    $busSource -notmatch 'WdfChildListUpdateChildDescriptionAsMissing' -or
+    $busSource -notmatch 'MANAGER_PROTOCOL_VERSION') {
+    throw "The dynamic KMDF bus implementation is incomplete."
 }
 
 $source = Get-Content -Raw crates\wintap-netadaptercx-driver\src\lib.rs

@@ -3,6 +3,7 @@ members = [
     "crates/netadaptercx-sys",
     "crates/wdk-sys",
     "crates/wintap-wdk-bootstrap",
+    "crates/wintap-bus-driver",
     "crates/wintap-netadaptercx-driver",
     "crates/wintap-switch-core",
     "crates/wintap-switch",

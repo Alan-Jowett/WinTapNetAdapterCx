@@ -11,8 +11,8 @@ mod windows_runtime {
     use std::time::{Duration, Instant};
 
     use wintap_switch_core::{
-        select_io_ring_version, BufferPool, EndpointId, ForwardingError, IoRingCapabilities,
-        IoRingVersion, Switch, FRAME_MAXIMUM,
+        BufferPool, EndpointId, FRAME_MAXIMUM, ForwardingError, IoRingCapabilities, IoRingVersion,
+        Switch, select_io_ring_version,
     };
 
     type Handle = *mut core::ffi::c_void;
@@ -187,7 +187,13 @@ mod windows_runtime {
 
     struct Endpoint {
         id: EndpointId,
+        guid: String,
         handle: Handle,
+    }
+
+    struct EndpointConfig {
+        guid: String,
+        interface_path: String,
     }
 
     impl Drop for Endpoint {
@@ -332,7 +338,11 @@ mod windows_runtime {
     }
 
     impl Runtime {
-        fn start(total_depth: usize, stats_enabled: bool) -> Result<Self, String> {
+        fn start(
+            total_depth: usize,
+            stats_enabled: bool,
+            endpoint_configs: [EndpointConfig; ENDPOINT_COUNT],
+        ) -> Result<Self, String> {
             if total_depth == 0 || total_depth % ENDPOINT_COUNT != 0 {
                 return Err("read depth must be a positive even value".to_string());
             }
@@ -347,16 +357,23 @@ mod windows_runtime {
                 .map_err(|_| "read depth exceeds I/O-ring limits".to_string())?;
             let maximum_version = query_capabilities()?;
 
+            let [first, second] = endpoint_configs;
             let endpoints = [
                 Endpoint {
                     id: EndpointId::new(1),
-                    handle: open_endpoint(r"\\.\WinTapRust")?,
+                    handle: open_endpoint(&first.interface_path)?,
+                    guid: first.guid,
                 },
                 Endpoint {
                     id: EndpointId::new(2),
-                    handle: open_endpoint(r"\\.\WinTapRust2")?,
+                    handle: open_endpoint(&second.interface_path)?,
+                    guid: second.guid,
                 },
             ];
+            eprintln!(
+                "selected dynamic endpoints: {}={:?} {}={:?}",
+                endpoints[0].guid, endpoints[0].id, endpoints[1].guid, endpoints[1].id,
+            );
             let flags = IoRingCreateFlags {
                 required: 0,
                 advisory: 0,
@@ -687,7 +704,9 @@ mod windows_runtime {
         }
 
         fn run_until_stopped(&mut self) -> Result<(), String> {
-            let mut switch = Switch::static_pair();
+            let mut switch =
+                Switch::from_endpoints(self.endpoints.iter().map(|endpoint| endpoint.id))
+                    .map_err(|error| format!("selected endpoint collection: {error:?}"))?;
             loop {
                 if STOP_REQUESTED.load(Ordering::SeqCst) {
                     self.stats.report(true);
@@ -1038,10 +1057,34 @@ mod windows_runtime {
         }
     }
 
-    fn parse_arguments() -> Result<(usize, bool), String> {
+    fn is_guid(value: &str) -> bool {
+        value.len() == 36
+            && value.bytes().enumerate().all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            })
+    }
+
+    fn parse_endpoint(value: String) -> Result<EndpointConfig, String> {
+        let (guid, interface_path) = value
+            .split_once('=')
+            .ok_or_else(|| "--endpoint must be <GUID>=<device-interface-path>".to_string())?;
+        if !is_guid(guid) || !interface_path.starts_with(r"\\?\") {
+            return Err(format!(
+                "invalid dynamic endpoint '{value}'; use <GUID>=\\\\?\\device-interface-path"
+            ));
+        }
+        Ok(EndpointConfig {
+            guid: guid.to_ascii_lowercase(),
+            interface_path: interface_path.to_string(),
+        })
+    }
+
+    fn parse_arguments() -> Result<(usize, bool, [EndpointConfig; ENDPOINT_COUNT]), String> {
         let mut args = env::args().skip(1);
         let mut read_depth = DEFAULT_READ_DEPTH;
         let mut stats_enabled = false;
+        let mut endpoints = Vec::with_capacity(ENDPOINT_COUNT);
         while let Some(argument) = args.next() {
             if argument == "--read-depth" {
                 let value = args
@@ -1052,24 +1095,49 @@ mod windows_runtime {
                     .map_err(|_| format!("invalid read depth '{value}'"))?;
             } else if argument == "--stats" {
                 stats_enabled = true;
+            } else if argument == "--endpoint" {
+                let value = args.next().ok_or_else(|| {
+                    "--endpoint requires <GUID>=<device-interface-path>".to_string()
+                })?;
+                let endpoint = parse_endpoint(value)?;
+                if endpoints.iter().any(|existing: &EndpointConfig| {
+                    existing.guid == endpoint.guid
+                        || existing.interface_path == endpoint.interface_path
+                }) {
+                    return Err("duplicate dynamic endpoint GUID or interface path".to_string());
+                }
+                endpoints.push(endpoint);
             } else if argument == "--help" || argument == "-h" {
-                println!("Usage: wintap-switch.exe [--read-depth <positive even total>] [--stats]");
+                println!(
+                    "Usage: wintap-switch.exe --endpoint <GUID>=<interface> --endpoint <GUID>=<interface> [--read-depth <positive even total>] [--stats]"
+                );
                 println!("Default read depth: {DEFAULT_READ_DEPTH}");
                 println!("--stats reports I/O-ring batching counters every 5 seconds");
+                println!(
+                    "Pass manager-returned GUID/interface pairs; fixed DOS paths are not supported."
+                );
                 std::process::exit(0);
             } else {
                 return Err(format!("unknown argument '{argument}'"));
             }
         }
-        Ok((read_depth, stats_enabled))
+        let endpoints: [EndpointConfig; ENDPOINT_COUNT] = endpoints
+            .try_into()
+            .map_err(|entries: Vec<EndpointConfig>| {
+                format!(
+                    "exactly {ENDPOINT_COUNT} GUID-correlated --endpoint values are required; got {}",
+                    entries.len()
+                )
+            })?;
+        Ok((read_depth, stats_enabled, endpoints))
     }
 
     pub fn run() -> Result<(), String> {
-        let (read_depth, stats_enabled) = parse_arguments()?;
+        let (read_depth, stats_enabled, endpoints) = parse_arguments()?;
         if unsafe { SetConsoleCtrlHandler(Some(console_handler), 1) } == 0 {
             return Err("SetConsoleCtrlHandler failed".to_string());
         }
-        let result = Runtime::start(read_depth, stats_enabled)?.run();
+        let result = Runtime::start(read_depth, stats_enabled, endpoints)?.run();
         unsafe {
             SetConsoleCtrlHandler(Some(console_handler), 0);
         }
