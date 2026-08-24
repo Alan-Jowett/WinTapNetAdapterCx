@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 WinTapNetAdapterCx contributors
+
+set -eu
+repo_root=$(git rev-parse --show-toplevel)
+if command -v pwsh >/dev/null 2>&1; then
+    pwsh -NoProfile -File "$repo_root/scripts/check-spdx-headers.ps1" -Staged
+else
+    powershell.exe -NoProfile -File "$repo_root/scripts/check-spdx-headers.ps1" -Staged
+fi

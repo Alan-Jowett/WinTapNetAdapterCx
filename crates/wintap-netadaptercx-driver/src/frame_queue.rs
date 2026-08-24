@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 WinTapNetAdapterCx contributors
 extern crate alloc;
 
 use alloc::{collections::VecDeque, vec::Vec};

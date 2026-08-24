@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 WinTapNetAdapterCx contributors
 param(
     [ValidateSet("x64", "ARM64")]
     [string]$Architecture = "x64",

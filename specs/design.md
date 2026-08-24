@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: MIT
+  Copyright (c) 2026 WinTapNetAdapterCx contributors -->
+
 # WinTapNetAdapterCx Design Specification
 
 **Workflow:** `/evolve`  
@@ -19,6 +22,46 @@
   endpoints without imposing a static-root identity.
 - Protocol tests exercise the existing Ethernet/TAP boundary and do not add
   an IP/TUN mode or test-only driver path.
+
+## SPDX header policy and enforcement
+
+All governed repository text files carry `SPDX-License-Identifier: MIT` in a
+comment syntax valid for the file type. The initial governed policy is:
+
+- `*.rs`, `*.c`, `*.h`, `*.cpp`, and `*.hpp`: `//`.
+- `*.ps1`, `*.psm1`, `*.psd1`, `*.sh`, `*.yml`, `*.yaml`, `*.toml`, `*.ini`,
+  `*.txt`, and `CMakeLists.txt`: `#`.
+- `*.md`: an HTML comment.
+- `*.inx`: `;`.
+- `.gitignore`, `.gitattributes`, and other hash-comment metadata:
+  `#`.
+
+`Cargo.lock` is governed as TOML-like metadata. `CMakePresets.json` and
+other strict JSON files are explicit exclusions because JSON comments are not
+semantically valid. `LICENSE`, binary files, and generated outputs are
+explicit exclusions unless a future policy entry defines a safe syntax.
+Shebangs, encoding declarations, and YAML front matter remain in their
+required positions, with the SPDX header placed immediately after those
+preambles.
+
+The validator has full-tree and staged modes. Full-tree mode enumerates all
+tracked governed files; staged mode examines added, copied, renamed, and
+modified index entries. Both modes fail closed for absent, malformed,
+wrong-syntax, or misplaced headers and use the same policy data locally and
+in CI.
+
+The exact governed extension and path rules, together with the exclusion
+manifest, are version-controlled beside the validator. New text file types
+are governed by default when a safe comment form is defined; adding an
+exclusion requires a documented policy-manifest change and review.
+
+The staged validator runs from a local pre-commit hook and rejects the commit
+before creation when any staged governed file fails. This local control can
+be bypassed and is not the remote authority. CI runs full-tree validation on
+pull requests and protected-branch pushes, exposes the stable required check
+name `SPDX headers`, and branch protection requires that check before merge.
+Thus a commit may exist remotely only when the push or pull-request policy
+accepts it; a bypassed local hook cannot bypass remote rejection.
 
 ## Build and dependency design
 

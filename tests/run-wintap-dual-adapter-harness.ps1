@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 WinTapNetAdapterCx contributors
 <#
 .SYNOPSIS
 Runs the REQ-015/REQ-016 routed dual-adapter WinTap relay test.

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 WinTapNetAdapterCx contributors
 [package]
 name = "wintap-netadaptercx-driver"
 version = "0.1.0"

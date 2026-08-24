@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 WinTapNetAdapterCx contributors
 #![cfg_attr(not(windows), allow(dead_code))]
 
 #[cfg(windows)]

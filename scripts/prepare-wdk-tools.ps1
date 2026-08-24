@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 WinTapNetAdapterCx contributors
 param(
     [Parameter(Mandatory = $true)]
     [string]$WdkVersion,

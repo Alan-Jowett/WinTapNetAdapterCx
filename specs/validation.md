@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: MIT
+  Copyright (c) 2026 WinTapNetAdapterCx contributors -->
+
 # WinTapNetAdapterCx Validation Specification
 
 **Workflow:** `/evolve`  
@@ -40,6 +43,10 @@
 | VAL-029 | REQ-033 | Verify legacy root devices are neither adopted nor bound as dynamic children; verify explicit migration/cleanup and package service selection. |
 | VAL-030 | REQ-034, REQ-035 | Verify lifecycle diagnostics omit packet data and manager restart preserves, enumerates, and reattaches active children without duplication. |
 | VAL-031 | REQ-032 | On independently created children, execute the REQ-002, REQ-013, REQ-016, REQ-021, REQ-024, and REQ-025 packet-path, IRQL, RX-ring, cancellation, power, and teardown regressions while create/remove operations occur on other children. |
+| VAL-032 | REQ-037, REQ-038, REQ-039, REQ-042, REQ-044 | Run SPDX validation in full-tree and staged modes over the exact governed extension/path policy. Verify valid source, script, metadata, Markdown, INX, shebang, encoding, and front-matter cases pass; missing, malformed, misplaced, wrong-syntax, and newly introduced governed extensions fail; verify exclusions are explicit, version-controlled, and diagnosed. |
+| VAL-033 | REQ-040, REQ-044 | Invoke the pre-commit hook with compliant and noncompliant staged files. Verify compliant commits proceed and noncompliant commits are rejected before commit creation, including partial staging and renames. |
+| VAL-034 | REQ-041, REQ-044 | Run CI with a missing or malformed governed-file header in a pull request and protected-branch push context. Verify the stable required `SPDX headers` check fails and merge eligibility/update acceptance is rejected; verify a compliant baseline passes. |
+| VAL-035 | REQ-043 | Review contributor documentation and validator diagnostics. Verify every supported file category has an example, the exclusion policy is explicit, and remediation identifies the expected header form. |
 
 | Test | Coverage |
 |---|---|
@@ -101,6 +108,14 @@
 | TC-074 | Install with stale `ROOT\WinTapRust` and `ROOT\WinTapRust2` devices. Verify the bus does not adopt them; exercise explicit migration/cleanup and verify no legacy device is selected as a dynamic child. |
 | TC-075 | Capture manager and bus diagnostics across invalid requests, create failure, remove failure, surprise removal, and cleanup failure. Verify request ID, GUID, PnP state, interface identity, and primary cleanup failure are present while packet payload bytes are absent. |
 | TC-076 | Create at least three children. Exercise valid and invalid TAP I/O, receive filtering, directional isolation, notification arming, passive/elevated TX delivery, cancellation, D0 transition, and teardown on one child while creating and removing the others. Verify no cross-child frame, queue, completion, lock, or callback state. |
+| TC-077 | For every tracked governed file, verify the policy-approved SPDX expression is present with the correct comment syntax: `MIT` for repository-owned files and `MIT OR Apache-2.0` for the documented vendored WDK bindings. Verify no governed file is missing its assigned identifier. |
+| TC-078 | Validate files with shebangs, encoding declarations, YAML front matter, and comment-sensitive preambles. Verify headers preserve interpreter behavior and front-matter parsing. |
+| TC-079 | Run full-tree and staged validation against missing, malformed, wrong-language, misplaced, deleted, renamed, and newly added governed files. Verify each failure is nonzero and diagnostic. |
+| TC-080 | Stage a compliant file and a file with its SPDX header removed. Invoke the pre-commit hook and verify only the compliant commit succeeds; verify the hook checks the index rather than an unrelated working-tree version. |
+| TC-081 | Execute CI with a deliberately noncompliant governed file in pull-request and protected-branch push contexts. Verify the required SPDX job fails and the compliant baseline passes. |
+| TC-082 | Present binary and generated files covered by the exclusion list. Verify exclusions are explicit, reported, and cannot cause source or configuration files to be skipped. |
+| TC-083 | Verify contributor documentation states the MIT policy, supported comment forms, preamble rules, local hook usage, CI behavior, and the process for requesting a justified exclusion. |
+| TC-084 | Add governed files in every repository directory and supported extension family. Verify full-tree, staged, pre-commit, and CI paths apply one consistent policy without directory-specific bypasses. |
 
 ## Functional tests
 
