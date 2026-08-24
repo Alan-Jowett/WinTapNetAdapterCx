@@ -20,7 +20,7 @@ $hashExtensions = @(".ps1", ".psm1", ".sh", ".yml", ".yaml", ".toml", ".ini", ".
 $semicolonExtensions = @(".inx")
 $markdownExtensions = @(".md")
 $specialHashFiles = @(".gitignore", ".gitattributes", "CMakeLists.txt", "Cargo.lock")
-$specialHashFiles += "hooks/pre-commit"
+$specialHashFiles += @("hooks/pre-commit", "crates/wdk-sys/Cargo.toml.orig")
 $explicitExclusions = @("CMakePresets.json", "LICENSE")
 
 function Get-Policy([string]$Path) {
@@ -30,7 +30,9 @@ function Get-Policy([string]$Path) {
         return "excluded"
     }
     if ($slashExtensions -contains $extension) { return "slash" }
-    if ($hashExtensions -contains $extension -or $specialHashFiles -contains $name) { return "hash" }
+    if ($hashExtensions -contains $extension -or
+        $specialHashFiles -contains $name -or
+        $specialHashFiles -contains $Path.Replace("\", "/")) { return "hash" }
     if ($semicolonExtensions -contains $extension) { return "semicolon" }
     if ($markdownExtensions -contains $extension) { return "markdown" }
     return $null
@@ -54,6 +56,9 @@ function Test-Header([string]$Path, [string[]]$Lines, [string]$Policy) {
 
     $index = 0
     if ($Lines.Count -gt 0 -and $Lines[0] -match "^#!") { $index = 1 }
+    if ($index -lt $Lines.Count -and $Lines[$index] -match "^#.*(?:coding|encoding)[:=]") {
+        $index++
+    }
     if ($Policy -eq "markdown" -and $index -eq 0 -and $Lines.Count -ge 1 -and $Lines[0] -eq "---") {
         $closing = [Array]::IndexOf($Lines, "---", 1)
         if ($closing -lt 0) { throw "Missing YAML front matter terminator in $Path." }
@@ -70,6 +75,12 @@ function Test-Header([string]$Path, [string[]]$Lines, [string]$Policy) {
         Write-Error "Missing or misplaced SPDX header in $Path. Expected '$expected' after required preamble."
         return $false
     }
+    if ($Policy -eq "markdown" -and
+        (($index + 1) -ge $Lines.Count -or
+         $Lines[$index + 1].TrimEnd("`r") -ne "  Copyright (c) 2026 WinTapNetAdapterCx contributors -->")) {
+        Write-Error "Malformed Markdown SPDX header in $Path. Expected the complete two-line header block."
+        return $false
+    }
     return $true
 }
 
@@ -83,6 +94,8 @@ $failed = $false
 foreach ($path in $paths) {
     $policy = Get-Policy $path
     if ($null -eq $policy -and $explicitExclusions -notcontains $path) {
+        Write-Error "Unclassified tracked file $path. Add a policy or explicit exclusion."
+        $failed = $true
         continue
     }
     if (-not (Test-Header $path (Read-File $path) $policy)) {
