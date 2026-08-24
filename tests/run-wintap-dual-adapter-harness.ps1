@@ -1789,31 +1789,6 @@ function Invoke-Cleanup {
     Invoke-CleanupAction "control handles" {
         Close-ControlHandles
     } $errors
-    foreach ($guid in @($script:CreatedChildGuids)) {
-        Invoke-CleanupAction "manager child $guid" {
-            Remove-WinTapBusChild $guid $TimeoutSeconds | Out-Null
-        } $errors
-    }
-    if ($script:BusInstalledByHarness) {
-        Invoke-CleanupAction "bus parent" {
-            Invoke-RecordedNative "remove-wintap-bus" $script:ResolvedDevCon `
-                @("remove", $busHardwareId) | Out-Null
-            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-            do {
-                if (@(Get-BusPnpDevices).Count -eq 0) {
-                    break
-                }
-                Start-Sleep -Milliseconds 250
-            } while ([DateTime]::UtcNow -lt $deadline)
-            Assert-True (@(Get-BusPnpDevices).Count -eq 0) `
-                "WinTap bus parent remains after cleanup."
-        } $errors
-    }
-    Invoke-CleanupAction "driver-store package tracking" {
-        if ($script:DriverPackageSnapshotTaken) {
-            Update-AddedDriverPackage "driver-store-cleanup"
-        }
-    } $errors
     foreach ($ruleName in @($script:CreatedFirewallRules)) {
         Invoke-CleanupAction "firewall rule $ruleName" {
             Remove-NetFirewallRule -Name $ruleName -PolicyStore ActiveStore -ErrorAction Stop
@@ -1840,6 +1815,31 @@ function Invoke-Cleanup {
                 Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
         } $errors
     }
+    foreach ($guid in @($script:CreatedChildGuids)) {
+        Invoke-CleanupAction "manager child $guid" {
+            Remove-WinTapBusChild $guid $TimeoutSeconds | Out-Null
+        } $errors
+    }
+    if ($script:BusInstalledByHarness) {
+        Invoke-CleanupAction "bus parent" {
+            Invoke-RecordedNative "remove-wintap-bus" $script:ResolvedDevCon `
+                @("remove", $busHardwareId) | Out-Null
+            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+            do {
+                if (@(Get-BusPnpDevices).Count -eq 0) {
+                    break
+                }
+                Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $deadline)
+            Assert-True (@(Get-BusPnpDevices).Count -eq 0) `
+                "WinTap bus parent remains after cleanup."
+        } $errors
+    }
+    Invoke-CleanupAction "driver-store package tracking" {
+        if ($script:DriverPackageSnapshotTaken) {
+            Update-AddedDriverPackage "driver-store-cleanup"
+        }
+    } $errors
     foreach ($instanceId in @($script:CreatedPnpInstanceIds)) {
         Invoke-CleanupAction "PnP device $instanceId" {
             Invoke-RecordedNative "remove-device-$($instanceId -replace '[\\/:*?`"<>|]', '_')" `
