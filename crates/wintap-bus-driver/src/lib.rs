@@ -224,6 +224,7 @@ struct BusDeviceContext {
 #[repr(C)]
 struct ChildPdoContext {
     bus_state: *mut BusState,
+    bus_device: WDFDEVICE,
     guid: GUID,
 }
 
@@ -342,6 +343,22 @@ unsafe fn find_child(state: *mut BusState, guid: &GUID) -> *mut ChildNode {
     core::ptr::null_mut()
 }
 
+/// The caller holds the bus state lock and does not use `node` afterward.
+unsafe fn reclaim_child(state: *mut BusState, node: *mut ChildNode) {
+    let mut link = unsafe { &mut (*state).children as *mut *mut ChildNode };
+    while !unsafe { (*link).is_null() } {
+        let current = unsafe { *link };
+        if current == node {
+            unsafe {
+                *link = (*current).next;
+                drop(Box::from_raw(current));
+            }
+            return;
+        }
+        link = unsafe { &mut (*current).next as *mut *mut ChildNode };
+    }
+}
+
 fn make_identification(guid: GUID) -> ChildIdentification {
     ChildIdentification {
         header: WDF_CHILD_IDENTIFICATION_DESCRIPTION_HEADER {
@@ -427,14 +444,41 @@ fn child_device_id(guid: &GUID) -> [u16; 64] {
     guid_text(guid, &PREFIX)
 }
 
-fn write_record(record: &mut ManagerRecord, node: &ChildNode) {
-    record.adapter_guid = node.guid;
-    record.lifecycle = node.lifecycle;
-    record.terminal_status = node.terminal_status;
-    record.request_id = node.request_id;
-    record.interface_length = node.interface_length;
-    record._padding = 0;
-    record.interface_name = node.interface_name;
+unsafe fn zero_record(record: *mut ManagerRecord) {
+    // ManagerRecord has four bytes of ABI tail padding.
+    unsafe {
+        core::ptr::write_bytes(
+            record.cast::<u8>(),
+            0,
+            core::mem::size_of::<ManagerRecord>(),
+        );
+    }
+}
+
+unsafe fn write_record(record: *mut ManagerRecord, node: &ChildNode) {
+    unsafe {
+        zero_record(record);
+        (*record).adapter_guid = node.guid;
+        (*record).lifecycle = node.lifecycle;
+        (*record).terminal_status = node.terminal_status;
+        (*record).request_id = node.request_id;
+        (*record).interface_length = node.interface_length;
+        (*record)._padding = 0;
+        (*record).interface_name = node.interface_name;
+    }
+}
+
+unsafe fn copy_record(record: *mut ManagerRecord, source: &ManagerRecord) {
+    unsafe {
+        zero_record(record);
+        (*record).adapter_guid = source.adapter_guid;
+        (*record).lifecycle = source.lifecycle;
+        (*record).terminal_status = source.terminal_status;
+        (*record).request_id = source.request_id;
+        (*record).interface_length = source.interface_length;
+        (*record)._padding = 0;
+        (*record).interface_name = source.interface_name;
+    }
 }
 
 fn complete(request: WDFREQUEST, status: NTSTATUS) {
@@ -778,8 +822,18 @@ extern "C" fn evt_child_list_create_device(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     unsafe {
-        (*pdo_context).bus_state = bus_state;
+        (*pdo_context).bus_state = core::ptr::null_mut();
+        (*pdo_context).bus_device = core::ptr::null_mut();
         (*pdo_context).guid = guid;
+        call_unsafe_wdf_function_binding!(
+            WdfObjectReferenceActual,
+            bus_device.cast(),
+            core::ptr::null_mut::<c_void>(),
+            0,
+            core::ptr::null::<i8>(),
+        );
+        (*pdo_context).bus_state = bus_state;
+        (*pdo_context).bus_device = bus_device;
     }
 
     unsafe {
@@ -806,7 +860,20 @@ unsafe fn mark_child_failure(state: *mut BusState, guid: &GUID, status: NTSTATUS
         unsafe {
             (*node).lifecycle = LIFECYCLE_FAILED;
             (*node).terminal_status = status;
-            (*node).pdo = core::ptr::null_mut();
+        }
+    }
+}
+
+unsafe fn reclaim_removed_child_without_pdo(state: *mut BusState, guid: &GUID) {
+    let Some(_guard) = (unsafe { BusStateGuard::acquire(state) }) else {
+        return;
+    };
+    let node = unsafe { find_child(state, guid) };
+    if !node.is_null()
+        && unsafe { (*node).lifecycle == LIFECYCLE_REMOVING && (*node).pdo.is_null() }
+    {
+        unsafe {
+            reclaim_child(state, node);
         }
     }
 }
@@ -815,31 +882,43 @@ unsafe extern "C" fn evt_child_pdo_cleanup(object: WDFOBJECT) {
     let context = unsafe {
         object_context::<ChildPdoContext>(object, &raw const CHILD_PDO_CONTEXT_TYPE_INFO)
     };
-    if context.is_null() || unsafe { (*context).bus_state.is_null() } {
+    if context.is_null() {
         return;
     }
     let state = unsafe { (*context).bus_state };
+    let bus_device = unsafe { (*context).bus_device };
     let guid = unsafe { (*context).guid };
-    let Some(_guard) = (unsafe { BusStateGuard::acquire(state) }) else {
-        return;
-    };
-    let node = unsafe { find_child(state, &guid) };
-    if node.is_null() {
-        return;
-    }
     unsafe {
-        (*node).pdo = core::ptr::null_mut();
-        (*node).interface_name = [0; MAX_INTERFACE_CHARS];
-        (*node).interface_length = 0;
-        if (*node).lifecycle == LIFECYCLE_REMOVING {
-            (*node).lifecycle = LIFECYCLE_ABSENT;
-            (*node).terminal_status = STATUS_SUCCESS;
-        } else if (*node).lifecycle == LIFECYCLE_CREATING {
-            (*node).lifecycle = LIFECYCLE_FAILED;
-            (*node).terminal_status = STATUS_UNSUCCESSFUL;
-        } else if (*node).lifecycle == LIFECYCLE_ACTIVE {
-            (*node).lifecycle = LIFECYCLE_FAILED;
-            (*node).terminal_status = STATUS_UNSUCCESSFUL;
+        (*context).bus_state = core::ptr::null_mut();
+        (*context).bus_device = core::ptr::null_mut();
+    }
+    if let Some(_guard) = unsafe { BusStateGuard::acquire(state) } {
+        let node = unsafe { find_child(state, &guid) };
+        if !node.is_null() {
+            unsafe {
+                (*node).pdo = core::ptr::null_mut();
+                (*node).interface_name = [0; MAX_INTERFACE_CHARS];
+                (*node).interface_length = 0;
+                if (*node).lifecycle == LIFECYCLE_REMOVING {
+                    reclaim_child(state, node);
+                } else if (*node).lifecycle == LIFECYCLE_CREATING
+                    || (*node).lifecycle == LIFECYCLE_ACTIVE
+                {
+                    (*node).lifecycle = LIFECYCLE_FAILED;
+                    (*node).terminal_status = STATUS_UNSUCCESSFUL;
+                }
+            }
+        }
+    }
+    if !bus_device.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfObjectDereferenceActual,
+                bus_device.cast(),
+                core::ptr::null_mut::<c_void>(),
+                0,
+                core::ptr::null::<i8>(),
+            );
         }
     }
 }
@@ -1054,7 +1133,7 @@ fn manager_create(
         let record_output = output
             .add(core::mem::size_of::<ManagerResponseHeader>())
             .cast::<ManagerRecord>();
-        record_output.write(record);
+        copy_record(record_output, &record);
         (*output.cast::<ManagerResponseHeader>()).length =
             (core::mem::size_of::<ManagerResponseHeader>() + core::mem::size_of::<ManagerRecord>())
                 as u32;
@@ -1083,6 +1162,7 @@ fn manager_remove(
             return;
         }
     };
+    let remove_without_pdo;
     {
         let Some(_guard) = (unsafe { BusStateGuard::acquire(state) }) else {
             complete(request, STATUS_DEVICE_NOT_READY);
@@ -1110,6 +1190,7 @@ fn manager_remove(
             return;
         }
         unsafe {
+            remove_without_pdo = (*node).pdo.is_null();
             (*node).lifecycle = LIFECYCLE_REMOVING;
             (*node).terminal_status = STATUS_PENDING;
             (*node).request_id = manager_request.request_id;
@@ -1127,6 +1208,10 @@ fn manager_remove(
         unsafe {
             mark_child_failure(state, &manager_request.adapter_guid, status);
         }
+    } else if remove_without_pdo {
+        unsafe {
+            reclaim_removed_child_without_pdo(state, &manager_request.adapter_guid);
+        }
     }
     let (operation_status, record) =
         unsafe { child_record_for(state, &manager_request.adapter_guid) };
@@ -1135,7 +1220,7 @@ fn manager_remove(
         let record_output = output
             .add(core::mem::size_of::<ManagerResponseHeader>())
             .cast::<ManagerRecord>();
-        record_output.write(record);
+        copy_record(record_output, &record);
         (*output.cast::<ManagerResponseHeader>()).length =
             (core::mem::size_of::<ManagerResponseHeader>() + core::mem::size_of::<ManagerRecord>())
                 as u32;
@@ -1153,7 +1238,7 @@ unsafe fn child_record_for(state: *mut BusState, guid: &GUID) -> (NTSTATUS, Mana
     };
     let node = unsafe { find_child(state, guid) };
     if node.is_null() {
-        return (STATUS_OBJECT_NAME_NOT_FOUND, empty_record());
+        return (STATUS_SUCCESS, absent_record(guid, STATUS_SUCCESS, 0));
     }
     let mut record = empty_record();
     unsafe {
@@ -1166,16 +1251,20 @@ unsafe fn child_record_for(state: *mut BusState, guid: &GUID) -> (NTSTATUS, Mana
     }
 }
 
-fn empty_record() -> ManagerRecord {
+fn absent_record(guid: &GUID, terminal_status: NTSTATUS, request_id: u64) -> ManagerRecord {
     ManagerRecord {
-        adapter_guid: GUID::default(),
+        adapter_guid: *guid,
         lifecycle: LIFECYCLE_ABSENT,
-        terminal_status: STATUS_OBJECT_NAME_NOT_FOUND,
-        request_id: 0,
+        terminal_status,
+        request_id,
         interface_length: 0,
         _padding: 0,
         interface_name: [0; MAX_INTERFACE_CHARS],
     }
+}
+
+fn empty_record() -> ManagerRecord {
+    absent_record(&GUID::default(), STATUS_OBJECT_NAME_NOT_FOUND, 0)
 }
 
 fn manager_query(
@@ -1199,10 +1288,10 @@ fn manager_query(
         unsafe { child_record_for(state, &manager_request.adapter_guid) };
     initialize_response(output, manager_request, operation_status, 1, 0);
     unsafe {
-        output
+        let record_output = output
             .add(core::mem::size_of::<ManagerResponseHeader>())
-            .cast::<ManagerRecord>()
-            .write(record);
+            .cast::<ManagerRecord>();
+        copy_record(record_output, &record);
         (*output.cast::<ManagerResponseHeader>()).length =
             (core::mem::size_of::<ManagerResponseHeader>() + core::mem::size_of::<ManagerRecord>())
                 as u32;
@@ -1250,7 +1339,7 @@ fn manager_enumerate(
                     .cast::<ManagerRecord>()
             };
             unsafe {
-                write_record(&mut *record_output, &*node);
+                write_record(record_output, &*node);
             }
             returned += 1;
         }

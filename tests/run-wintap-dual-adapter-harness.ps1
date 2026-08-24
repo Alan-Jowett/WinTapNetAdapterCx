@@ -1873,6 +1873,16 @@ function Invoke-Cleanup {
     return $errors
 }
 
+function New-WinTapBusChildTracked([Guid]$Guid, [int]$WaitSeconds) {
+    Wait-WinTapBusManager $WaitSeconds
+    $result = Invoke-WinTapBusRequest Create $Guid
+    if ($result.Status -notin @(0, 0x103)) {
+        throw "WinTap create for $Guid returned NTSTATUS 0x$('{0:X8}' -f [uint32]$result.Status)."
+    }
+    $script:CreatedChildGuids += $Guid
+    return Wait-WinTapBusChild $Guid Active $WaitSeconds
+}
+
 function Invoke-DualAdapterHarness {
     Ensure-DiagnosticsDirectory
     Write-Diagnostic "dual: start runId=$script:RunId relayIterations=$RelayIterations timeoutSeconds=$TimeoutSeconds"
@@ -1901,9 +1911,8 @@ function Invoke-DualAdapterHarness {
         @("install", $script:BusInfPath, $busHardwareId) | Out-Null
     $script:BusInstalledByHarness = $true
     Write-Diagnostic "dual: creating GUID-correlated TAP children"
-    $childA = New-WinTapBusChild $script:ChildGuidA $TimeoutSeconds
-    $childB = New-WinTapBusChild $script:ChildGuidB $TimeoutSeconds
-    $script:CreatedChildGuids = @($script:ChildGuidA, $script:ChildGuidB)
+    $childA = New-WinTapBusChildTracked $script:ChildGuidA $TimeoutSeconds
+    $childB = New-WinTapBusChildTracked $script:ChildGuidB $TimeoutSeconds
     $script:controlPathA = $childA.InterfacePath
     $script:controlPathB = $childB.InterfacePath
     Assert-True ($script:controlPathA -ne $script:controlPathB) "Manager returned duplicate TAP interface identities."

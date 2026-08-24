@@ -23,6 +23,8 @@ $busHardwareId = "ROOT\WinTapBus"
 $driverHardwareIds = @($busHardwareId, "ROOT\WinTapRust", "ROOT\WinTapRust2")
 $driverDescription = "WinTap dynamic"
 $script:IntegrationChildGuid = [Guid]::NewGuid()
+$script:IntegrationChildCreated = $false
+$script:BusInstalledByHarness = $false
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -733,6 +735,16 @@ function Test-WinTapAdapterIdentity($Adapter) {
     )
 }
 
+function New-WinTapBusChildTracked([Guid]$Guid, [int]$WaitSeconds) {
+    Wait-WinTapBusManager $WaitSeconds
+    $result = Invoke-WinTapBusRequest Create $Guid
+    if ($result.Status -notin @(0, 0x103)) {
+        throw "WinTap create for $Guid returned NTSTATUS 0x$('{0:X8}' -f [uint32]$result.Status)."
+    }
+    $script:IntegrationChildCreated = $true
+    return Wait-WinTapBusChild $Guid Active $WaitSeconds
+}
+
 function Invoke-DriverInstall {
     Assert-True (-not [string]::IsNullOrWhiteSpace($PackageDirectory)) `
         "-PackageDirectory is required with -InstallDriver."
@@ -759,8 +771,8 @@ function Invoke-DriverInstall {
     if ($result.ExitCode -ne 0) {
         throw "devcon failed with exit code $($result.ExitCode)."
     }
-    $child = New-WinTapBusChild $script:IntegrationChildGuid $TimeoutSeconds
-    $script:IntegrationChildCreated = $true
+    $script:BusInstalledByHarness = $true
+    $child = New-WinTapBusChildTracked $script:IntegrationChildGuid $TimeoutSeconds
     $script:DevicePath = $child.InterfacePath
 }
 
@@ -819,6 +831,9 @@ function Remove-TestAddress($Adapter) {
 function Invoke-IntegrationHarness {
     Ensure-DiagnosticsDirectory
     Write-Diagnostic "integration: start"
+    if (-not $InstallDriver) {
+        throw "-Integration requires -InstallDriver because it creates and owns a new WinTap bus child."
+    }
     if ($RequireTestSigning) {
         Write-Diagnostic "integration: checking test signing"
         Assert-TestSigning
@@ -966,7 +981,7 @@ if ($Integration) {
             if ($script:IntegrationChildCreated) {
                 Remove-WinTapBusChild $script:IntegrationChildGuid $TimeoutSeconds | Out-Null
             }
-            if ($InstallDriver) {
+            if ($script:BusInstalledByHarness) {
                 & $DevConPath remove $busHardwareId 2>&1 |
                     Out-File (Join-Path $DiagnosticsPath "remove-bus.txt") `
                     -Encoding utf8 -Force

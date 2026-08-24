@@ -2123,7 +2123,6 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         };
         let (was_suspended, read_queue) = {
             let state = &mut *state_guard;
-            state.control_open.store(false, Ordering::Release);
             let was_suspended = state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
             state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
             (was_suspended, state.read_queue)
@@ -2141,21 +2140,23 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
             !state.adapter.is_null() && !was_suspended
         };
         drop(state_guard);
-        if !should_resume {
-            return;
+        if should_resume {
+            // WdfIoQueueStart can synchronously dispatch request handlers.
+            resume_manual_queue(read_queue);
         }
-
-        // WdfIoQueueStart can synchronously dispatch request handlers.
-        resume_manual_queue(read_queue);
 
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
         let state = &mut *state_guard;
-        if state.lifecycle.load(Ordering::Acquire) == INSTANCE_CLOSING && !state.adapter.is_null() {
+        if should_resume
+            && state.lifecycle.load(Ordering::Acquire) == INSTANCE_CLOSING
+            && !state.adapter.is_null()
+        {
             reopen_frame_queues(state);
             state.lifecycle.store(INSTANCE_OPEN, Ordering::Release);
         }
+        state.control_open.store(false, Ordering::Release);
     }
 }
 
