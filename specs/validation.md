@@ -117,7 +117,7 @@
 | TC-082 | Present binary and generated files covered by the exclusion list. Verify exclusions are explicit, reported, and cannot cause source or configuration files to be skipped. |
 | TC-083 | Verify contributor documentation states the MIT policy, supported comment forms, preamble rules, local hook usage, CI behavior, and the process for requesting a justified exclusion. |
 | TC-084 | Add governed files in every repository directory and supported extension family. Verify full-tree, staged, pre-commit, and CI paths apply one consistent policy without directory-specific bypasses. |
-| TC-085 | Run the switch with both dynamic endpoints while forcing transient `ERROR_BUSY` I/O-ring completions. Verify bounded backoff retries the same operation no more than eight times without slot reuse, frame loss caused by premature buffer release, stale completions, or unbounded looping; verify retry exhaustion cleans up explicitly and fatal completion errors remain surfaced. |
+| TC-085 | Run the switch with both dynamic endpoints while forcing transient `ERROR_BUSY` I/O-ring completions. Verify bounded backoff retries the same operation no more than eight times without slot reuse, frame loss caused by premature buffer release, stale completions, or unbounded looping; verify retry exhaustion cancels and releases the consumed slot exactly once before shutdown, and fatal completion errors remain surfaced. |
 
 ## Functional tests
 

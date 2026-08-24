@@ -1008,5 +1008,5 @@ bounded to a finite number of attempts and fatal errors remain fail-closed.
 
 ## Specification approval gate
 
-REQ-026 through REQ-044 require approval together with their design and
+REQ-026 through REQ-045 require approval together with their design and
 validation coverage before implementation.
