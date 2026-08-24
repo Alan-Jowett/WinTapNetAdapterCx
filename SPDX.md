@@ -7,6 +7,10 @@ This repository uses the MIT SPDX identifier:
 
 `SPDX-License-Identifier: MIT`
 
+Vendored WDK binding sources retain their declared dual license:
+`SPDX-License-Identifier: MIT OR Apache-2.0`, together with the Microsoft
+copyright and `License: MIT OR Apache-2.0` notice.
+
 Governed files use comment syntax appropriate to their format:
 
 | Files | Header |
@@ -17,10 +21,12 @@ Governed files use comment syntax appropriate to their format:
 | Markdown | `<!-- SPDX-License-Identifier: MIT` followed by the copyright line and `-->` |
 
 Shebangs remain first. YAML front matter remains intact, with the Markdown
-header immediately after its closing delimiter. Strict JSON (`CMakePresets.json`),
-`LICENSE`, binary files, and generated outputs are explicit exclusions because
-comments would be invalid or the file is not source-controlled text policy
-input. The validator reports exclusions in full-tree mode.
+header immediately after its closing delimiter. Strict JSON (`CMakePresets.json`), `LICENSE`, and generated `out/*` and
+`target/*` outputs are explicit exclusions because comments would be invalid
+or the files are generated/license text. These entries, including their
+reasons, are maintained in `scripts/spdx-policy.psd1` and reported by the
+validator in full-tree mode. Binary files are excluded by their explicit
+policy entries when tracked.
 
 Install the repository hook once with:
 

@@ -14,22 +14,32 @@ if (($All -and $Staged) -or (-not $All -and -not $Staged)) {
 
 $root = (git rev-parse --show-toplevel).Trim()
 Set-Location $root
+$policyManifest = Import-PowerShellDataFile (Join-Path $root "scripts/spdx-policy.psd1")
 
 $slashExtensions = @(".rs", ".c", ".h", ".cpp", ".hpp")
-$hashExtensions = @(".ps1", ".psm1", ".sh", ".yml", ".yaml", ".toml", ".ini", ".txt")
+$hashExtensions = @(".ps1", ".psm1", ".psd1", ".sh", ".yml", ".yaml", ".toml", ".ini", ".txt")
 $semicolonExtensions = @(".inx")
 $markdownExtensions = @(".md")
 $specialHashFiles = @(".gitignore", ".gitattributes", "CMakeLists.txt", "Cargo.lock")
 $specialHashFiles += @("hooks/pre-commit", "crates/wdk-sys/Cargo.toml.orig")
-$explicitExclusions = @("CMakePresets.json", "LICENSE")
 
 function Get-Policy([string]$Path) {
     $name = [IO.Path]::GetFileName($Path)
     $extension = [IO.Path]::GetExtension($Path).ToLowerInvariant()
-    if ($explicitExclusions -contains $Path -or $explicitExclusions -contains $name) {
+    $normalizedPath = $Path.Replace("\", "/")
+    if (@($policyManifest.ExplicitExclusions | Where-Object {
+        $normalizedPath -like $_.Pattern -or $name -like $_.Pattern
+    }).Count -gt 0) {
         return "excluded"
     }
-    if ($slashExtensions -contains $extension) { return "slash" }
+    if ($slashExtensions -contains $extension) {
+        if (@($policyManifest.VendoredDualLicensePatterns | Where-Object {
+            $normalizedPath -like $_
+        }).Count -gt 0) {
+            return "slash-dual"
+        }
+        return "slash"
+    }
     if ($hashExtensions -contains $extension -or
         $specialHashFiles -contains $name -or
         $specialHashFiles -contains $Path.Replace("\", "/")) { return "hash" }
@@ -67,12 +77,19 @@ function Test-Header([string]$Path, [string[]]$Lines, [string]$Policy) {
 
     $expected = switch ($Policy) {
         "slash" { "// SPDX-License-Identifier: MIT" }
+        "slash-dual" { "// SPDX-License-Identifier: MIT OR Apache-2.0" }
         "hash" { "# SPDX-License-Identifier: MIT" }
         "semicolon" { "; SPDX-License-Identifier: MIT" }
         "markdown" { "<!-- SPDX-License-Identifier: MIT" }
     }
     if ($index -ge $Lines.Count -or $Lines[$index].TrimEnd("`r") -ne $expected) {
         Write-Error "Missing or misplaced SPDX header in $Path. Expected '$expected' after required preamble."
+        return $false
+    }
+    if ($Policy -in @("slash", "slash-dual") -and $Policy -eq "slash-dual" -and
+        (($index + 3) -ge $Lines.Count -or
+         $Lines[$index + 3].TrimEnd("`r") -ne "// License: MIT OR Apache-2.0")) {
+        Write-Error "Malformed dual-license SPDX header in $Path."
         return $false
     }
     if ($Policy -eq "markdown" -and
@@ -93,10 +110,15 @@ if ($All) {
 $failed = $false
 foreach ($path in $paths) {
     $policy = Get-Policy $path
-    if ($null -eq $policy -and $explicitExclusions -notcontains $path) {
+    if ($null -eq $policy) {
         Write-Error "Unclassified tracked file $path. Add a policy or explicit exclusion."
         $failed = $true
         continue
+    }
+    if ($All) {
+        foreach ($exclusion in $policyManifest.ExplicitExclusions) {
+            Write-Host "EXCLUDED: $($exclusion.Pattern) ($($exclusion.Reason))"
+        }
     }
     if (-not (Test-Header $path (Read-File $path) $policy)) {
         $failed = $true
