@@ -33,6 +33,7 @@ mod windows_runtime {
     const IORING_E_SUBMISSION_QUEUE_FULL: HResult = 0x8046_0002u32 as HResult;
     const HRESULT_FROM_NT_STATUS_DEVICE_BUSY: HResult = 0x9000_0011u32 as HResult;
     const HRESULT_FROM_WIN32_INVALID_USER_BUFFER: HResult = 0x8007_06F8u32 as HResult;
+    const HRESULT_FROM_WIN32_ERROR_BUSY: HResult = 0x8007_00AAu32 as HResult;
     const IORING_OP_READ: Dword = 1;
     const IORING_OP_WRITE: Dword = 5;
     const IORING_SQE_FLAG_NONE: Dword = 0;
@@ -48,6 +49,7 @@ mod windows_runtime {
     const ENDPOINT_COUNT: usize = 2;
     const DEFAULT_READ_DEPTH: usize = 128;
     const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+    const MAX_BUSY_RETRIES: u32 = 8;
     const SLOT_BITS: u32 = 31;
     const GENERATION_SHIFT: u32 = SLOT_BITS;
     const GENERATION_BITS: u32 = 32;
@@ -788,7 +790,7 @@ mod windows_runtime {
         }
 
         fn retry_busy_operation(&mut self, slot: usize) -> Result<(), String> {
-            let (handle, length, user_data, is_write, busy_retries) = {
+            let retry = {
                 let active = self.active[slot]
                     .as_mut()
                     .ok_or_else(|| format!("busy completion references inactive slot {slot}"))?;
@@ -797,16 +799,33 @@ mod windows_runtime {
                         "busy completion references inactive operation slot {slot}"
                     ));
                 }
-                active.queued = false;
-                active.submitted = false;
-                active.busy_retries = active.busy_retries.saturating_add(1);
-                (
-                    active.handle,
-                    active.length,
-                    active.user_data,
-                    active.is_write,
-                    active.busy_retries,
-                )
+                if active.busy_retries >= MAX_BUSY_RETRIES {
+                    None
+                } else {
+                    active.queued = false;
+                    active.submitted = false;
+                    active.busy_retries = active.busy_retries.saturating_add(1);
+                    Some((
+                        active.handle,
+                        active.length,
+                        active.user_data,
+                        active.is_write,
+                        active.busy_retries,
+                    ))
+                }
+            };
+            let Some((handle, length, user_data, is_write, busy_retries)) = retry else {
+                let completion = self.active[slot]
+                    .as_ref()
+                    .expect("busy retry slot remains active")
+                    .completion;
+                self.pool
+                    .cancel(completion)
+                    .map_err(|error| format!("busy retry exhaustion cleanup: {error:?}"))?;
+                self.active[slot] = None;
+                return Err(format!(
+                    "I/O-ring busy retry limit exceeded for slot {slot}"
+                ));
             };
             std::thread::sleep(busy_retry_delay(busy_retries));
             let status = if is_write {
@@ -1041,6 +1060,7 @@ mod windows_runtime {
     fn is_device_busy(status: HResult) -> bool {
         status == HRESULT_FROM_NT_STATUS_DEVICE_BUSY
             || status == HRESULT_FROM_WIN32_INVALID_USER_BUFFER
+            || status == HRESULT_FROM_WIN32_ERROR_BUSY
     }
 
     fn busy_retry_delay(retries: u32) -> Duration {

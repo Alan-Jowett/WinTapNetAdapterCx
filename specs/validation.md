@@ -43,6 +43,7 @@
 | VAL-029 | REQ-033 | Verify legacy root devices are neither adopted nor bound as dynamic children; verify explicit migration/cleanup and package service selection. |
 | VAL-030 | REQ-034, REQ-035 | Verify lifecycle diagnostics omit packet data and manager restart preserves, enumerates, and reattaches active children without duplication. |
 | VAL-031 | REQ-032 | On independently created children, execute the REQ-002, REQ-013, REQ-016, REQ-021, REQ-024, and REQ-025 packet-path, IRQL, RX-ring, cancellation, power, and teardown regressions while create/remove operations occur on other children. |
+| VAL-036 | REQ-045 | Inject or observe transient I/O-ring `ERROR_BUSY` (`0x800700AA`) read/write completions during sustained two-endpoint traffic; verify the operation is retried with its original slot, buffer, endpoint, and completion identity up to the finite retry limit, exhaustion terminates explicitly with cleanup, traffic continues through transient events, and an unrelated fatal HRESULT still terminates explicitly. |
 | VAL-032 | REQ-037, REQ-038, REQ-039, REQ-042, REQ-044 | Run SPDX validation in full-tree and staged modes over the exact governed extension/path policy. Verify valid source, script, metadata, Markdown, INX, shebang, encoding, and front-matter cases pass; missing, malformed, misplaced, wrong-syntax, and newly introduced governed extensions fail; verify exclusions are explicit, version-controlled, and diagnosed. |
 | VAL-033 | REQ-040, REQ-044 | Invoke the pre-commit hook with compliant and noncompliant staged files. Verify compliant commits proceed and noncompliant commits are rejected before commit creation, including partial staging and renames. |
 | VAL-034 | REQ-041, REQ-044 | Run CI with a missing or malformed governed-file header in a pull request and protected-branch push context. Verify the stable required `SPDX headers` check fails and merge eligibility/update acceptance is rejected; verify a compliant baseline passes. |
@@ -116,6 +117,7 @@
 | TC-082 | Present binary and generated files covered by the exclusion list. Verify exclusions are explicit, reported, and cannot cause source or configuration files to be skipped. |
 | TC-083 | Verify contributor documentation states the MIT policy, supported comment forms, preamble rules, local hook usage, CI behavior, and the process for requesting a justified exclusion. |
 | TC-084 | Add governed files in every repository directory and supported extension family. Verify full-tree, staged, pre-commit, and CI paths apply one consistent policy without directory-specific bypasses. |
+| TC-085 | Run the switch with both dynamic endpoints while forcing transient `ERROR_BUSY` I/O-ring completions. Verify bounded backoff retries the same operation no more than eight times without slot reuse, frame loss caused by premature buffer release, stale completions, or unbounded looping; verify retry exhaustion cancels and releases the consumed slot exactly once before shutdown, and fatal completion errors remain surfaced. |
 
 ## Functional tests
 

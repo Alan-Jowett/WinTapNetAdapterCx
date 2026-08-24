@@ -702,6 +702,19 @@ checks all size calculations, allocates the complete pool, configures ring
 depths, and registers every buffer before entering `Running`. Any failure
 unwinds all allocated resources and reports the primary error explicitly.
 
+An I/O-ring completion result of Win32 `ERROR_BUSY` (`HRESULT 0x800700AA`)
+is transient resource contention, equivalent to the existing device-busy
+retry cases. The runtime clears the submitted state without cancelling the
+slot, waits using the bounded exponential backoff, rebuilds the same read or
+write operation with the same completion identity and registered buffer, and
+resubmits it. The runtime permits at most eight busy retries for one
+operation; exhaustion cancels and releases the consumed slot before
+reporting an explicit error, allowing normal shutdown to complete without
+re-enqueuing that operation. The retry path shall not allocate a new slot,
+release the buffer, change the endpoint, or hide a retry-build failure. Other
+non-success completion results remain fatal and preserve the primary error
+for shutdown.
+
 Shutdown, endpoint removal, and cancellation stop new reads, submit operation
 cancellation, drain each original completion, and only then deregister buffers
 and handles or close the ring. A completion with an unknown slot, direction,
