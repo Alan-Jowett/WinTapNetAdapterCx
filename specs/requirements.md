@@ -985,12 +985,18 @@ In adaptive-polling mode:
    closure, and teardown shall cancel or complete every outstanding wait
    exactly once, without retaining user buffers, requests, frames, or stale
    notification state.
-6. The switch shall negotiate adaptive-polling mode on each endpoint before
-   using it. Following progress it may poll immediate I/O-ring completions for
-   an adaptive, configured microsecond budget. After the budget expires
-   without progress, it shall submit `WAIT_FOR_CHANGE` and block until that
-   operation completes, then resume polling. It shall not use a
-   one-completion I/O-ring wait for normal per-frame progress in this mode.
+6. The switch shall negotiate adaptive-polling mode on every selected endpoint
+   before using it. It shall enter adaptive mode only when every endpoint
+   accepts the same protocol version and flags. If an endpoint has enabled
+   adaptive mode before a selected peer fails negotiation, the switch shall
+   close every negotiating handle, allow each owner-cleanup path to restore
+   legacy state, then reopen every endpoint for all-legacy operation. It shall
+   not mix adaptive and legacy request semantics within one relay run.
+   Following progress it may poll immediate I/O-ring completions for an
+   adaptive, configured microsecond budget. After the budget expires without
+   progress, it shall submit `WAIT_FOR_CHANGE` and block until that operation
+   completes, then resume polling. It shall not use a one-completion I/O-ring
+   wait for normal per-frame progress in this mode.
 
 **Trace:** User proposal based on the CPU trace hot path
 `evt_packet_queue_advance -> WdfRequestCompleteWithInformation ->

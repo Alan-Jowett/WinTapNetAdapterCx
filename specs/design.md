@@ -803,7 +803,11 @@ The switch enables the driver-defined adaptive-polling protocol independently
 on each selected endpoint before posting adaptive I/O. If all endpoints
 negotiate the same supported protocol version, it uses adaptive polling;
 otherwise it uses the documented all-legacy fallback and does not mix models
-within one relay run. It retains one
+within one relay run. Negotiation is transactional: if any endpoint has
+entered adaptive mode before the common protocol selection fails, the switch
+closes every negotiating handle, allowing each driver's owner-cleanup path to
+cancel waits and restore legacy state, then reopens every endpoint before
+posting legacy I/O. It retains one
 overlapped `WAIT_FOR_CHANGE` operation per endpoint, separate from registered
 frame-buffer slots and normal I/O-ring completion identities. A wait result
 only grants permission to resume polling; it does not transfer a frame or

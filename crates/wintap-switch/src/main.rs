@@ -13,7 +13,7 @@ mod windows_runtime {
     use std::time::{Duration, Instant};
 
     use wintap_switch_core::{
-        ADAPTIVE_INTEREST_ALL, ADAPTIVE_INTEREST_READABLE, ADAPTIVE_INTEREST_WRITABLE,
+        ADAPTIVE_INTEREST_ALL, ADAPTIVE_INTEREST_READABLE,
         ADAPTIVE_POLLING_PROTOCOL_VERSION, AdaptiveEnableRequest, AdaptiveEnableResponse,
         AdaptiveEndpointCapability, AdaptiveWaitRequest, AdaptiveWaitResponse, BufferPool,
         EndpointId, FRAME_MAXIMUM, ForwardingError, IoRingCapabilities, IoRingVersion, Switch,
@@ -67,12 +67,16 @@ mod windows_runtime {
     const ERROR_SUCCESS: Dword = 0;
     const ERROR_INVALID_FUNCTION: Dword = 1;
     const ERROR_NOT_SUPPORTED: Dword = 50;
+    const ERROR_SHARING_VIOLATION: Dword = 32;
+    const ERROR_BUSY: Dword = 170;
     const ERROR_IO_PENDING: Dword = 997;
     const ERROR_OPERATION_ABORTED: Dword = 995;
     const ERROR_NOT_FOUND: Dword = 1168;
     const WAIT_OBJECT_0: Dword = 0;
     const WAIT_TIMEOUT_RESULT: Dword = 258;
     const WAIT_FAILED: Dword = 0xffff_ffff;
+    const CLEANUP_REOPEN_ATTEMPTS: u32 = 50;
+    const CLEANUP_REOPEN_DELAY: Duration = Duration::from_millis(10);
 
     #[repr(C)]
     struct RawIoRingCapabilities {
@@ -610,11 +614,12 @@ mod windows_runtime {
             let maximum_version = query_capabilities()?;
 
             let [first, second] = endpoint_configs;
-            let mut endpoints = open_endpoints(&first, &second)?;
+            let mut endpoints =
+                open_endpoints(&first, &second).map_err(|error| error.message())?;
             let adaptive_polling = negotiate_adaptive_polling(&mut endpoints)?;
             if !adaptive_polling {
                 drop(endpoints);
-                endpoints = open_endpoints(&first, &second)?;
+                endpoints = reopen_legacy_endpoints_after_cleanup(&first, &second)?;
             }
             eprintln!(
                 "selected dynamic endpoints: {}={:?} {}={:?}; adaptive polling={adaptive_polling}",
@@ -1091,32 +1096,20 @@ mod windows_runtime {
             Ok(())
         }
 
-        fn adaptive_interest_for_endpoint(&self, endpoint: usize) -> u32 {
-            let handle = self.endpoints[endpoint].handle;
-            let interest = self.active.iter().flatten().fold(0, |interest, active| {
-                if active.handle != handle {
-                    interest
-                } else if active.is_write {
-                    interest | ADAPTIVE_INTEREST_WRITABLE
-                } else {
-                    interest | ADAPTIVE_INTEREST_READABLE
-                }
-            });
-            if interest == 0 {
-                ADAPTIVE_INTEREST_READABLE
-            } else {
-                interest
-            }
+        fn adaptive_interest_for_endpoint(&self, _endpoint: usize) -> u32 {
+            ADAPTIVE_INTEREST_READABLE
         }
 
         fn wait_for_adaptive_change(&mut self) -> Result<bool, String> {
             let mut pending_events = [core::ptr::null_mut(); ENDPOINT_COUNT];
             let mut pending_indices = [0usize; ENDPOINT_COUNT];
             let mut pending_count = 0usize;
+            let mut immediately_ready = false;
             for endpoint in 0..ENDPOINT_COUNT {
                 let interest = self.adaptive_interest_for_endpoint(endpoint);
                 if self.submit_adaptive_wait(endpoint, interest)? {
-                    return Ok(true);
+                    immediately_ready = true;
+                    continue;
                 }
                 let wait = self.endpoints[endpoint]
                     .adaptive_wait
@@ -1127,6 +1120,11 @@ mod windows_runtime {
                     pending_indices[pending_count] = endpoint;
                     pending_count += 1;
                 }
+            }
+            if immediately_ready {
+                // Keep waits already pended on the other endpoint armed. A writable
+                // result can be immediate while the peer still needs a readable wake.
+                return Ok(true);
             }
             if pending_count == 0 {
                 return Ok(true);
@@ -1527,7 +1525,25 @@ mod windows_runtime {
         Ok(raw.max_version)
     }
 
-    fn open_endpoint(path: &str) -> Result<Handle, String> {
+    struct EndpointOpenError {
+        path: String,
+        error: Dword,
+    }
+
+    impl EndpointOpenError {
+        fn message(&self) -> String {
+            format!(
+                "CreateFileW failed for {} with Win32 error {}",
+                self.path, self.error
+            )
+        }
+
+        fn cleanup_is_pending(&self) -> bool {
+            self.error == ERROR_BUSY || self.error == ERROR_SHARING_VIOLATION
+        }
+    }
+
+    fn open_endpoint(path: &str) -> Result<Handle, EndpointOpenError> {
         let wide: Vec<u16> = OsStr::new(path)
             .encode_wide()
             .chain(std::iter::once(0))
@@ -1544,7 +1560,10 @@ mod windows_runtime {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            Err(format!("CreateFileW failed for {path}"))
+            Err(EndpointOpenError {
+                path: path.to_string(),
+                error: unsafe { GetLastError() },
+            })
         } else {
             Ok(handle)
         }
@@ -1553,7 +1572,7 @@ mod windows_runtime {
     fn open_endpoints(
         first: &EndpointConfig,
         second: &EndpointConfig,
-    ) -> Result<[Endpoint; ENDPOINT_COUNT], String> {
+    ) -> Result<[Endpoint; ENDPOINT_COUNT], EndpointOpenError> {
         Ok([
             Endpoint {
                 id: EndpointId::new(1),
@@ -1568,6 +1587,28 @@ mod windows_runtime {
                 adaptive_wait: None,
             },
         ])
+    }
+
+    fn reopen_legacy_endpoints_after_cleanup(
+        first: &EndpointConfig,
+        second: &EndpointConfig,
+    ) -> Result<[Endpoint; ENDPOINT_COUNT], String> {
+        for attempt in 0..CLEANUP_REOPEN_ATTEMPTS {
+            match open_endpoints(first, second) {
+                Ok(endpoints) => return Ok(endpoints),
+                Err(error) if error.cleanup_is_pending() => {
+                    std::thread::sleep(CLEANUP_REOPEN_DELAY);
+                }
+                Err(error) => return Err(error.message()),
+            }
+            if attempt + 1 == CLEANUP_REOPEN_ATTEMPTS {
+                break;
+            }
+        }
+        Err(format!(
+            "timed out waiting for endpoint cleanup after {} attempts",
+            CLEANUP_REOPEN_ATTEMPTS
+        ))
     }
 
     fn negotiate_adaptive_polling(
