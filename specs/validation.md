@@ -50,6 +50,7 @@
 | VAL-033 | REQ-040, REQ-044 | Invoke the pre-commit hook with compliant and noncompliant staged files. Verify compliant commits proceed and noncompliant commits are rejected before commit creation, including partial staging and renames. |
 | VAL-034 | REQ-041, REQ-044 | Run CI with a missing or malformed governed-file header in a pull request and protected-branch push context. Verify the stable required `SPDX headers` check fails and merge eligibility/update acceptance is rejected; verify a compliant baseline passes. |
 | VAL-035 | REQ-043 | Review contributor documentation and validator diagnostics. Verify every supported file category has an example, the exclusion policy is explicit, and remediation identifies the expected header form. |
+| VAL-037 | REQ-046 | Enable adaptive-polling mode on two exclusive TAP handles; verify immediate empty READ, inline busy WRITE, level-sensitive queue-change waits, bounded one-wait-per-handle behavior, legacy compatibility, adaptive switch batching, cancellation, PnP/power teardown, and no lost notification or per-frame I/O-ring wait. |
 
 | Test | Coverage |
 |---|---|
@@ -124,6 +125,10 @@
 | TC-087 | Create children with valid MTU properties of 1,500, an intermediate value, and 65,521; verify the selected value is reported and the advertised MTU, `MaximumFrameSize`, queue limits, maximum accepted frame, and maximum-plus-one rejection all match. |
 | TC-088 | Submit version-2 create requests with zero, below-minimum, above-maximum, malformed, truncated, and unsupported MTU fields; submit version-1 requests and non-create requests with nonzero `requested_mtu`; verify explicit failure before child publication and no partial child state. |
 | TC-089 | Remove and recreate a child with a different MTU; verify the new value applies, an active child has no runtime MTU mutation path, and the switch rejects a pair whose effective MTUs differ. |
+| TC-086 | Enable adaptive-polling mode on one exclusive TAP handle. Verify an empty READ completes with `STATUS_NO_MORE_ENTRIES`, an accepted WRITE completes inline, and a full injection queue returns `STATUS_DEVICE_BUSY` without retaining either request. Verify a legacy handle retains pending-READ behavior. |
+| TC-087 | For each requested readiness mask, race an empty-to-nonempty capture transition and a full-to-nonfull injection transition against `WAIT_FOR_CHANGE` registration, cancellation, and a second simultaneous wait. Verify immediate level-triggered completion when already ready, exactly one completion for the registered wait, explicit rejection of the second wait, no lost wakeup, and no stale wait after owner close. |
+| TC-088 | Run the adaptive switch on two dynamic endpoints under sustained and bursty traffic. Verify it uses zero-minimum I/O-ring submissions while making progress, polls only within its configured microsecond budget, blocks only on an overlapped `WAIT_FOR_CHANGE` request after idle, resumes after readable/writable notification, and preserves slot generation and frame forwarding ownership. Record `KeSetEvent`/`HalpInterruptSendIpi` attribution against the legacy one-completion-wait baseline as performance evidence; it is not a pass/fail threshold. |
+| TC-089 | During an outstanding adaptive `WAIT_FOR_CHANGE`, exercise cancellation, owner cleanup, D0 exit/entry, queue stop/start, surprise removal, and release hardware. Verify exactly one terminal wait completion, no request or frame leak, no use of the manual READ queue for adaptive empty READs, and safe legacy-mode purge/resume behavior. |
 
 ## Functional tests
 
@@ -279,3 +284,4 @@ TC-051 through TC-055 provide trace points for REQ-017 through REQ-019.
 TC-056 through TC-061 provide trace points for REQ-020.
 TC-062 through TC-064 provide trace points for REQ-021. TC-065 provides the
 trace point for REQ-024. TC-066 provides the trace point for REQ-025.
+TC-086 through TC-089 provide trace points for REQ-046.

@@ -17,6 +17,73 @@ pub const FRAME_MINIMUM: usize = 14;
 pub const FRAME_MAXIMUM: usize = 65_535;
 pub const FDB_CAPACITY: usize = 4096;
 pub const IO_RING_BASELINE_VERSION: u32 = 300;
+pub const TAP_IOCTL_ENABLE_ADAPTIVE_POLLING: u32 = 0x0022_2400;
+pub const TAP_IOCTL_WAIT_FOR_CHANGE: u32 = 0x0022_2404;
+pub const ADAPTIVE_POLLING_PROTOCOL_VERSION: u32 = 1;
+pub const ADAPTIVE_INTEREST_READABLE: u32 = 1;
+pub const ADAPTIVE_INTEREST_WRITABLE: u32 = 2;
+pub const ADAPTIVE_INTEREST_ALL: u32 = ADAPTIVE_INTEREST_READABLE | ADAPTIVE_INTEREST_WRITABLE;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveEnableRequest {
+    pub version: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveEnableResponse {
+    pub version: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveWaitRequest {
+    pub version: u32,
+    pub interest: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveWaitResponse {
+    pub satisfied: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveEndpointCapability {
+    Unsupported,
+    Incompatible,
+    Supported { version: u32, accepted_flags: u32 },
+}
+
+pub fn select_adaptive_polling(endpoints: &[AdaptiveEndpointCapability]) -> Option<(u32, u32)> {
+    let first = endpoints.first()?;
+    let AdaptiveEndpointCapability::Supported {
+        version,
+        accepted_flags,
+    } = *first
+    else {
+        return None;
+    };
+    if accepted_flags != ADAPTIVE_INTEREST_ALL {
+        return None;
+    }
+    if endpoints.iter().all(|endpoint| {
+        matches!(
+            endpoint,
+            AdaptiveEndpointCapability::Supported {
+                version: endpoint_version,
+                accepted_flags: endpoint_flags,
+            } if *endpoint_version == version && *endpoint_flags == accepted_flags
+        )
+    }) {
+        Some((version, accepted_flags))
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct EndpointId(u32);
@@ -491,6 +558,40 @@ mod tests {
             }),
             Ok(IoRingVersion::V3)
         );
+    }
+
+    #[test]
+    fn adaptive_polling_requires_all_endpoints_to_accept_one_protocol() {
+        let supported = AdaptiveEndpointCapability::Supported {
+            version: ADAPTIVE_POLLING_PROTOCOL_VERSION,
+            accepted_flags: ADAPTIVE_INTEREST_ALL,
+        };
+        assert_eq!(
+            select_adaptive_polling(&[supported, supported]),
+            Some((ADAPTIVE_POLLING_PROTOCOL_VERSION, ADAPTIVE_INTEREST_ALL))
+        );
+        assert_eq!(
+            select_adaptive_polling(&[supported, AdaptiveEndpointCapability::Unsupported]),
+            None
+        );
+        assert_eq!(
+            select_adaptive_polling(&[
+                supported,
+                AdaptiveEndpointCapability::Supported {
+                    version: ADAPTIVE_POLLING_PROTOCOL_VERSION + 1,
+                    accepted_flags: ADAPTIVE_INTEREST_ALL,
+                },
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn adaptive_protocol_has_stable_wire_layouts() {
+        assert_eq!(core::mem::size_of::<AdaptiveEnableRequest>(), 8);
+        assert_eq!(core::mem::size_of::<AdaptiveEnableResponse>(), 8);
+        assert_eq!(core::mem::size_of::<AdaptiveWaitRequest>(), 8);
+        assert_eq!(core::mem::size_of::<AdaptiveWaitResponse>(), 4);
     }
 
     #[test]

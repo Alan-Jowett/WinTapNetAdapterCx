@@ -319,6 +319,16 @@ same ownership transitions so a frame or request cannot be claimed twice.
 Teardown closes the capture queue before draining it and prevents new claims;
 already claimed pairs finish through the outside-the-lock completion path.
 
+Adaptive-polling mode does not retain READ requests for this direct-delivery
+path. In that mode, TX capture always copies a valid frame into the bounded
+nonpaged `capture_queue` before returning the framework-owned packet entries.
+The enqueue transition records whether the queue was empty before insertion.
+An empty-to-nonempty transition evaluates and claims a registered readable
+`WAIT_FOR_CHANGE` request; it does not access a user buffer or complete that
+request while holding the state/frame lock. This preserves the
+DISPATCH_LEVEL-safe packet callback contract while making readiness visible to
+user mode without a pending READ IRP.
+
 ## Queue state and backpressure
 
 The design shall maintain separate bounded queues for:
@@ -371,10 +381,65 @@ at its own WDF execution level. RX ring mutation is confined to
 return; a notification callback may only arm/disarm notification and request
 a subsequent advance.
 
-Pending reads are held by a WDF manual queue. WDF owns cancellation while a
-read request is queued, and synchronous queue purge owns terminal completion
-during cleanup. Valid writes are completed inline and therefore are not
-owned by a pending write queue.
+For a control handle that has not enabled adaptive-polling mode, pending reads
+are held by a WDF manual queue. WDF owns cancellation while a read request is
+queued, and synchronous queue purge owns terminal completion during cleanup.
+Valid writes are completed inline and therefore are not owned by a pending
+write queue.
+
+### Adaptive-polling control contract
+
+Adaptive-polling mode is negotiated through a versioned driver-defined control
+operation on the exclusive control handle. The enable request carries a
+version and flags, and the successful response identifies the supported
+protocol version and accepted flags. The switch must enable the mode on every
+selected endpoint before it uses the adaptive path. A failed or unsupported
+negotiation leaves the handle in its legacy mode; it must not partially alter
+READ, WRITE, queue, or cancellation semantics.
+
+The switch falls back to its existing I/O-ring pending-READ loop only when an
+endpoint reports that adaptive-polling mode is unsupported or its protocol
+version is incompatible. It reports all other negotiation failures and does
+not start a partially adaptive data plane. This fallback preserves additive
+deployment with an older driver while requiring explicit successful opt-in
+before using the new contract.
+
+The driver-defined `WAIT_FOR_CHANGE` operation has a versioned input
+containing a readable/writable interest mask and a fixed-size output containing
+the satisfied mask. It is valid only after successful mode enable. The driver
+permits at most one wait request per exclusive handle. A second request fails
+explicitly and cannot cancel, replace, or steal the registered request.
+
+The state lock protects all of the following as one transaction:
+
+1. Read the requested queue conditions.
+2. Complete the operation immediately if an interested condition is already
+   satisfied.
+3. Otherwise mark the request cancellable and publish it as the one pending
+   wait before releasing the lock.
+
+Readability is true while the capture queue is nonempty. Writability is true
+while the injection queue has capacity. A frame enqueue that observes an
+empty capture queue and a frame dequeue that observes a full injection queue
+evaluate the matching registered wait under the state lock. They claim the
+request and clear the pending-wait state under the lock, then unmark and
+complete it outside the lock. A cancellation callback uses the same lock to
+either remove the still-published request or observe that a queue transition
+already claimed it; exactly one path completes the request.
+
+When adaptive-polling mode is enabled, an empty READ completes with
+`STATUS_NO_MORE_ENTRIES`; it is never placed on the manual read queue. An
+accepted WRITE continues to complete inline, and a full injection queue
+returns `STATUS_DEVICE_BUSY`. A transition remains level-sensitive: a wait
+submitted after a queue becomes readable or writable completes immediately,
+which prevents a lost wakeup between polling and blocking.
+
+Owner close, file cleanup, D0 exit, adapter stop, surprise removal, queue
+closure, and release hardware first prevent a new wait from being published,
+then claim/cancel the published wait through the same state-lock protocol.
+They purge legacy manual READ requests only for legacy mode. Adaptive-mode
+teardown neither leaves a wait request published nor resumes a manual queue
+for an adaptive READ.
 
 The installed NetAdapterCx ring guidance verifies that a client driver owns
 `[BeginIndex, EndIndex)` and returns completed RX entries by advancing
@@ -731,6 +796,35 @@ Closed`. Capability failure transitions to `Closed` without publishing a
 partially initialized data plane. Endpoint close, device removal, owner close,
 and process shutdown all enter `Draining`, prevent new reads and writes, and
 preserve the original failure while reporting cleanup failures separately.
+
+### Adaptive-polling switch execution
+
+The switch enables the driver-defined adaptive-polling protocol independently
+on each selected endpoint before posting adaptive I/O. If all endpoints
+negotiate the same supported protocol version, it uses adaptive polling;
+otherwise it uses the documented all-legacy fallback and does not mix models
+within one relay run. It retains one
+overlapped `WAIT_FOR_CHANGE` operation per endpoint, separate from registered
+frame-buffer slots and normal I/O-ring completion identities. A wait result
+only grants permission to resume polling; it does not transfer a frame or
+buffer ownership.
+
+While the data plane makes progress, the switch submits READ and WRITE
+operations in batches with an I/O-ring minimum completion count of zero and
+drains immediately available completions. It treats the adaptive empty-READ
+status as reported by the I/O-ring completion and `ERROR_BUSY` write result as
+no-progress/backpressure outcomes, not as fatal slot failures. The affected
+slot reaches a terminal completion before it is reposted or retried according
+to the documented bounded policy.
+
+After no progress for its configured microsecond polling budget, the switch
+submits `WAIT_FOR_CHANGE` for the conditions relevant to its current reads
+and writes through an overlapped control request, then blocks on that request
+rather than on an I/O-ring completion. It resumes polling after the wait
+completes. The adaptive normal-traffic path must not issue
+`SubmitIoRing(..., 1, ...)` merely to wait for an individual packet
+completion. The switch cancels and drains its outstanding waits before
+closing endpoint handles, I/O-ring resources, or registered buffers.
 
 The endpoint collection, FDB, slot states, and pending-operation counters use
 one documented lock order. Completion callbacks do not reacquire a lock that

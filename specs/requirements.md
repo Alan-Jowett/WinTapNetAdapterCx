@@ -947,6 +947,66 @@ capability advertisement, packet validation, and switch endpoint checks shall
 remain consistent per child, and no configuration shall produce a
 `MaximumFrameSize` above 65,535 bytes.
 
+### REQ-046 — Opt-in adaptive polling and queue-change notification
+
+**Before:** The switch posts TAP READ requests that may remain pending until a
+captured frame is available, then waits for one I/O-ring completion. Completing
+an individual READ can wake the switch through the I/O-ring completion event
+path. Valid writes already complete inline, but the switch has no dedicated
+queue-change notification contract with which to choose between polling and
+blocking.
+
+**After:** The driver and switch shall support a new, explicitly negotiated
+adaptive-polling mode on an exclusively opened TAP control handle. The mode is
+additive: a client that has not successfully enabled it retains the existing
+pending-READ and normal WRITE contract.
+
+In adaptive-polling mode:
+
+1. A READ shall complete inline with one captured frame when available, or
+   `STATUS_NO_MORE_ENTRIES` when the capture queue is empty. It shall not be
+   retained in a WDF manual queue solely to await a future frame.
+2. A valid WRITE shall continue to complete inline after enqueueing its frame,
+   or return `STATUS_DEVICE_BUSY` if injection capacity is unavailable. It
+   shall not be retained solely to await capacity.
+3. The driver shall expose a versioned, cancellable `WAIT_FOR_CHANGE` control
+   operation with an interest mask for readable capture data, writable
+   injection capacity, or both. Each exclusive control handle permits at most
+   one pending wait; a second wait shall fail explicitly without replacing the
+   first. A pending wait shall complete when a requested condition becomes
+   satisfied: capture transitions empty-to-nonempty, or injection transitions
+   full-to-nonfull.
+4. Wait registration and satisfaction testing shall be level-sensitive and
+   atomic with respect to the frame-queue state. If a requested condition is
+   already true, the wait completes immediately; otherwise the request is
+   registered before releasing queue synchronization. Queue transitions claim
+   waits while synchronized and complete them after releasing locks.
+5. Cancellation, owner close, D0 exit, adapter stop, surprise removal, queue
+   closure, and teardown shall cancel or complete every outstanding wait
+   exactly once, without retaining user buffers, requests, frames, or stale
+   notification state.
+6. The switch shall negotiate adaptive-polling mode on each endpoint before
+   using it. Following progress it may poll immediate I/O-ring completions for
+   an adaptive, configured microsecond budget. After the budget expires
+   without progress, it shall submit `WAIT_FOR_CHANGE` and block until that
+   operation completes, then resume polling. It shall not use a
+   one-completion I/O-ring wait for normal per-frame progress in this mode.
+
+**Trace:** User proposal based on the CPU trace hot path
+`evt_packet_queue_advance -> WdfRequestCompleteWithInformation ->
+IopCompleteIoRingEntry -> KeSetEvent -> KiExitDispatcher ->
+HalpInterruptSendIpi`; repository evidence in `evt_io_read`,
+`evt_io_write`, `capture_transmit_packets`, `wintap-switch` I/O-ring
+submission, and `adaptive-polling-proposal.md`; extends REQ-002, REQ-003,
+REQ-005, REQ-006, REQ-018, REQ-021, REQ-024, and REQ-025.
+
+**Invariant impact:** The opted-in path replaces pending request ownership with
+explicit queue-state notification without changing frame direction, bounded
+queue ownership, or exactly-once request completion. A notification cannot be
+lost between observing no progress and registering a wait. Legacy clients
+retain their existing contract, and adaptive-mode clients cannot cause
+per-frame blocking wakeups merely by processing normal traffic.
+
 ### Dynamic-bus traceability
 
 | Requirement | Design coverage | Validation coverage |
@@ -972,7 +1032,7 @@ remain consistent per child, and no configuration shall produce a
 | REQ-043 | Contributor-facing SPDX documentation | VAL-035; TC-083 |
 | REQ-044 | Complete repository coverage | VAL-032, VAL-033, VAL-034; TC-084 |
 | REQ-045 | I/O-ring resources and completion state | VAL-036; TC-085 |
-| REQ-046 | MTU configuration and frame-size contract | VAL-038; TC-086 through TC-089 |
+| REQ-046 | MTU configuration and frame-size contract; adaptive-polling control contract and switch execution | VAL-037; VAL-038; TC-086 through TC-089 |
 
 ## Open questions requiring user decisions
 
@@ -1036,6 +1096,11 @@ remain consistent per child, and no configuration shall produce a
 27. **Resolved:** Binary files and generated outputs that cannot contain
     comments are explicit validator exclusions; source, scripts, metadata,
     specifications, and documentation are not excluded by default.
+28. **[ASSUMPTION]:** “a no model” in the `/evolve` request means a new
+    additive mode that requires both the switch and driver to opt in. The
+    existing control-handle contract remains the default.
+29. **Resolved:** Each exclusive adaptive-polling handle permits one pending
+    `WAIT_FOR_CHANGE` IOCTL; a second wait fails explicitly.
 
 ## Specification approval gate
 
