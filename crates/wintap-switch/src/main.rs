@@ -43,7 +43,8 @@ mod windows_runtime {
     const CTRL_C_EVENT: Dword = 0;
     const CTRL_CLOSE_EVENT: Dword = 2;
     const CANCEL_COMPLETION_MARKER: Ulonglong = 1_u64 << 63;
-    const COMPLETION_WAIT_MILLISECONDS: Dword = 100;
+    const DEFAULT_COMPLETION_WAIT_MILLISECONDS: Dword = 1;
+    const DEFAULT_WAIT_OPERATIONS: Dword = 32;
     const BUSY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(1);
     const BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(64);
     const ENDPOINT_COUNT: usize = 2;
@@ -238,6 +239,8 @@ mod windows_runtime {
         operations_may_be_in_flight: bool,
         submission_queue_size: usize,
         reads_per_endpoint: usize,
+        wait_operations: Dword,
+        completion_wait_milliseconds: Dword,
         stats: RuntimeStats,
     }
 
@@ -345,6 +348,8 @@ mod windows_runtime {
         fn start(
             total_depth: usize,
             stats_enabled: bool,
+            wait_operations: Dword,
+            completion_wait_milliseconds: Dword,
             endpoint_configs: [EndpointConfig; ENDPOINT_COUNT],
         ) -> Result<Self, String> {
             if total_depth == 0 || total_depth % ENDPOINT_COUNT != 0 {
@@ -352,6 +357,11 @@ mod windows_runtime {
             }
             if total_depth > SLOT_MASK as usize + 1 {
                 return Err("read depth exceeds completion identity capacity".to_string());
+            }
+            if wait_operations == 0 || wait_operations as usize > total_depth {
+                return Err(format!(
+                    "wait operations must be between 1 and read depth ({total_depth})"
+                ));
             }
             let reads_per_endpoint = total_depth / ENDPOINT_COUNT;
             let total_bytes = total_depth
@@ -497,6 +507,8 @@ mod windows_runtime {
                 operations_may_be_in_flight: false,
                 submission_queue_size: total_depth,
                 reads_per_endpoint,
+                wait_operations,
+                completion_wait_milliseconds,
                 stats: RuntimeStats::new(stats_enabled),
             };
             for slot in 0..total_depth {
@@ -568,8 +580,14 @@ mod windows_runtime {
 
         fn wait_for_completion(&self) -> Result<bool, String> {
             let mut submitted = 0;
-            let status =
-                unsafe { SubmitIoRing(self.ring, 1, COMPLETION_WAIT_MILLISECONDS, &mut submitted) };
+            let status = unsafe {
+                SubmitIoRing(
+                    self.ring,
+                    self.wait_operations,
+                    self.completion_wait_milliseconds,
+                    &mut submitted,
+                )
+            };
             if status == WAIT_TIMEOUT {
                 Ok(false)
             } else {
@@ -1102,10 +1120,13 @@ mod windows_runtime {
         })
     }
 
-    fn parse_arguments() -> Result<(usize, bool, [EndpointConfig; ENDPOINT_COUNT]), String> {
+    fn parse_arguments()
+    -> Result<(usize, bool, Dword, Dword, [EndpointConfig; ENDPOINT_COUNT]), String> {
         let mut args = env::args().skip(1);
         let mut read_depth = DEFAULT_READ_DEPTH;
         let mut stats_enabled = false;
+        let mut wait_operations = DEFAULT_WAIT_OPERATIONS;
+        let mut completion_wait_milliseconds = DEFAULT_COMPLETION_WAIT_MILLISECONDS;
         let mut endpoints = Vec::with_capacity(ENDPOINT_COUNT);
         while let Some(argument) = args.next() {
             if argument == "--read-depth" {
@@ -1117,6 +1138,20 @@ mod windows_runtime {
                     .map_err(|_| format!("invalid read depth '{value}'"))?;
             } else if argument == "--stats" {
                 stats_enabled = true;
+            } else if argument == "--wait-operations" {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--wait-operations requires a value".to_string())?;
+                wait_operations = value
+                    .parse()
+                    .map_err(|_| format!("invalid wait operations '{value}'"))?;
+            } else if argument == "--completion-timeout-ms" {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--completion-timeout-ms requires a value".to_string())?;
+                completion_wait_milliseconds = value
+                    .parse()
+                    .map_err(|_| format!("invalid completion timeout '{value}'"))?;
             } else if argument == "--endpoint" {
                 let value = args.next().ok_or_else(|| {
                     "--endpoint requires <GUID>=<device-interface-path>".to_string()
@@ -1131,9 +1166,11 @@ mod windows_runtime {
                 endpoints.push(endpoint);
             } else if argument == "--help" || argument == "-h" {
                 println!(
-                    "Usage: wintap-switch.exe --endpoint <GUID>=<interface> --endpoint <GUID>=<interface> [--read-depth <positive even total>] [--stats]"
+                    "Usage: wintap-switch.exe --endpoint <GUID>=<interface> --endpoint <GUID>=<interface> [--read-depth <positive even total>] [--wait-operations <positive>] [--completion-timeout-ms <milliseconds>] [--stats]"
                 );
                 println!("Default read depth: {DEFAULT_READ_DEPTH}");
+                println!("Default wait operations: {DEFAULT_WAIT_OPERATIONS}");
+                println!("Default completion timeout: {DEFAULT_COMPLETION_WAIT_MILLISECONDS} ms");
                 println!("--stats reports I/O-ring batching counters every 5 seconds");
                 println!(
                     "Pass manager-returned GUID/interface pairs; fixed DOS paths are not supported."
@@ -1151,15 +1188,29 @@ mod windows_runtime {
                     entries.len()
                 )
             })?;
-        Ok((read_depth, stats_enabled, endpoints))
+        Ok((
+            read_depth,
+            stats_enabled,
+            wait_operations,
+            completion_wait_milliseconds,
+            endpoints,
+        ))
     }
 
     pub fn run() -> Result<(), String> {
-        let (read_depth, stats_enabled, endpoints) = parse_arguments()?;
+        let (read_depth, stats_enabled, wait_operations, completion_wait_milliseconds, endpoints) =
+            parse_arguments()?;
         if unsafe { SetConsoleCtrlHandler(Some(console_handler), 1) } == 0 {
             return Err("SetConsoleCtrlHandler failed".to_string());
         }
-        let result = Runtime::start(read_depth, stats_enabled, endpoints)?.run();
+        let result = Runtime::start(
+            read_depth,
+            stats_enabled,
+            wait_operations,
+            completion_wait_milliseconds,
+            endpoints,
+        )?
+        .run();
         unsafe {
             SetConsoleCtrlHandler(Some(console_handler), 0);
         }
