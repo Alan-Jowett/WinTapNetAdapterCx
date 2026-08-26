@@ -214,6 +214,21 @@ stale completion is reported as a nonzero startup/termination error. The
 switch currently uses the contiguous v3 path; v4 scatter/gather remains
 disabled until its dedicated validation is complete.
 
+For repeatable switch experiments, copy
+`tests\run-wintap-switch-experiment.ps1` and
+`tests\wintap-bus-manager.psm1` to the VM and run the script there. It stages the child driver,
+installs the bus, creates two GUID-keyed TAPs, assigns `198.51.100.1/32` and
+`198.51.100.2/32` with reciprocal host routes, starts the switch, and removes
+all resources it created when the bounded run ends:
+
+```powershell
+.\run-wintap-switch-experiment.ps1 `
+  -PackageDirectory C:\Temp\WinTapSwitch\package `
+  -SwitchPath C:\Temp\WinTapSwitch\wintap-switch.exe `
+  -DevConPath C:\Temp\WinTapSwitch\devcon.exe `
+  -DurationSeconds 300 -Stats
+```
+
 ### 6. Run the routed driver relay validation
 
 The existing harness validates the provisioned driver, TAP ownership, routed
