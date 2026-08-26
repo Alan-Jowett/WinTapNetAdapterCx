@@ -1135,7 +1135,7 @@ mod windows_runtime {
                         Dword::try_from(pending_count).expect("endpoint count fits Dword"),
                         pending_events.as_ptr(),
                         0,
-                        COMPLETION_WAIT_MILLISECONDS,
+                        self.completion_wait_milliseconds,
                     )
                 };
                 if result != WAIT_TIMEOUT_RESULT || STOP_REQUESTED.load(Ordering::SeqCst) {
