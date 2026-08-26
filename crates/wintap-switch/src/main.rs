@@ -13,10 +13,10 @@ mod windows_runtime {
     use std::time::{Duration, Instant};
 
     use wintap_switch_core::{
-        ADAPTIVE_INTEREST_ALL, ADAPTIVE_INTEREST_READABLE,
-        ADAPTIVE_POLLING_PROTOCOL_VERSION, AdaptiveEnableRequest, AdaptiveEnableResponse,
-        AdaptiveEndpointCapability, AdaptiveWaitRequest, AdaptiveWaitResponse, BufferPool,
-        EndpointId, FRAME_MAXIMUM, ForwardingError, IoRingCapabilities, IoRingVersion, Switch,
+        ADAPTIVE_INTEREST_ALL, ADAPTIVE_INTEREST_READABLE, ADAPTIVE_POLLING_PROTOCOL_VERSION,
+        AdaptiveEnableRequest, AdaptiveEnableResponse, AdaptiveEndpointCapability,
+        AdaptiveWaitRequest, AdaptiveWaitResponse, BufferPool, EndpointId, FRAME_MAXIMUM,
+        ForwardingError, IoRingCapabilities, IoRingVersion, Switch,
         TAP_IOCTL_ENABLE_ADAPTIVE_POLLING, TAP_IOCTL_WAIT_FOR_CHANGE, select_adaptive_polling,
         select_io_ring_version,
     };
@@ -39,6 +39,7 @@ mod windows_runtime {
     const HRESULT_FROM_NT_STATUS_DEVICE_BUSY: HResult = 0x9000_0011u32 as HResult;
     const HRESULT_FROM_NT_STATUS_NO_MORE_ENTRIES: HResult = 0x9000_001Au32 as HResult;
     const STATUS_NO_MORE_ENTRIES: HResult = 0x8000_001Au32 as HResult;
+    const HRESULT_FROM_WIN32_ERROR_NO_MORE_ITEMS: HResult = 0x8007_0103u32 as HResult;
     const HRESULT_FROM_WIN32_INVALID_USER_BUFFER: HResult = 0x8007_06F8u32 as HResult;
     const HRESULT_FROM_WIN32_ERROR_BUSY: HResult = 0x8007_00AAu32 as HResult;
     const IORING_OP_READ: Dword = 1;
@@ -77,7 +78,6 @@ mod windows_runtime {
     const WAIT_FAILED: Dword = 0xffff_ffff;
     const CLEANUP_REOPEN_ATTEMPTS: u32 = 50;
     const CLEANUP_REOPEN_DELAY: Duration = Duration::from_millis(10);
-
     #[repr(C)]
     struct RawIoRingCapabilities {
         max_version: Dword,
@@ -496,6 +496,7 @@ mod windows_runtime {
         completions: u64,
         reads: u64,
         writes: u64,
+        empty_reads: u64,
         max_batch: u64,
     }
 
@@ -512,15 +513,21 @@ mod windows_runtime {
                 completions: 0,
                 reads: 0,
                 writes: 0,
+                empty_reads: 0,
                 max_batch: 0,
             }
         }
 
-        fn record_wait(&mut self, signaled: bool) {
+        fn record_wait_submission(&mut self) {
             self.wait_calls += 1;
-            if signaled {
-                self.signaled_wakes += 1;
-            }
+        }
+
+        fn record_signaled_wake(&mut self) {
+            self.signaled_wakes += 1;
+        }
+
+        fn record_empty_read(&mut self) {
+            self.empty_reads += 1;
         }
 
         fn record_batch(&mut self, reads: u64, writes: u64) {
@@ -548,16 +555,18 @@ mod windows_runtime {
             } else {
                 self.reads as f64 / self.signaled_wakes as f64
             };
-            eprintln!(
-                "io-ring stats: elapsed={elapsed:.1}s waits={} signaled_wakes={} batches={} completions={} reads={} writes={} avg_completions_per_batch={average_batch:.2} avg_reads_per_wake={average_reads_per_wake:.2} max_batch={}",
+            let message = format!(
+                "io-ring stats: elapsed={elapsed:.1}s waits={} signaled_wakes={} batches={} completions={} reads={} writes={} empty_reads={} avg_completions_per_batch={average_batch:.2} avg_reads_per_wake={average_reads_per_wake:.2} max_batch={}",
                 self.wait_calls,
                 self.signaled_wakes,
                 self.batches,
                 self.completions,
                 self.reads,
                 self.writes,
+                self.empty_reads,
                 self.max_batch,
             );
+            eprintln!("{message}");
             self.last_report = Instant::now();
         }
     }
@@ -614,10 +623,9 @@ mod windows_runtime {
             let maximum_version = query_capabilities()?;
 
             let [first, second] = endpoint_configs;
-            let mut endpoints =
-                open_endpoints(&first, &second).map_err(|error| error.message())?;
-            let adaptive_polling = negotiate_adaptive_polling(&mut endpoints)?;
-            if !adaptive_polling {
+            let mut endpoints = open_endpoints(&first, &second).map_err(|error| error.message())?;
+            let (adaptive_polling, reopen_for_legacy) = negotiate_adaptive_polling(&mut endpoints)?;
+            if reopen_for_legacy {
                 drop(endpoints);
                 endpoints = reopen_legacy_endpoints_after_cleanup(&first, &second)?;
             }
@@ -871,6 +879,7 @@ mod windows_runtime {
                 self.pool
                     .cancel(slot_completion)
                     .map_err(|error| format!("empty adaptive read completion: {error:?}"))?;
+                self.stats.record_empty_read();
                 return Ok(None);
             }
             if completion.result_code != S_OK {
@@ -991,7 +1000,11 @@ mod windows_runtime {
                 let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
                 if status == S_FALSE {
                     let signaled = self.wait_for_completion()?;
-                    self.stats.record_wait(signaled);
+                    self.stats.record_wait_submission();
+                    if signaled {
+                        self.stats.record_signaled_wake();
+                    }
+                    self.stats.report(false);
                     continue;
                 }
                 check_hr(status, "PopIoRingCompletion")?;
@@ -1068,14 +1081,18 @@ mod windows_runtime {
                 if saw_completion {
                     self.submit_pending_operations()?;
                     self.stats.record_batch(reads, writes);
+                    self.stats.report(false);
                 }
                 if made_progress {
                     idle_since = Instant::now();
                     continue;
                 }
                 if idle_since.elapsed() >= self.polling_budget {
+                    self.stats.record_wait_submission();
                     let signaled = self.wait_for_adaptive_change()?;
-                    self.stats.record_wait(signaled);
+                    if signaled {
+                        self.stats.record_signaled_wake();
+                    }
                     if signaled {
                         self.post_adaptive_idle_reads()?;
                         self.submit_pending_operations()?;
@@ -1141,6 +1158,7 @@ mod windows_runtime {
                 if result != WAIT_TIMEOUT_RESULT || STOP_REQUESTED.load(Ordering::SeqCst) {
                     break result;
                 }
+                self.stats.report(false);
             };
             if result == WAIT_FAILED {
                 return Err(format!(
@@ -1613,10 +1631,14 @@ mod windows_runtime {
 
     fn negotiate_adaptive_polling(
         endpoints: &mut [Endpoint; ENDPOINT_COUNT],
-    ) -> Result<bool, String> {
+    ) -> Result<(bool, bool), String> {
         let first = negotiate_adaptive_endpoint(&endpoints[0])?;
         let second = negotiate_adaptive_endpoint(&endpoints[1])?;
-        Ok(select_adaptive_polling(&[first, second]).is_some())
+        let adaptive_polling = select_adaptive_polling(&[first, second]).is_some();
+        let reopen_for_legacy = !adaptive_polling
+            && (matches!(first, AdaptiveEndpointCapability::Supported { .. })
+                || matches!(second, AdaptiveEndpointCapability::Supported { .. }));
+        Ok((adaptive_polling, reopen_for_legacy))
     }
 
     fn negotiate_adaptive_endpoint(
@@ -1646,8 +1668,16 @@ mod windows_runtime {
                 if response.version != ADAPTIVE_POLLING_PROTOCOL_VERSION
                     || response.flags != ADAPTIVE_INTEREST_ALL
                 {
+                    eprintln!(
+                        "adaptive polling incompatible for {}: version={} flags=0x{:08X}",
+                        endpoint.guid, response.version, response.flags
+                    );
                     Ok(AdaptiveEndpointCapability::Incompatible)
                 } else {
+                    eprintln!(
+                        "adaptive polling enabled for {}: version={} flags=0x{:08X}",
+                        endpoint.guid, response.version, response.flags
+                    );
                     Ok(AdaptiveEndpointCapability::Supported {
                         version: response.version,
                         accepted_flags: response.flags,
@@ -1655,6 +1685,10 @@ mod windows_runtime {
                 }
             }
             Err(error) if is_adaptive_unsupported(error) => {
+                eprintln!(
+                    "adaptive polling unsupported for {} with Win32 error {error}",
+                    endpoint.guid
+                );
                 Ok(AdaptiveEndpointCapability::Unsupported)
             }
             Err(error) => Err(format!(
@@ -1767,7 +1801,9 @@ mod windows_runtime {
     }
 
     fn is_no_more_entries(status: HResult) -> bool {
-        status == HRESULT_FROM_NT_STATUS_NO_MORE_ENTRIES || status == STATUS_NO_MORE_ENTRIES
+        status == HRESULT_FROM_NT_STATUS_NO_MORE_ENTRIES
+            || status == STATUS_NO_MORE_ENTRIES
+            || status == HRESULT_FROM_WIN32_ERROR_NO_MORE_ITEMS
     }
 
     fn validate_adaptive_wait_response(

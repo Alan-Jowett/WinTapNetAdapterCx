@@ -2185,14 +2185,58 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
         return status;
     }
 
-    let mut default_queue_config = WDF_IO_QUEUE_CONFIG {
+    let mut control_queue_config = WDF_IO_QUEUE_CONFIG {
         Size: core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
         DispatchType: wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchParallel,
+        AllowZeroLengthRequests: 1,
+        EvtIoDeviceControl: Some(evt_io_device_control),
+        EvtIoStop: Some(evt_io_stop),
+        ..WDF_IO_QUEUE_CONFIG::default()
+    };
+    unsafe {
+        control_queue_config
+            .Settings
+            .Parallel
+            .NumberOfPresentedRequests = ULONG::MAX;
+    }
+    let mut control_queue: WDFQUEUE = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoQueueCreate,
+            device,
+            &mut control_queue_config,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut control_queue,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return status;
+    }
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceConfigureRequestDispatching,
+            device,
+            control_queue,
+            wdk_sys::_WDF_REQUEST_TYPE::WdfRequestTypeDeviceControl,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return status;
+    }
+
+    let mut default_queue_config = WDF_IO_QUEUE_CONFIG {
+        Size: core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
+        DispatchType: wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchSequential,
         AllowZeroLengthRequests: 1,
         DefaultQueue: 1,
         EvtIoRead: Some(evt_io_read),
         EvtIoWrite: Some(evt_io_write),
-        EvtIoDeviceControl: Some(evt_io_device_control),
         ..WDF_IO_QUEUE_CONFIG::default()
     };
     let mut default_queue_attributes = WDF_OBJECT_ATTRIBUTES {

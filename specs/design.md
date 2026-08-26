@@ -404,6 +404,11 @@ not start a partially adaptive data plane. This fallback preserves additive
 deployment with an older driver while requiring explicit successful opt-in
 before using the new contract.
 
+Adaptive enable diagnostics identify the manager-returned endpoint GUID and
+record one of: accepted version/flags, unsupported Win32 error, incompatible
+version/flags, or fatal negotiation failure. The diagnostics contain only
+control-plane values; they never include a frame or interface payload.
+
 The driver-defined `WAIT_FOR_CHANGE` operation has a versioned input
 containing a readable/writable interest mask and a fixed-size output containing
 the satisfied mask. It is valid only after successful mode enable. The driver
@@ -829,6 +834,19 @@ completes. The adaptive normal-traffic path must not issue
 `SubmitIoRing(..., 1, ...)` merely to wait for an individual packet
 completion. The switch cancels and drains its outstanding waits before
 closing endpoint handles, I/O-ring resources, or registered buffers.
+
+When statistics are requested, the switch reports wait submission, signaled
+wake, and read/write batch counters at the configured interval even while an
+adaptive wait remains pending. This exposes an idle, unsignaled wait without
+changing the wait or completion path.
+
+The experiment records a GUID-to-device-interface-to-network-interface mapping
+before assigning an address or route. Every probe explicitly uses the mapped
+network interface and is rejected if its address, route, or PnP hardware ID
+does not match the manager-created GUID supplied to the switch. It performs
+functional enable, wait-registration, readable-transition, wait-completion,
+read, and forwarding checks before treating any adaptive run as a performance
+sample.
 
 The endpoint collection, FDB, slot states, and pending-operation counters use
 one documented lock order. Completion callbacks do not reacquire a lock that

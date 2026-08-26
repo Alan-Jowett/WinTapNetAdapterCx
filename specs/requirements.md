@@ -1013,6 +1013,41 @@ lost between observing no progress and registering a wait. Legacy clients
 retain their existing contract, and adaptive-mode clients cannot cause
 per-frame blocking wakeups merely by processing normal traffic.
 
+### REQ-047 — Adaptive-path observability and endpoint-correlated validation
+
+**Before:** An unsupported adaptive enable result may select legacy mode
+without recording the endpoint, Win32 error, or negotiated result. Switch
+statistics can omit idle wait state, and VM probes can observe a stale TAP
+interface rather than the manager-created endpoint owned by the switch.
+
+**After:** The switch and its experiment validation shall make adaptive-path
+state diagnosable without exposing frame payloads:
+
+1. For every selected endpoint, startup diagnostics shall record whether
+   adaptive enable succeeded, was unsupported, was incompatible, or failed;
+   unsupported and incompatible results shall include the endpoint GUID and
+   protocol/error result.
+2. When statistics are enabled, the switch shall periodically report submitted
+   waits, signaled wakes, and completed read/write batches while idle as well
+   as while forwarding.
+3. The experiment shall correlate each assigned test address, route, and probe
+   source interface to the exact manager-created GUID and device interface
+   passed to the switch. It shall reject pre-existing or stale TAP interfaces
+   rather than using them as probe endpoints.
+4. Functional adaptive validation shall prove, for each correlated endpoint,
+   enable, `WAIT_FOR_CHANGE` registration, readable capture transition, wait
+   completion, resumed read, and peer forwarding before collecting performance
+   measurements.
+
+**Trace:** User debugging request following failed two-TAP ARP/ICMP probes;
+WinDbg evidence that capture can occur on a non-switch-owned stale TAP
+instance; extends REQ-046.
+
+**Invariant impact:** Diagnostics are control-plane metadata only. They shall
+not retain or disclose frame payloads, alter exclusive-handle ownership,
+change queue readiness, or convert a failed adaptive negotiation into a
+successful legacy test result.
+
 ### Dynamic-bus traceability
 
 | Requirement | Design coverage | Validation coverage |
@@ -1039,6 +1074,7 @@ per-frame blocking wakeups merely by processing normal traffic.
 | REQ-044 | Complete repository coverage | VAL-032, VAL-033, VAL-034; TC-084 |
 | REQ-045 | I/O-ring resources and completion state | VAL-036; TC-085 |
 | REQ-046 | MTU configuration and frame-size contract; adaptive-polling control contract and switch execution | VAL-037; VAL-038; TC-086 through TC-089 |
+| REQ-047 | Adaptive-path diagnostics and endpoint-correlated functional validation | VAL-038; TC-090 |
 
 ## Open questions requiring user decisions
 
@@ -1110,5 +1146,5 @@ per-frame blocking wakeups merely by processing normal traffic.
 
 ## Specification approval gate
 
-REQ-026 through REQ-046 require approval together with their design and
+REQ-026 through REQ-047 require approval together with their design and
 validation coverage before implementation.
