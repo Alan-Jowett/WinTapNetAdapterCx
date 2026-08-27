@@ -2,10 +2,10 @@
 // Copyright (c) 2026 WinTapNetAdapterCx contributors
 extern crate alloc;
 
-use alloc::collections::VecDeque;
-#[cfg(test)]
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use core::mem::MaybeUninit;
 use core::ptr::null_mut;
 
 use wdk_sys::WDFLOOKASIDE;
@@ -179,7 +179,9 @@ impl Drop for Frame {
 }
 
 pub struct FrameQueue {
-    frames: VecDeque<Frame>,
+    frames: Box<[MaybeUninit<Frame>]>,
+    head: usize,
+    length: usize,
     limit: usize,
     byte_limit: usize,
     bytes: usize,
@@ -188,13 +190,16 @@ pub struct FrameQueue {
 
 impl FrameQueue {
     pub fn try_new(limit: usize, byte_limit: usize) -> Result<Self, QueueError> {
-        let mut frames = VecDeque::new();
+        let mut frames = Vec::new();
         frames
             .try_reserve_exact(limit)
             .map_err(|_| QueueError::InsufficientResources)?;
+        frames.resize_with(limit, MaybeUninit::uninit);
 
         Ok(Self {
-            frames,
+            frames: frames.into_boxed_slice(),
+            head: 0,
+            length: 0,
             limit,
             byte_limit,
             bytes: 0,
@@ -210,21 +215,27 @@ impl FrameQueue {
             Some(remaining) => remaining,
             None => return Err(QueueError::Full),
         };
-        if self.frames.len() >= self.limit || frame.data.len() > remaining_bytes {
+        let frame_length = frame.as_bytes().len();
+        if self.length >= self.limit || frame_length > remaining_bytes {
             return Err(QueueError::Full);
         }
 
-        self.bytes += frame.data.len();
-        self.frames.push_back(frame);
+        let index = (self.head + self.length) % self.limit;
+        self.frames[index].write(frame);
+        self.length += 1;
+        self.bytes += frame_length;
         Ok(())
     }
 
     pub fn dequeue(&mut self) -> Option<Frame> {
-        let frame = self.frames.pop_front();
-        if let Some(frame) = &frame {
-            self.bytes -= frame.data.len();
+        if self.length == 0 {
+            return None;
         }
-        frame
+        let frame = unsafe { self.frames[self.head].assume_init_read() };
+        self.head = (self.head + 1) % self.limit;
+        self.length -= 1;
+        self.bytes -= frame.as_bytes().len();
+        Some(frame)
     }
 
     pub fn begin_close(&mut self) {
@@ -234,27 +245,35 @@ impl FrameQueue {
     }
 
     pub fn close(&mut self) {
-        self.frames.clear();
-        self.bytes = 0;
+        self.clear_frames();
         self.state = QueueState::Closed;
     }
 
     pub fn reopen(&mut self) {
-        self.frames.clear();
-        self.bytes = 0;
+        self.clear_frames();
         self.state = QueueState::Open;
     }
 
     pub fn len(&self) -> usize {
-        self.frames.len()
+        self.length
     }
 
     pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.length == 0
     }
 
     pub fn state(&self) -> QueueState {
         self.state
+    }
+
+    fn clear_frames(&mut self) {
+        while self.dequeue().is_some() {}
+    }
+}
+
+impl Drop for FrameQueue {
+    fn drop(&mut self) {
+        self.clear_frames();
     }
 }
 
