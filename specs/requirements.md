@@ -1048,6 +1048,47 @@ not retain or disclose frame payloads, alter exclusive-handle ownership,
 change queue readiness, or convert a failed adaptive negotiation into a
 successful legacy test result.
 
+### REQ-048 — OS-managed lookaside-backed frame storage
+
+**Before:** Driver-owned frames use individually allocated `Vec<u8>` storage.
+Capturing a stack-transmitted frame allocates and copies a payload on the
+datapath hot path, and user writes allocate frame storage before entering the
+injection queue.
+
+**After:** The driver shall use the operating system's nonpaged lookaside-list
+facility for driver-owned frame objects. Each lookaside element shall contain
+one full-size `FRAME_MAXIMUM` payload buffer and its valid length metadata.
+
+1. The lookaside list shall manage frame-object caching and capacity; the
+   driver shall not implement a second frame free list or capacity policy.
+2. Existing directional queue limits remain the admission and backpressure
+   boundary. Lookaside allocation failure shall be surfaced explicitly using
+   the affected queue's existing resource-exhaustion behavior.
+3. A frame shall be acquired before ownership enters either directional frame
+   queue and returned exactly once after delivery, rejection, cancellation,
+   queue drain, or teardown.
+4. NetAdapterCx packet and fragment ring entries remain framework-owned and
+   callback-scoped. A lookaside frame is required when ownership crosses that
+   callback boundary.
+5. Acquisition and release shall be valid at every callback execution level
+   that handles the operation and shall not retain a user buffer or framework
+   ring entry when acquisition fails.
+6. Initialization shall establish the OS lookaside object before datapath
+   publication and fail explicitly if its element size or required setup is
+   invalid. Teardown shall block new acquisitions, drain all frame ownership,
+   and delete the lookaside object only after no frame can reference it.
+7. Reused elements shall not expose bytes from their prior owner to a later
+   frame or user request.
+
+**Trace:** User request to use OS-provided lookaside lists with full-sized
+frame elements; existing per-frame `Vec` allocation in the driver frame and
+capture paths; refines REQ-016, REQ-021, REQ-024, and REQ-046.
+
+**Invariant impact:** Changes only driver-owned frame storage and allocation
+behavior. It shall preserve directional isolation, queue bounds, NetAdapterCx
+ring ownership, IRQL/pageability rules, exact-once completion, adaptive/legacy
+semantics, and teardown safety.
+
 ### Dynamic-bus traceability
 
 | Requirement | Design coverage | Validation coverage |
@@ -1075,6 +1116,7 @@ successful legacy test result.
 | REQ-045 | I/O-ring resources and completion state | VAL-036; TC-085 |
 | REQ-046 | MTU configuration and frame-size contract; adaptive-polling control contract and switch execution | VAL-037; VAL-038; TC-086 through TC-089 |
 | REQ-047 | Adaptive-path diagnostics and endpoint-correlated functional validation | VAL-038; TC-090 |
+| REQ-048 | OS-managed nonpaged lookaside frame storage and lifecycle | VAL-039; TC-091 |
 
 ## Open questions requiring user decisions
 
@@ -1132,19 +1174,23 @@ successful legacy test result.
 25. **Resolved:** Passive READ delivery claims frame/request ownership under
     the state lock but performs WDF buffer access, copying, requeue, and
     request completion only after releasing that lock.
-26. **Resolved:** SPDX enforcement uses MIT identifiers and comment syntax
+26. **Resolved:** Driver-owned frames use OS-provided nonpaged lookaside
+    storage with one full-size frame payload per element; the OS manages
+    lookaside caching/capacity and existing directional queues remain the
+    backpressure boundary.
+27. **Resolved:** SPDX enforcement uses MIT identifiers and comment syntax
     compatible with each governed file type, following the established
     LexonGraph and ebpf-for-windows patterns.
-27. **Resolved:** Binary files and generated outputs that cannot contain
+28. **Resolved:** Binary files and generated outputs that cannot contain
     comments are explicit validator exclusions; source, scripts, metadata,
     specifications, and documentation are not excluded by default.
-28. **[ASSUMPTION]:** “a no model” in the `/evolve` request means a new
+29. **[ASSUMPTION]:** “a no model” in the `/evolve` request means a new
     additive mode that requires both the switch and driver to opt in. The
     existing control-handle contract remains the default.
-29. **Resolved:** Each exclusive adaptive-polling handle permits one pending
+30. **Resolved:** Each exclusive adaptive-polling handle permits one pending
     `WAIT_FOR_CHANGE` IOCTL; a second wait fails explicitly.
 
 ## Specification approval gate
 
-REQ-026 through REQ-047 require approval together with their design and
+REQ-026 through REQ-048 require approval together with their design and
 validation coverage before implementation.

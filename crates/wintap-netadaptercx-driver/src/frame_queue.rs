@@ -2,10 +2,19 @@
 // Copyright (c) 2026 WinTapNetAdapterCx contributors
 extern crate alloc;
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::collections::VecDeque;
+#[cfg(test)]
+use alloc::vec::Vec;
+
+use core::ptr::null_mut;
+
+use wdk_sys::WDFLOOKASIDE;
+#[cfg(not(test))]
+use wdk_sys::{WDFMEMORY, call_unsafe_wdf_function_binding};
 
 pub const FRAME_MINIMUM: usize = 14;
 pub const FRAME_MAXIMUM: usize = 65_535;
+pub const FRAME_STORAGE_SIZE: usize = core::mem::size_of::<FrameStorage>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueueError {
@@ -22,12 +31,101 @@ pub enum QueueState {
     Closed,
 }
 
+#[repr(C)]
+struct FrameStorage {
+    length: usize,
+    data: [u8; FRAME_MAXIMUM],
+}
+
 pub struct Frame {
+    #[cfg(not(test))]
+    memory: WDFMEMORY,
+    #[cfg(not(test))]
+    storage: *mut FrameStorage,
+    #[cfg(test)]
     data: Vec<u8>,
+    #[cfg(test)]
+    length: usize,
 }
 
 impl Frame {
-    pub fn from_bytes(data: &[u8]) -> Result<Self, QueueError> {
+    #[cfg(test)]
+    pub fn new(_pool: WDFLOOKASIDE) -> Result<Self, QueueError> {
+        let mut data = Vec::new();
+        data.try_reserve_exact(FRAME_MAXIMUM)
+            .map_err(|_| QueueError::InsufficientResources)?;
+        data.resize(FRAME_MAXIMUM, 0);
+        Ok(Self { data, length: 0 })
+    }
+
+    #[cfg(not(test))]
+    pub fn new(pool: WDFLOOKASIDE) -> Result<Self, QueueError> {
+        if pool.is_null() {
+            return Err(QueueError::Closed);
+        }
+        let mut memory = null_mut();
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfMemoryCreateFromLookaside,
+                pool,
+                &mut memory,
+            )
+        };
+        if status != 0 || memory.is_null() {
+            return Err(QueueError::InsufficientResources);
+        }
+
+        let mut size = 0;
+        let storage = unsafe {
+            call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, memory, &mut size)
+        } as *mut FrameStorage;
+        if storage.is_null() || size < core::mem::size_of::<FrameStorage>() {
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, memory.cast());
+            }
+            return Err(QueueError::InsufficientResources);
+        }
+
+        unsafe {
+            (*storage).length = 0;
+        }
+        Ok(Self {
+            memory,
+            storage,
+        })
+    }
+
+    #[cfg(not(test))]
+    pub fn from_bytes(pool: WDFLOOKASIDE, data: &[u8]) -> Result<Self, QueueError> {
+        if !(FRAME_MINIMUM..=FRAME_MAXIMUM).contains(&data.len()) {
+            return Err(QueueError::InvalidFrameLength);
+        }
+        let mut frame = Self::new(pool)?;
+        frame.copy_from_slice(0, data)?;
+        frame.set_length(data.len());
+        Ok(frame)
+    }
+
+    #[cfg(not(test))]
+    pub fn copy_from_slice(&mut self, offset: usize, data: &[u8]) -> Result<(), QueueError> {
+        if offset > FRAME_MAXIMUM || data.len() > FRAME_MAXIMUM - offset {
+            return Err(QueueError::InvalidFrameLength);
+        }
+        unsafe {
+            (*self.storage).data[offset..offset + data.len()].copy_from_slice(data);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    pub fn set_length(&mut self, length: usize) {
+        unsafe {
+            (*self.storage).length = length;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn from_bytes(_pool: WDFLOOKASIDE, data: &[u8]) -> Result<Self, QueueError> {
         if !(FRAME_MINIMUM..=FRAME_MAXIMUM).contains(&data.len()) {
             return Err(QueueError::InvalidFrameLength);
         }
@@ -37,19 +135,46 @@ impl Frame {
             .try_reserve_exact(data.len())
             .map_err(|_| QueueError::InsufficientResources)?;
         copied.extend_from_slice(data);
-        Self::from_vec(copied)
+        Ok(Self {
+            data: copied,
+            length: data.len(),
+        })
     }
 
-    pub fn from_vec(data: Vec<u8>) -> Result<Self, QueueError> {
-        if !(FRAME_MINIMUM..=FRAME_MAXIMUM).contains(&data.len()) {
+    #[cfg(test)]
+    pub fn copy_from_slice(&mut self, offset: usize, data: &[u8]) -> Result<(), QueueError> {
+        if offset > FRAME_MAXIMUM || data.len() > FRAME_MAXIMUM - offset {
             return Err(QueueError::InvalidFrameLength);
         }
+        self.data[offset..offset + data.len()].copy_from_slice(data);
+        Ok(())
+    }
 
-        Ok(Self { data })
+    #[cfg(test)]
+    pub fn set_length(&mut self, length: usize) {
+        self.length = length;
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.data
+        #[cfg(not(test))]
+        unsafe {
+            &(*self.storage).data[..(*self.storage).length]
+        }
+        #[cfg(test)]
+        &self.data[..self.length]
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for Frame {
+    fn drop(&mut self) {
+        if !self.memory.is_null() {
+            unsafe {
+                (*self.storage).data[..(*self.storage).length].fill(0);
+                (*self.storage).length = 0;
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, self.memory.cast());
+            }
+        }
     }
 }
 
@@ -138,19 +263,19 @@ mod tests {
     use super::*;
 
     fn frame() -> Frame {
-        Frame::from_bytes(&[0; FRAME_MINIMUM]).unwrap()
+        Frame::from_bytes(null_mut(), &[0; FRAME_MINIMUM]).unwrap()
     }
 
     #[test]
     fn validates_ethernet_frame_bounds() {
         assert!(matches!(
-            Frame::from_bytes(&[0; FRAME_MINIMUM - 1]),
+            Frame::from_bytes(null_mut(), &[0; FRAME_MINIMUM - 1]),
             Err(QueueError::InvalidFrameLength)
         ));
-        assert!(Frame::from_bytes(&[0; FRAME_MINIMUM]).is_ok());
-        assert!(Frame::from_bytes(&[0; FRAME_MAXIMUM]).is_ok());
+        assert!(Frame::from_bytes(null_mut(), &[0; FRAME_MINIMUM]).is_ok());
+        assert!(Frame::from_bytes(null_mut(), &[0; FRAME_MAXIMUM]).is_ok());
         assert!(matches!(
-            Frame::from_bytes(&[0; FRAME_MAXIMUM + 1]),
+            Frame::from_bytes(null_mut(), &[0; FRAME_MAXIMUM + 1]),
             Err(QueueError::InvalidFrameLength)
         ));
     }

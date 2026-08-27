@@ -6,14 +6,13 @@ extern crate alloc;
 
 use alloc::alloc::alloc;
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 #[cfg(not(test))]
 extern crate wdk_panic;
 
 mod frame_queue;
 mod ring;
-use frame_queue::{Frame, FrameQueue, QueueError, QueueState};
+use frame_queue::{Frame, FrameQueue, QueueError, QueueState, FRAME_MAXIMUM, FRAME_STORAGE_SIZE};
 use ring::{advance_index, fragment_at, fragment_virtual_address, increment_index, packet_at};
 
 use core::alloc::Layout;
@@ -147,6 +146,7 @@ struct InstanceState {
     adapter: netadaptercx_sys::NETADAPTER,
     read_queue: WDFQUEUE,
     frame_lock: WDFSPINLOCK,
+    frame_pool: wdk_sys::WDFLOOKASIDE,
     state_lock: WDFSPINLOCK,
     injection_queue: Option<FrameQueue>,
     capture_queue: Option<FrameQueue>,
@@ -186,6 +186,7 @@ impl InstanceState {
             adapter: core::ptr::null_mut(),
             read_queue: core::ptr::null_mut(),
             frame_lock: core::ptr::null_mut(),
+            frame_pool: core::ptr::null_mut(),
             state_lock: core::ptr::null_mut(),
             injection_queue: None,
             capture_queue: None,
@@ -1462,46 +1463,70 @@ fn capture_transmit_packets(
             continue;
         }
 
-        let mut bytes = Vec::new();
-        if bytes.try_reserve_exact(total_length).is_ok() {
-            fragment_index = fragment_begin;
-            for _ in 0..fragment_count {
-                let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
-                    Some(fragment) => unsafe { &*fragment },
-                    None => return,
-                };
-                let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
-                    Some(address) => unsafe { &*address },
-                    None => return,
-                };
-                let start = unsafe {
-                    (address.VirtualAddress as *const u8).add(fragment.Offset() as usize)
-                };
-                let length = fragment.ValidLength() as usize;
-                let data = unsafe { core::slice::from_raw_parts(start, length) };
-                bytes.extend_from_slice(data);
-                fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
-                    Some(index) => index,
-                    None => return,
-                };
+        let pool = match unsafe { state.as_ref() }.map(|state| state.frame_pool) {
+            Some(pool) if !pool.is_null() => pool,
+            _ => {
+                debug_status(b"Tx capture frame pool", STATUS_DEVICE_NOT_READY);
+                break;
             }
-
-            if let Ok(frame) = Frame::from_vec(bytes) {
-                if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-                    let adaptive = state_guard.adaptive_enabled.load(Ordering::Acquire);
-                    match enqueue_existing_capture_frame_locked(&mut state_guard, frame) {
-                        Ok(wait_completion_queued) => {
-                            if !adaptive {
-                                captured_for_legacy_read = true;
-                            }
-                            wait_completion_scheduled |= wait_completion_queued;
+        };
+        let mut frame = match Frame::new(pool) {
+            Ok(frame) => frame,
+            Err(_) => {
+                debug_status(b"Tx capture frame allocation", STATUS_INSUFFICIENT_RESOURCES);
+                break;
+            }
+        };
+        let mut offset = 0;
+        let mut copy_succeeded = true;
+        fragment_index = fragment_begin;
+        for _ in 0..fragment_count {
+            let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
+                Some(fragment) => unsafe { &*fragment },
+                None => {
+                    copy_succeeded = false;
+                    break;
+                }
+            };
+            let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
+                Some(address) => unsafe { &*address },
+                None => {
+                    copy_succeeded = false;
+                    break;
+                }
+            };
+            let start = unsafe {
+                (address.VirtualAddress as *const u8).add(fragment.Offset() as usize)
+            };
+            let length = fragment.ValidLength() as usize;
+            let data = unsafe { core::slice::from_raw_parts(start, length) };
+            if frame.copy_from_slice(offset, data).is_err() {
+                copy_succeeded = false;
+                break;
+            }
+            offset += length;
+            fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
+                Some(index) => index,
+                None => {
+                    copy_succeeded = false;
+                    break;
+                }
+            };
+        }
+        if copy_succeeded && offset == total_length {
+            frame.set_length(total_length);
+            if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+                let adaptive = state_guard.adaptive_enabled.load(Ordering::Acquire);
+                match enqueue_existing_capture_frame_locked(&mut state_guard, frame) {
+                    Ok(wait_completion_queued) => {
+                        if !adaptive {
+                            captured_for_legacy_read = true;
                         }
-                        Err(_) => {}
+                        wait_completion_scheduled |= wait_completion_queued;
                     }
+                    Err(_) => {}
                 }
             }
-        } else {
-            debug_status(b"Tx capture allocation", STATUS_INSUFFICIENT_RESOURCES);
         }
 
         let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
@@ -2107,6 +2132,13 @@ extern "C" fn evt_device_release_hardware(
     };
     let state = &mut *state_guard;
     clear_frame_queues(state);
+    let frame_pool = state.frame_pool;
+    state.frame_pool = core::ptr::null_mut();
+    if !frame_pool.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, frame_pool.cast());
+        }
+    }
     clear_receive_filter_state(state);
     state.pending_reads.store(0, Ordering::Release);
     state.pending_writes.store(0, Ordering::Release);
@@ -2136,6 +2168,30 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
     };
+    let mut lookaside_attributes = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ParentObject: device.cast(),
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ..WDF_OBJECT_ATTRIBUTES::default()
+    };
+    let mut frame_pool: wdk_sys::WDFLOOKASIDE = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfLookasideListCreate,
+            &mut lookaside_attributes,
+            FRAME_STORAGE_SIZE,
+            wdk_sys::_POOL_TYPE::NonPagedPool,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            u32::from_le_bytes(*b"WTFR"),
+            &mut frame_pool,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        debug_status(b"FramePoolCreate", status);
+        return status;
+    }
     let injection_queue = match FrameQueue::try_new(FRAME_QUEUE_LIMIT, queue_byte_limit) {
         Ok(queue) => queue,
         Err(_) => {
@@ -2335,6 +2391,7 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
 
     state.read_queue = read_queue;
     state.frame_lock = frame_lock;
+    state.frame_pool = frame_pool;
     state.state_lock = state_lock;
     state.injection_queue = Some(injection_queue);
     state.capture_queue = Some(capture_queue);
@@ -2973,7 +3030,7 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
 }
 
 fn enqueue_injection_frame(state: &mut InstanceState, bytes: &[u8]) -> Result<(), QueueError> {
-    let frame = Frame::from_bytes(bytes)?;
+    let frame = Frame::from_bytes(state.frame_pool, bytes)?;
     enqueue_existing_injection_frame(state, frame)
 }
 

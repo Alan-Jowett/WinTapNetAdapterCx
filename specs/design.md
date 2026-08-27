@@ -329,6 +329,40 @@ request while holding the state/frame lock. This preserves the
 DISPATCH_LEVEL-safe packet callback contract while making readiness visible to
 user mode without a pending READ IRP.
 
+### Driver-owned frame storage
+
+Driver-owned frames shall be represented by fixed-size elements from an OS
+nonpaged lookaside list. Each element contains a `FRAME_MAXIMUM`-byte payload
+area, a valid-length field, and only the metadata required to identify its
+current ownership. The lookaside list owns element caching and obtains backing
+storage from the OS when needed; the driver does not maintain a parallel free
+list or impose a second capacity limit.
+
+The injection and capture queues remain separate bounded owners. A producer
+acquires a lookaside element before copying data from a user request or a
+NetAdapterCx fragment into storage that must outlive the current callback. If
+acquisition fails, the producer reports the existing explicit resource
+exhaustion result, completes or rejects the operation according to its queue
+contract, and returns any framework-owned ring entry without retaining it.
+Direct passive-level TX delivery may continue to copy directly into a
+compatible user output buffer and does not require a lookaside element when
+the framework entry is returned in the same callback.
+
+The element's valid length is set only after a complete frame copy succeeds.
+On dequeue, delivery, rejection, cancellation, or queue drain, ownership
+transitions are serialized by the existing state/frame lock and the element is
+returned exactly once. Reuse must not expose bytes from a previous frame;
+the implementation shall clear the prior valid payload range before release
+or establish an equivalent non-observability guarantee.
+
+Lookaside creation occurs before adapter datapath publication and uses a
+nonpaged element suitable for the highest IRQL at which frame acquisition or
+release occurs. Teardown first closes both frame queues and prevents new
+acquisitions, then drains queued and in-flight elements, and only then deletes
+the lookaside list. Adapter stop, D0 exit, owner close, surprise removal, and
+failed initialization follow the same ordering and preserve exactly-once
+release.
+
 ## Queue state and backpressure
 
 The design shall maintain separate bounded queues for:
