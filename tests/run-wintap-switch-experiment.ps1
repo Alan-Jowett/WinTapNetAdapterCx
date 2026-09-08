@@ -40,6 +40,11 @@ param(
 
     [switch]$Stats,
 
+    [string]$IperfPath,
+
+    [ValidateRange(1, 3600)]
+    [int]$IperfDurationSeconds = 10,
+
     [string]$DiagnosticsPath = ".\artifacts\wintap-switch-experiment",
 
     [ValidateRange(5, 300)]
@@ -61,6 +66,7 @@ $childInterfaces = @{}
 $createdAddresses = @()
 $createdRoutes = @()
 $switchProcess = $null
+$iperfProcess = $null
 $busInstalled = $false
 $adapters = @()
 
@@ -128,7 +134,20 @@ function Remove-SwitchProcess {
     $script:switchProcess = $null
 }
 
+function Remove-IperfProcess {
+    if ($null -eq $script:iperfProcess) {
+        return
+    }
+    if (-not $script:iperfProcess.HasExited) {
+        Stop-Process -Id $script:iperfProcess.Id -Force -ErrorAction SilentlyContinue
+        $script:iperfProcess.WaitForExit(5000)
+    }
+    $script:iperfProcess.Dispose()
+    $script:iperfProcess = $null
+}
+
 function Remove-ExperimentResources {
+    Remove-IperfProcess
     Remove-SwitchProcess
 
     foreach ($route in @($script:createdRoutes)) {
@@ -216,6 +235,22 @@ try {
         -WorkingDirectory (Split-Path -Parent $switch) -RedirectStandardOutput $stdoutPath `
         -RedirectStandardError $stderrPath -PassThru
     Write-Host "Started wintap-switch.exe (PID $($switchProcess.Id)) for $DurationSeconds seconds."
+    if (-not [string]::IsNullOrWhiteSpace($IperfPath)) {
+        $iperf = (Resolve-Path -LiteralPath $IperfPath -ErrorAction Stop).Path
+        $iperfServerOutput = Join-Path $DiagnosticsPath "iperf-server.txt"
+        $iperfServerError = Join-Path $DiagnosticsPath "iperf-server-error.txt"
+        $iperfClientOutput = Join-Path $DiagnosticsPath "iperf-client.txt"
+        $iperfProcess = Start-Process -FilePath $iperf -ArgumentList "-s", "-B", "198.51.100.2" `
+            -RedirectStandardOutput $iperfServerOutput -RedirectStandardError $iperfServerError `
+            -PassThru
+        Start-Sleep -Seconds 1
+        & $iperf "-c" "198.51.100.2" "-B" "198.51.100.1" "-t" $IperfDurationSeconds `
+            *> $iperfClientOutput
+        if ($LASTEXITCODE -ne 0) {
+            throw "iperf3 failed with exit code $LASTEXITCODE."
+        }
+        Write-Host "iperf3 completed successfully for $IperfDurationSeconds seconds."
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds($DurationSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($switchProcess.WaitForExit(100)) {
