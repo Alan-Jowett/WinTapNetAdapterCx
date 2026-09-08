@@ -197,9 +197,11 @@ try {
     Add-PointToPointAddress $adapters[0] "198.51.100.1" "198.51.100.2"
     Add-PointToPointAddress $adapters[1] "198.51.100.2" "198.51.100.1"
 
+    $interfaceGuidA = ([Guid]$adapters[0].InterfaceGuid).ToString("D")
+    $interfaceGuidB = ([Guid]$adapters[1].InterfaceGuid).ToString("D")
     $arguments = @(
-        "--endpoint", "$($adapters[0].InterfaceGuid)=$($childInterfaces[$childGuids[0].ToString()])",
-        "--endpoint", "$($adapters[1].InterfaceGuid)=$($childInterfaces[$childGuids[1].ToString()])",
+        "--endpoint", "$interfaceGuidA=$($childInterfaces[$childGuids[0].ToString()])",
+        "--endpoint", "$interfaceGuidB=$($childInterfaces[$childGuids[1].ToString()])",
         "--read-depth", $ReadDepth,
         "--wait-operations", $WaitOperations,
         "--completion-timeout-ms", $CompletionTimeoutMilliseconds
