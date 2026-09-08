@@ -190,12 +190,16 @@ try {
     $adapterA = Get-AdapterForChild -Guid $childGuids[0]
     $adapterB = Get-AdapterForChild -Guid $childGuids[1]
     $adapters = @($adapterA, $adapterB)
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$adapters[0].InterfaceGuid)) `
+        "Adapter $($adapters[0].Name) did not expose an interface GUID."
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$adapters[1].InterfaceGuid)) `
+        "Adapter $($adapters[1].Name) did not expose an interface GUID."
     Add-PointToPointAddress $adapters[0] "198.51.100.1" "198.51.100.2"
     Add-PointToPointAddress $adapters[1] "198.51.100.2" "198.51.100.1"
 
     $arguments = @(
-        "--endpoint", "$($childGuids[0])=$($childInterfaces[$childGuids[0].ToString()])",
-        "--endpoint", "$($childGuids[1])=$($childInterfaces[$childGuids[1].ToString()])",
+        "--endpoint", "$($adapters[0].InterfaceGuid)=$($childInterfaces[$childGuids[0].ToString()])",
+        "--endpoint", "$($adapters[1].InterfaceGuid)=$($childInterfaces[$childGuids[1].ToString()])",
         "--read-depth", $ReadDepth,
         "--wait-operations", $WaitOperations,
         "--completion-timeout-ms", $CompletionTimeoutMilliseconds
