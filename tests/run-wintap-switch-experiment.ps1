@@ -244,6 +244,10 @@ try {
             -RedirectStandardOutput $iperfServerOutput -RedirectStandardError $iperfServerError `
             -PassThru
         Start-Sleep -Seconds 1
+        Get-NetIPAddress -InterfaceIndex $adapters[0].ifIndex, $adapters[1].ifIndex `
+            -AddressFamily IPv4 | Format-List * | Out-File (Join-Path $DiagnosticsPath "tap-addresses.txt")
+        Get-NetRoute -InterfaceIndex $adapters[0].ifIndex, $adapters[1].ifIndex `
+            -AddressFamily IPv4 | Format-List * | Out-File (Join-Path $DiagnosticsPath "tap-routes.txt")
         & $iperf "-c" "198.51.100.2" "-B" "198.51.100.1" "-t" $IperfDurationSeconds `
             *> $iperfClientOutput
         if ($LASTEXITCODE -ne 0) {
