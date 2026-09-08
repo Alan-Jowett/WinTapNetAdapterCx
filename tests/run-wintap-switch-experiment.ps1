@@ -240,7 +240,7 @@ try {
         $iperfServerOutput = Join-Path $DiagnosticsPath "iperf-server.txt"
         $iperfServerError = Join-Path $DiagnosticsPath "iperf-server-error.txt"
         $iperfClientOutput = Join-Path $DiagnosticsPath "iperf-client.txt"
-        $iperfProcess = Start-Process -FilePath $iperf -ArgumentList "-s", "-B", "198.51.100.2" `
+        $iperfProcess = Start-Process -FilePath $iperf -ArgumentList "-s" `
             -RedirectStandardOutput $iperfServerOutput -RedirectStandardError $iperfServerError `
             -PassThru
         Start-Sleep -Seconds 1
