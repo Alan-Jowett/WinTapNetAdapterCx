@@ -21,6 +21,7 @@ mod windows_runtime {
     type HResult = i32;
     type Dword = u32;
     type Ulonglong = u64;
+    type Guid = wintap_switch_core::Guid;
 
     const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
     const FILE_FLAG_OVERLAPPED: Dword = 0x4000_0000;
@@ -56,6 +57,7 @@ mod windows_runtime {
     const GENERATION_BITS: u32 = 32;
     const SLOT_MASK: Ulonglong = (1_u64 << SLOT_BITS) - 1;
     const GENERATION_MASK: Ulonglong = (1_u64 << GENERATION_BITS) - 1;
+    const ERROR_SUCCESS: Dword = 0;
 
     #[repr(C)]
     struct RawIoRingCapabilities {
@@ -64,9 +66,129 @@ mod windows_runtime {
     }
 
     #[repr(C)]
+    struct MibIfRow2 {
+        interface_luid: Ulonglong,
+        interface_index: Dword,
+        interface_guid: Guid,
+        alias: [u16; 257],
+        description: [u16; 257],
+        physical_address_length: Dword,
+        physical_address: [u8; 32],
+        permanent_physical_address: [u8; 32],
+        mtu: Dword,
+        interface_type: Dword,
+        tunnel_type: Dword,
+        media_type: Dword,
+        physical_medium_type: Dword,
+        access_type: Dword,
+        direction_type: Dword,
+        interface_and_oper_status_flags: u8,
+        oper_status: Dword,
+        admin_status: Dword,
+        media_connect_state: Dword,
+        network_guid: Guid,
+        connection_type: Dword,
+        transmit_link_speed: Ulonglong,
+        receive_link_speed: Ulonglong,
+        in_octets: Ulonglong,
+        in_ucast_pkts: Ulonglong,
+        in_nucast_pkts: Ulonglong,
+        in_discards: Ulonglong,
+        in_errors: Ulonglong,
+        in_unknown_protos: Ulonglong,
+        in_ucast_octets: Ulonglong,
+        in_multicast_octets: Ulonglong,
+        in_broadcast_octets: Ulonglong,
+        out_octets: Ulonglong,
+        out_ucast_pkts: Ulonglong,
+        out_nucast_pkts: Ulonglong,
+        out_discards: Ulonglong,
+        out_errors: Ulonglong,
+        out_ucast_octets: Ulonglong,
+        out_multicast_octets: Ulonglong,
+        out_broadcast_octets: Ulonglong,
+        out_qlen: Ulonglong,
+    }
+
+    #[repr(C)]
+    struct MibIfTable2 {
+        num_entries: Dword,
+        _padding: Dword,
+        table: [MibIfRow2; 0],
+    }
+
+    #[repr(C)]
     struct IoRingCreateFlags {
         required: Dword,
         advisory: Dword,
+    }
+
+    fn parse_guid(value: &str) -> Result<Guid, String> {
+        let parts: Vec<&str> = value.split('-').collect();
+        if parts.len() != 5
+            || parts[0].len() != 8
+            || parts[1].len() != 4
+            || parts[2].len() != 4
+            || parts[3].len() != 4
+            || parts[4].len() != 12
+        {
+            return Err(format!("invalid GUID '{value}'"));
+        }
+        let parse = |part: &str| {
+            u64::from_str_radix(part, 16).map_err(|_| format!("invalid GUID '{value}'"))
+        };
+        let data1 =
+            u32::try_from(parse(parts[0])?).map_err(|_| format!("invalid GUID '{value}'"))?;
+        let data2 =
+            u16::try_from(parse(parts[1])?).map_err(|_| format!("invalid GUID '{value}'"))?;
+        let data3 =
+            u16::try_from(parse(parts[2])?).map_err(|_| format!("invalid GUID '{value}'"))?;
+        let data4_a =
+            u16::try_from(parse(parts[3])?).map_err(|_| format!("invalid GUID '{value}'"))?;
+        let data4_b =
+            u64::try_from(parse(parts[4])?).map_err(|_| format!("invalid GUID '{value}'"))?;
+        Ok(Guid {
+            data1,
+            data2,
+            data3,
+            data4: [
+                (data4_a >> 8) as u8,
+                data4_a as u8,
+                (data4_b >> 40) as u8,
+                (data4_b >> 32) as u8,
+                (data4_b >> 24) as u8,
+                (data4_b >> 16) as u8,
+                (data4_b >> 8) as u8,
+                data4_b as u8,
+            ],
+        })
+    }
+
+    fn query_adapter_mtu(guid: &str) -> Result<usize, String> {
+        let guid = parse_guid(guid)?;
+        let mut table = std::ptr::null_mut();
+        let status = unsafe { GetIfTable2(&mut table) };
+        if status != ERROR_SUCCESS {
+            return Err(format!("GetIfTable2 failed with Win32 error {status}"));
+        }
+        if table.is_null() {
+            return Err("GetIfTable2 returned a null table".to_string());
+        }
+        let result = unsafe {
+            let table_ref = &*table;
+            let rows = std::slice::from_raw_parts(
+                table_ref.table.as_ptr(),
+                table_ref.num_entries as usize,
+            );
+            rows.iter()
+                .find(|row| row.interface_guid == guid)
+                .map(|row| row.mtu as usize)
+                .ok_or_else(|| {
+                    format!("adapter GUID {guid:?} was not found in the interface table")
+                })
+        };
+        unsafe { FreeMibTable(table.cast()) };
+        result
     }
 
     #[repr(C)]
@@ -188,6 +310,12 @@ mod windows_runtime {
             submitted: *mut Dword,
         ) -> HResult;
         fn PopIoRingCompletion(ring: Handle, completion: *mut IoRingCompletion) -> HResult;
+    }
+
+    #[link(name = "iphlpapi")]
+    unsafe extern "system" {
+        fn GetIfTable2(table: *mut *mut MibIfTable2) -> Dword;
+        fn FreeMibTable(table: *mut core::ffi::c_void);
     }
 
     struct Endpoint {
@@ -364,6 +492,19 @@ mod windows_runtime {
                 ));
             }
             let reads_per_endpoint = total_depth / ENDPOINT_COUNT;
+            let mtu_a = query_adapter_mtu(&endpoint_configs[0].guid)?;
+            let mtu_b = query_adapter_mtu(&endpoint_configs[1].guid)?;
+            if mtu_a != mtu_b {
+                return Err(format!("endpoint MTUs differ: {} and {}", mtu_a, mtu_b));
+            }
+            let expected_mtu = FRAME_MAXIMUM
+                .checked_sub(wintap_switch_core::FRAME_MINIMUM)
+                .ok_or_else(|| "frame maximum is smaller than the Ethernet header".to_string())?;
+            if mtu_a != expected_mtu {
+                return Err(format!(
+                    "endpoint MTU {mtu_a} does not match configured frame maximum {FRAME_MAXIMUM}"
+                ));
+            }
             let total_bytes = total_depth
                 .checked_mul(FRAME_MAXIMUM)
                 .ok_or_else(|| "read depth buffer-size calculation overflowed".to_string())?;

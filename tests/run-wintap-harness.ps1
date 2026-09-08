@@ -401,7 +401,7 @@ function Invoke-OverlappedIo(
 function Read-Frame(
     [IntPtr]$Handle,
     [int]$TimeoutMilliseconds = 1000,
-    [int]$MaximumLength = 1514
+    [int]$MaximumLength = 65549
 ) {
     Invoke-OverlappedIo $Handle ([byte[]]::new($MaximumLength)) $false `
         $TimeoutMilliseconds
@@ -1021,7 +1021,7 @@ try {
         "Exclusive device open unexpectedly succeeded twice."
 
     Assert-ZeroLengthWrite $handle
-    foreach ($invalidLength in @(1, 13, 1515)) {
+    foreach ($invalidLength in @(1, 13, 65550)) {
         Assert-InvalidFrameWrite $handle $invalidLength
     }
 
@@ -1032,6 +1032,12 @@ try {
         $frame[$i] = [byte]$i
     }
     Write-Frame $handle $frame
+
+    $maximumFrame = [byte[]]::new(65549)
+    for ($i = 0; $i -lt $maximumFrame.Length; ++$i) {
+        $maximumFrame[$i] = [byte]($i -band 0xff)
+    }
+    Write-Frame $handle $maximumFrame
 
     if ($Extended) {
         Write-Host "Extended outstanding-read cancellation checks deferred with TC-040."

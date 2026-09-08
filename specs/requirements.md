@@ -116,7 +116,8 @@ support overlapped I/O and cancellation.
 with bounded buffering, backpressure when full, and deterministic completion or
 cancellation.
 
-Nonzero writes shorter than 14 bytes or longer than 1514 bytes shall complete
+Nonzero writes shorter than 14 bytes or longer than the negotiated maximum
+frame size shall complete
 promptly without enqueuing a frame, report `ERROR_INVALID_PARAMETER` (87), and
 leave subsequent valid read/write I/O operational. A zero-byte `WriteFile` is a
 native Win32 no-op that completes before dispatching to the driver.

@@ -188,7 +188,8 @@ and stopped or deleted only through the verified NetAdapterCx/WDF lifecycle.
    and inline capture finish.
 2. The driver validates frame length and required Ethernet constraints before
    accepting the frame.
-3. A nonzero write shorter than 14 bytes or longer than 1514 bytes completes
+3. A nonzero write shorter than 14 bytes or longer than the negotiated maximum
+   frame size completes
    with `STATUS_INVALID_PARAMETER` before it enters a manual queue, consumes
    pending I/O capacity, or creates a frame object. A zero-byte `WriteFile`
    completes as a Win32 no-op before the request reaches this callback.
@@ -460,7 +461,7 @@ reschedules required passive drain/completion work.
 
 - Invalid frame lengths, unsupported flags, closed queues, unavailable owner
   state, and cancelled requests shall return explicit, documented errors.
-  Nonzero control writes outside the 14-to-1514-byte frame range shall
+  Nonzero control writes outside the 14-byte-to-negotiated-maximum frame range shall
   complete with `STATUS_INVALID_PARAMETER`, which the Win32 caller observes as
   `ERROR_INVALID_PARAMETER` (87). Zero-byte `WriteFile` calls are native
   Win32 no-ops and do not dispatch to the driver.
@@ -683,7 +684,7 @@ runtime probes and dedicated validation confirm support; otherwise the switch
 continues with the validated contiguous path. If required read/write support
 is absent, startup fails explicitly.
 
-The switch registers both handles and a pool of 1514-byte buffers sized from
+The switch registers both handles and a pool of negotiated-maximum-sized buffers sized from
 the validated shared total. The total is split equally between the two
 endpoints, with checked multiplication and allocation before ring
 registration. FDB capacity remains 4,096 entries. Each buffer slot has the
@@ -852,8 +853,9 @@ same assertions as hosted CI and do not rely on an external network peer.
 
 - The selected WDK baseline uses `EVT_PACKET_QUEUE_ADVANCE` for both directions
   and the ring iterator APIs listed above.
-- The initial frame contract is 14 through 1514 bytes, with a 1500-byte
-  Ethernet payload/MTU. VLAN-tagged frames remain subject to the fixed maximum.
+- The selected frame contract is 14 through 65,549 bytes, with a 65,535-byte
+  Ethernet payload/MTU. VLAN-tagged frames remain subject to the selected
+  maximum.
 - The default directional frame queue limit is 256 frames and is not yet
   registry-configurable.
 - **[ASSUMPTION]** A copy at the user/kernel boundary is acceptable for the

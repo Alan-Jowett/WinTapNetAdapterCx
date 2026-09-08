@@ -82,7 +82,8 @@ const PENDING_READ_LIMIT: usize = 256;
 const PENDING_WRITE_LIMIT: usize = 256;
 const FRAME_QUEUE_LIMIT: usize = 256;
 const FRAME_MINIMUM: usize = 14;
-const FRAME_MAXIMUM: usize = 1514;
+const MTU_SIZE: usize = 65_535;
+const FRAME_MAXIMUM: usize = MTU_SIZE + FRAME_MINIMUM;
 const MAXIMUM_MULTICAST_ADDRESSES: usize = 64;
 const ETHERNET_ADDRESS_LENGTH: usize = 6;
 const TAP_INTERFACE_CLASS: GUID = GUID {
@@ -1917,7 +1918,17 @@ extern "C" fn evt_device_release_hardware(
 }
 
 fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
-    let injection_queue = match FrameQueue::try_new(FRAME_QUEUE_LIMIT) {
+    let queue_byte_limit = match FRAME_QUEUE_LIMIT.checked_mul(FRAME_MAXIMUM) {
+        Some(limit) => limit,
+        None => {
+            debug_status(b"FrameQueueBudget", STATUS_INSUFFICIENT_RESOURCES);
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+            }
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    };
+    let injection_queue = match FrameQueue::try_new(FRAME_QUEUE_LIMIT, queue_byte_limit) {
         Ok(queue) => queue,
         Err(_) => {
             debug_status(b"InjectionQueueCreate", STATUS_INSUFFICIENT_RESOURCES);
@@ -1927,7 +1938,7 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
     };
-    let capture_queue = match FrameQueue::try_new(FRAME_QUEUE_LIMIT) {
+    let capture_queue = match FrameQueue::try_new(FRAME_QUEUE_LIMIT, queue_byte_limit) {
         Ok(queue) => queue,
         Err(_) => {
             debug_status(b"CaptureQueueCreate", STATUS_INSUFFICIENT_RESOURCES);

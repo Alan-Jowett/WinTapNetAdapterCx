@@ -4,8 +4,17 @@
 
 use std::collections::HashMap;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct Guid {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
+
 pub const FRAME_MINIMUM: usize = 14;
-pub const FRAME_MAXIMUM: usize = 1514;
+pub const FRAME_MAXIMUM: usize = 65_549;
 pub const FDB_CAPACITY: usize = 4096;
 pub const IO_RING_BASELINE_VERSION: u32 = 300;
 
