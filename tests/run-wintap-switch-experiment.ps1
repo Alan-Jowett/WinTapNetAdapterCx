@@ -107,9 +107,10 @@ function Get-AdapterForChild([Guid]$Guid) {
 }
 
 function Add-PointToPointAddress($Adapter, [string]$Address, [string]$PeerAddress) {
+    Set-NetIPInterface -InterfaceIndex $Adapter.ifIndex -AddressFamily IPv4 `
+        -DadTransmits 0 -ErrorAction Stop | Out-Null
     New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $Address `
-        -PrefixLength 32 -PolicyStore ActiveStore -DadTransmits 0 `
-        -ErrorAction Stop | Out-Null
+        -PrefixLength 32 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
     $script:createdAddresses += [pscustomobject]@{
         InterfaceIndex = $Adapter.ifIndex
         Address = $Address
