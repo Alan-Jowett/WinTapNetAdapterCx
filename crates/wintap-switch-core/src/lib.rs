@@ -14,7 +14,7 @@ pub struct Guid {
 }
 
 pub const FRAME_MINIMUM: usize = 14;
-pub const FRAME_MAXIMUM: usize = 65_549;
+pub const FRAME_MAXIMUM: usize = 65_535;
 pub const FDB_CAPACITY: usize = 4096;
 pub const IO_RING_BASELINE_VERSION: u32 = 300;
 

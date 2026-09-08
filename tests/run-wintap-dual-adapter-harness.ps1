@@ -890,7 +890,7 @@ function Start-IoOperation(
     [object]$SourceOperation,
     [string]$Description
 ) {
-    Assert-True ($Length -ge 0 -and $Length -le 65549) "$Description has invalid I/O length $Length."
+    Assert-True ($Length -ge 0 -and $Length -le 65535) "$Description has invalid I/O length $Length."
     $overlapped = New-UnmanagedOverlapped
     [uint32]$eventError = 0
     $event = [WinTapDualNative]::CreateEventWithError(
@@ -986,7 +986,7 @@ function Dispose-BufferedIoOperation($Operation) {
 }
 
 function Copy-FrameFromRead($Operation) {
-    Assert-True ($Operation.Transferred -ge 14 -and $Operation.Transferred -le 65549) `
+    Assert-True ($Operation.Transferred -ge 14 -and $Operation.Transferred -le 65535) `
         "$($Operation.Description) received out-of-range Ethernet length $($Operation.Transferred)."
     [byte[]]$frame = [byte[]]::new([int]$Operation.Transferred)
     [Runtime.InteropServices.Marshal]::Copy($Operation.Buffer, $frame, 0, $frame.Length)
@@ -995,9 +995,9 @@ function Copy-FrameFromRead($Operation) {
 
 function New-RelayRead($Relay, [string]$Direction) {
     $handle = if ($Direction -eq "AtoB") { $Relay.HandleA } else { $Relay.HandleB }
-    $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(65549)
+    $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(65535)
     try {
-        $read = Start-IoOperation $handle $buffer 65549 $false $null "$Direction source read"
+        $read = Start-IoOperation $handle $buffer 65535 $false $null "$Direction source read"
         $read.OwnsBuffer = $true
         $read | Add-Member -NotePropertyName Direction -NotePropertyValue $Direction
         return $read
@@ -1452,7 +1452,7 @@ function Assert-IPv6IcmpFrame($Relay, [string]$Direction, [byte[]]$Frame) {
 }
 
 function Observe-RelayFrame($Relay, [string]$Direction, [byte[]]$Frame) {
-    Assert-True ($Frame.Length -ge 14 -and $Frame.Length -le 65549) `
+    Assert-True ($Frame.Length -ge 14 -and $Frame.Length -le 65535) `
         "Relay received an out-of-range Ethernet frame length $($Frame.Length)."
     Assert-NoReflectedInjection $Relay $Direction $Frame
     $etherType = Get-UInt16BigEndian $Frame 12

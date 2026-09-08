@@ -401,7 +401,7 @@ function Invoke-OverlappedIo(
 function Read-Frame(
     [IntPtr]$Handle,
     [int]$TimeoutMilliseconds = 1000,
-    [int]$MaximumLength = 65549
+    [int]$MaximumLength = 65535
 ) {
     Invoke-OverlappedIo $Handle ([byte[]]::new($MaximumLength)) $false `
         $TimeoutMilliseconds
@@ -1021,7 +1021,7 @@ try {
         "Exclusive device open unexpectedly succeeded twice."
 
     Assert-ZeroLengthWrite $handle
-    foreach ($invalidLength in @(1, 13, 65550)) {
+    foreach ($invalidLength in @(1, 13, 65536)) {
         Assert-InvalidFrameWrite $handle $invalidLength
     }
 
@@ -1033,7 +1033,7 @@ try {
     }
     Write-Frame $handle $frame
 
-    $maximumFrame = [byte[]]::new(65549)
+    $maximumFrame = [byte[]]::new(65535)
     for ($i = 0; $i -lt $maximumFrame.Length; ++$i) {
         $maximumFrame[$i] = [byte]($i -band 0xff)
     }

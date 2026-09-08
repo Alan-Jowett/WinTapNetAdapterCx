@@ -122,6 +122,12 @@ promptly without enqueuing a frame, report `ERROR_INVALID_PARAMETER` (87), and
 leave subsequent valid read/write I/O operational. A zero-byte `WriteFile` is a
 native Win32 no-op that completes before dispatching to the driver.
 
+The negotiated MTU shall be 65,521 bytes. The complete Ethernet frame contract
+shall therefore be 14 through 65,535 bytes, because NetAdapterCx rejects a
+`MaximumFrameSize` above 65,535 bytes. Driver, switch, queue, and harness
+validation shall use this same maximum, and a 65,536-byte frame shall be
+rejected explicitly.
+
 ### REQ-003 — Windows driver lifecycle
 
 **Before:** No lifecycle behavior is specified.  

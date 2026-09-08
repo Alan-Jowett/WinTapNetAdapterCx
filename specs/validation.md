@@ -14,6 +14,7 @@
 | --- | --- | --- |
 | VAL-001 | REQ-001 | Build and install the NetAdapterCx driver; verify one virtual Ethernet adapter appears with the expected capabilities and identity. |
 | VAL-002 | REQ-002 | Write valid Ethernet frames through the device handle and verify delivery to the Windows networking stack; verify invalid nonzero lengths complete with error 87 without enqueuing a frame and zero-byte writes complete as Win32 no-ops; transmit frames through the stack and verify complete reads in user mode without crossing the two directions. |
+| VAL-037 | REQ-002 | Verify the adapter reports MTU 65,521 and complete-frame maximum 65,535; write and forward a 65,535-byte frame successfully, and reject a 65,536-byte frame with `ERROR_INVALID_PARAMETER` without destabilizing the adapter. |
 | VAL-003 | REQ-003 | Exercise start, pause, restart, stop, surprise removal, owner close, process termination, and cancellation; verify no hangs, double completions, or leaked objects. |
 | VAL-004 | REQ-004 | Build and execute the supported x64 and ARM64 packages on Windows 10 version 2004+ and reject unsupported platform combinations explicitly. |
 | VAL-005 | REQ-005 | Verify non-administrator open/control attempts fail; verify malformed nonzero lengths complete with error 87 and invalid I/O requests cannot corrupt memory or disclose data. |

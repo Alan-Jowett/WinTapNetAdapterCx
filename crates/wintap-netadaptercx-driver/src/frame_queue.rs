@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::{collections::VecDeque, vec::Vec};
 
 pub const FRAME_MINIMUM: usize = 14;
-pub const FRAME_MAXIMUM: usize = 65_549;
+pub const FRAME_MAXIMUM: usize = 65_535;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueueError {

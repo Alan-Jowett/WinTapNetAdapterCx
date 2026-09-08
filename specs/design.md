@@ -853,9 +853,10 @@ same assertions as hosted CI and do not rely on an external network peer.
 
 - The selected WDK baseline uses `EVT_PACKET_QUEUE_ADVANCE` for both directions
   and the ring iterator APIs listed above.
-- The selected frame contract is 14 through 65,549 bytes, with a 65,535-byte
-  Ethernet payload/MTU. VLAN-tagged frames remain subject to the selected
-  maximum.
+- The selected frame contract is 14 through 65,535 bytes, with a 65,521-byte
+  Ethernet payload/MTU. NetAdapterCx's complete-frame ceiling is 65,535 bytes;
+  the implementation shall not advertise a larger `MaximumFrameSize`.
+  VLAN-tagged frames remain subject to the selected maximum.
 - The default directional frame queue limit is 256 frames and is not yet
   registry-configurable.
 - **[ASSUMPTION]** A copy at the user/kernel boundary is acceptable for the
