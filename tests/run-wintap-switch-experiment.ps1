@@ -38,6 +38,9 @@ param(
     [ValidateRange(0, 60000)]
     [int]$CompletionTimeoutMilliseconds = 1,
 
+    [ValidateRange(0, 65521)]
+    [uint32]$RequestedMtu = 0,
+
     [switch]$Stats,
 
     [string]$IperfPath,
@@ -204,7 +207,8 @@ try {
 
     foreach ($guid in $childGuids) {
         $createdChildren += $guid
-        $child = New-WinTapBusChild $guid $TimeoutSeconds
+        $child = New-WinTapBusChild $guid -RequestedMtu $RequestedMtu `
+            -TimeoutSeconds $TimeoutSeconds
         $childInterfaces[$guid.ToString()] = $child.InterfacePath
     }
 

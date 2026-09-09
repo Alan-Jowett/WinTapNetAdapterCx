@@ -369,6 +369,7 @@ mod windows_runtime {
         reads_per_endpoint: usize,
         wait_operations: Dword,
         completion_wait_milliseconds: Dword,
+        frame_maximum: usize,
         stats: RuntimeStats,
     }
 
@@ -497,16 +498,15 @@ mod windows_runtime {
             if mtu_a != mtu_b {
                 return Err(format!("endpoint MTUs differ: {} and {}", mtu_a, mtu_b));
             }
-            let expected_mtu = FRAME_MAXIMUM
-                .checked_sub(wintap_switch_core::FRAME_MINIMUM)
-                .ok_or_else(|| "frame maximum is smaller than the Ethernet header".to_string())?;
-            if mtu_a != expected_mtu {
-                return Err(format!(
-                    "endpoint MTU {mtu_a} does not match configured frame maximum {FRAME_MAXIMUM}"
-                ));
+            if !(1_500..=65_521).contains(&mtu_a) {
+                return Err(format!("endpoint MTU {mtu_a} is outside supported limits"));
             }
+            let frame_maximum = mtu_a
+                .checked_add(wintap_switch_core::FRAME_MINIMUM)
+                .filter(|value| *value <= FRAME_MAXIMUM)
+                .ok_or_else(|| format!("endpoint MTU {mtu_a} exceeds switch frame limits"))?;
             let total_bytes = total_depth
-                .checked_mul(FRAME_MAXIMUM)
+                .checked_mul(frame_maximum)
                 .ok_or_else(|| "read depth buffer-size calculation overflowed".to_string())?;
             let queue_size = Dword::try_from(total_depth)
                 .map_err(|_| "read depth exceeds I/O-ring limits".to_string())?;
@@ -562,15 +562,15 @@ mod windows_runtime {
             buffers
                 .try_reserve_exact(total_depth)
                 .map_err(|_| "buffer pool allocation failed".to_string())?;
-            if total_bytes < FRAME_MAXIMUM {
+            if total_bytes < frame_maximum {
                 return Err("read depth buffer-size calculation was invalid".to_string());
             }
             for _ in 0..total_depth {
                 let mut buffer = Vec::new();
                 buffer
-                    .try_reserve_exact(FRAME_MAXIMUM)
+                    .try_reserve_exact(frame_maximum)
                     .map_err(|_| "buffer pool allocation failed".to_string())?;
-                buffer.resize(FRAME_MAXIMUM, 0);
+                buffer.resize(frame_maximum, 0);
                 buffers.push(buffer);
             }
             let mut registrations = Vec::new();
@@ -580,7 +580,7 @@ mod windows_runtime {
             for buffer in &buffers {
                 registrations.push(IoRingBufferInfo {
                     address: buffer.as_ptr() as *mut u8,
-                    length: FRAME_MAXIMUM as Dword,
+                    length: frame_maximum as Dword,
                 });
             }
             let registration_count = Dword::try_from(registrations.len())
@@ -650,6 +650,7 @@ mod windows_runtime {
                 reads_per_endpoint,
                 wait_operations,
                 completion_wait_milliseconds,
+                frame_maximum,
                 stats: RuntimeStats::new(stats_enabled),
             };
             for slot in 0..total_depth {
@@ -682,7 +683,7 @@ mod windows_runtime {
                         self.ring,
                         handle_ref(endpoint.handle),
                         buffer_ref(slot as Dword),
-                        FRAME_MAXIMUM as Dword,
+                        self.frame_maximum as Dword,
                         0,
                         encode_completion(slot, completion.generation)?,
                         IORING_SQE_FLAG_NONE,
@@ -695,7 +696,7 @@ mod windows_runtime {
                 handle: endpoint.handle,
                 user_data: encode_completion(slot, completion.generation)?,
                 is_write: false,
-                length: FRAME_MAXIMUM as Dword,
+                length: self.frame_maximum as Dword,
                 queued: true,
                 submitted: false,
                 busy_retries: 0,
@@ -788,7 +789,7 @@ mod windows_runtime {
                     .map_err(|error| format!("read completion: {error:?}"))?;
                 let source = self.endpoint_for_slot(slot).id;
                 let length = completion.information as usize;
-                if length <= FRAME_MAXIMUM {
+                if length <= self.frame_maximum {
                     let recipients = match switch.forward(source, &self.buffers[slot][..length]) {
                         Ok(recipients) => recipients,
                         Err(ForwardingError::InvalidFrame(_)) => {

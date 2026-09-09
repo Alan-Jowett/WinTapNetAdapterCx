@@ -82,8 +82,8 @@ const PENDING_READ_LIMIT: usize = 256;
 const PENDING_WRITE_LIMIT: usize = 256;
 const FRAME_QUEUE_LIMIT: usize = 256;
 const FRAME_MINIMUM: usize = 14;
-const MTU_SIZE: usize = 65_521;
-const FRAME_MAXIMUM: usize = MTU_SIZE + FRAME_MINIMUM;
+const DEFAULT_MTU: usize = 1_500;
+const MAXIMUM_MTU: usize = 65_521;
 const MAXIMUM_MULTICAST_ADDRESSES: usize = 64;
 const ETHERNET_ADDRESS_LENGTH: usize = 6;
 const TAP_INTERFACE_CLASS: GUID = GUID {
@@ -105,6 +105,8 @@ static WORK_ITEM_CONTEXT_NAME: &[u8] = b"WINTAP_WORK_ITEM_CONTEXT\0";
 #[repr(C)]
 struct InstanceState {
     guid: GUID,
+    mtu: usize,
+    frame_maximum: usize,
     mac_address: [u8; ETHERNET_ADDRESS_LENGTH],
     pnp_device: WDFDEVICE,
     adapter: netadaptercx_sys::NETADAPTER,
@@ -133,9 +135,11 @@ struct InstanceState {
 }
 
 impl InstanceState {
-    fn new(guid: GUID) -> Self {
+    fn new(guid: GUID, mtu: usize) -> Self {
         Self {
             guid,
+            mtu,
+            frame_maximum: mtu + FRAME_MINIMUM,
             mac_address: mac_address_from_guid(&guid),
             pnp_device: core::ptr::null_mut(),
             adapter: core::ptr::null_mut(),
@@ -165,7 +169,7 @@ impl InstanceState {
     }
 }
 
-fn allocate_instance_state(guid: GUID) -> *mut InstanceState {
+fn allocate_instance_state(guid: GUID, mtu: usize) -> *mut InstanceState {
     let layout = Layout::new::<InstanceState>();
     let state = unsafe {
         // SAFETY: The layout exactly describes the InstanceState allocation.
@@ -174,7 +178,7 @@ fn allocate_instance_state(guid: GUID) -> *mut InstanceState {
     if !state.is_null() {
         unsafe {
             // SAFETY: The allocation is uniquely owned and properly aligned for InstanceState.
-            state.write(InstanceState::new(guid));
+            state.write(InstanceState::new(guid, mtu));
         }
     }
     state
@@ -516,8 +520,8 @@ extern "C" fn evt_driver_device_add(
         }
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    let guid = match child_guid_from_hardware_id(_pnp_device) {
-        Ok(guid) => guid,
+    let (guid, mtu) = match child_properties_from_hardware_id(_pnp_device) {
+        Ok(properties) => properties,
         Err(status) => {
             unsafe {
                 call_unsafe_wdf_function_binding!(WdfObjectDelete, _pnp_device.cast());
@@ -526,7 +530,7 @@ extern "C" fn evt_driver_device_add(
             return status;
         }
     };
-    let state = allocate_instance_state(guid);
+    let state = allocate_instance_state(guid, mtu);
     if state.is_null() {
         unsafe {
             call_unsafe_wdf_function_binding!(WdfObjectDelete, _pnp_device.cast());
@@ -633,7 +637,46 @@ fn parse_child_guid_from_hardware_id(hardware_id: &[u16]) -> Option<GUID> {
     None
 }
 
-fn child_guid_from_hardware_id(device: WDFDEVICE) -> Result<GUID, NTSTATUS> {
+fn parse_child_mtu_from_hardware_id(hardware_id: &[u16]) -> Option<usize> {
+    const PREFIX: [u16; 14] = [
+        b'W' as u16,
+        b'I' as u16,
+        b'N' as u16,
+        b'T' as u16,
+        b'A' as u16,
+        b'P' as u16,
+        b'B' as u16,
+        b'U' as u16,
+        b'S' as u16,
+        b'M' as u16,
+        b'T' as u16,
+        b'U' as u16,
+        b'\\' as u16,
+        0,
+    ];
+    if !hardware_id.starts_with(&PREFIX[..PREFIX.len() - 1]) {
+        return None;
+    }
+    let mut value = 0usize;
+    for character in &hardware_id[PREFIX.len() - 1..] {
+        if *character == 0 {
+            break;
+        }
+        if !(b'0' as u16..=b'9' as u16).contains(character) {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add((*character - b'0' as u16) as usize)?;
+    }
+    if (DEFAULT_MTU..=MAXIMUM_MTU).contains(&value) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn child_properties_from_hardware_id(device: WDFDEVICE) -> Result<(GUID, usize), NTSTATUS> {
     let mut hardware_ids = [0u16; 128];
     let mut result_length: ULONG = 0;
     let status = unsafe {
@@ -654,6 +697,8 @@ fn child_guid_from_hardware_id(device: WDFDEVICE) -> Result<GUID, NTSTATUS> {
     }
     let character_count =
         (result_length as usize / core::mem::size_of::<u16>()).min(hardware_ids.len());
+    let mut guid = None;
+    let mut mtu = None;
     let mut offset = 0;
     while offset < character_count {
         let Some(length) = hardware_ids[offset..character_count]
@@ -665,14 +710,23 @@ fn child_guid_from_hardware_id(device: WDFDEVICE) -> Result<GUID, NTSTATUS> {
         if length == 0 {
             break;
         }
-        if let Some(guid) =
+        if let Some(parsed_guid) =
             parse_child_guid_from_hardware_id(&hardware_ids[offset..offset + length])
         {
-            return Ok(guid);
+            guid = Some(parsed_guid);
+        }
+        if let Some(value) =
+            parse_child_mtu_from_hardware_id(&hardware_ids[offset..offset + length])
+        {
+            mtu = Some(value);
         }
         offset += length + 1;
     }
-    Err(STATUS_INVALID_PARAMETER)
+    match (guid, mtu) {
+        (Some(guid), Some(mtu)) => Ok((guid, mtu)),
+        (Some(guid), None) => Ok((guid, DEFAULT_MTU)),
+        _ => Err(STATUS_INVALID_PARAMETER),
+    }
 }
 
 unsafe fn net_function<T: Copy>(index: usize) -> T {
@@ -785,6 +839,7 @@ unsafe fn create_adapter(device: WDFDEVICE, state: &mut InstanceState) -> NTSTAT
 fn configure_adapter_link_state(
     adapter: netadaptercx_sys::NETADAPTER,
     mac_address: [u8; ETHERNET_ADDRESS_LENGTH],
+    mtu: usize,
 ) {
     let mut link_layer = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES {
         Size: core::mem::size_of::<netadaptercx_sys::NET_ADAPTER_LINK_LAYER_CAPABILITIES>()
@@ -815,11 +870,7 @@ fn configure_adapter_link_state(
         )
     };
     unsafe {
-        set_mtu(
-            netadaptercx_sys::NetDriverGlobals,
-            adapter,
-            (FRAME_MAXIMUM - FRAME_MINIMUM) as ULONG,
-        );
+        set_mtu(netadaptercx_sys::NetDriverGlobals, adapter, mtu as ULONG);
     }
 
     let address = netadaptercx_sys::NET_ADAPTER_LINK_LAYER_ADDRESS {
@@ -1279,7 +1330,9 @@ fn capture_transmit_packets(
                     break;
                 }
             };
-            if !validate_fragment(fragment, address, &mut total_length) {
+            if !validate_fragment(fragment, address, &mut total_length, unsafe {
+                (*state).frame_maximum
+            }) {
                 valid = false;
                 break;
             }
@@ -1291,7 +1344,7 @@ fn capture_transmit_packets(
                 }
             };
         }
-        if !valid || !(FRAME_MINIMUM..=FRAME_MAXIMUM).contains(&total_length) {
+        if !valid || !(FRAME_MINIMUM..=unsafe { (*state).frame_maximum }).contains(&total_length) {
             break;
         }
 
@@ -1492,6 +1545,7 @@ fn validate_fragment(
     fragment: &netadaptercx_sys::NET_FRAGMENT,
     address: &netadaptercx_sys::NET_FRAGMENT_VIRTUAL_ADDRESS,
     total_length: &mut usize,
+    frame_maximum: usize,
 ) -> bool {
     if address.VirtualAddress.is_null() {
         return false;
@@ -1501,8 +1555,8 @@ fn validate_fragment(
     let valid_length = fragment.ValidLength() as usize;
     offset <= capacity
         && valid_length <= capacity - offset
-        && valid_length <= FRAME_MAXIMUM
-        && *total_length <= FRAME_MAXIMUM - valid_length
+        && valid_length <= frame_maximum
+        && *total_length <= frame_maximum - valid_length
         && {
             *total_length += valid_length;
             true
@@ -1757,17 +1811,22 @@ extern "C" fn evt_device_prepare_hardware(
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    let (adapter, mac_address) = {
+    let (adapter, mac_address, mtu, frame_maximum) = {
         let state = &mut *state_guard;
         state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
-        (state.adapter, state.mac_address)
+        (
+            state.adapter,
+            state.mac_address,
+            state.mtu,
+            state.frame_maximum,
+        )
     };
     drop(state_guard);
     if adapter.is_null() {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    configure_adapter_link_state(adapter, mac_address);
+    configure_adapter_link_state(adapter, mac_address, mtu);
 
     // Match NET_ADAPTER_TX_CAPABILITIES_INIT: this is a system-managed,
     // non-DMA path with no fragment-count limit.
@@ -1789,7 +1848,7 @@ extern "C" fn evt_device_prepare_hardware(
         AttachmentMode:
             netadaptercx_sys::_NET_RX_FRAGMENT_BUFFER_ATTACHMENT_MODE_NetRxFragmentBufferAttachmentModeSystem,
         FragmentRingNumberOfElementsHint: 0,
-        MaximumFrameSize: FRAME_MAXIMUM as u64,
+        MaximumFrameSize: frame_maximum as u64,
         MaximumNumberOfQueues: 1,
         __bindgen_anon_1:
             netadaptercx_sys::_NET_ADAPTER_RX_CAPABILITIES__bindgen_ty_1 {
@@ -1918,7 +1977,7 @@ extern "C" fn evt_device_release_hardware(
 }
 
 fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
-    let queue_byte_limit = match FRAME_QUEUE_LIMIT.checked_mul(FRAME_MAXIMUM) {
+    let queue_byte_limit = match FRAME_QUEUE_LIMIT.checked_mul(state.frame_maximum) {
         Some(limit) => limit,
         None => {
             debug_status(b"FrameQueueBudget", STATUS_INSUFFICIENT_RESOURCES);
@@ -2230,7 +2289,7 @@ extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize)
         complete_request(request, STATUS_SUCCESS);
         return;
     }
-    if !(FRAME_MINIMUM..=FRAME_MAXIMUM).contains(&length) {
+    if !(FRAME_MINIMUM..=state.frame_maximum).contains(&length) {
         complete_request(request, STATUS_INVALID_PARAMETER);
         return;
     }
@@ -2255,7 +2314,7 @@ extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize)
         complete_request(request, status);
         return;
     }
-    if input_length > FRAME_MAXIMUM {
+    if input_length > state.frame_maximum {
         release_request(&state.pending_writes);
         complete_request(request, STATUS_INVALID_BUFFER_SIZE);
         return;

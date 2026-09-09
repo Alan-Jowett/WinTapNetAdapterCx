@@ -767,14 +767,22 @@ adapter GUID. The bus rejects unknown versions, invalid operation codes,
 lengths smaller than the header, lengths exceeding the supplied buffer, and
 invalid GUIDs before allocation or mutation.
 
-Create validates the GUID, reserves the per-GUID lifecycle state, adds the
-child description, and returns an in-progress result correlated by request ID
-and GUID. It reaches terminal success only after the child publishes its TAP
+The manager protocol advances to version 2; version 1 requests are rejected
+and no compatibility shim is required because all supported consumers are in
+this repository. The version-2 request retains the bounded fixed-size
+envelope and uses its create-only `requested_mtu` field, where zero means the
+1,500-byte default. For remove, enumerate, and query, `requested_mtu` must be
+zero. The bus validates the requested MTU as 1,500 through 65,521 before
+reserving lifecycle state or adding the child description. Invalid values fail
+without child-list mutation. The selected MTU is copied into immutable
+child/PDO context and is available to the child service during device
+addition. Create then returns an in-progress result correlated by request ID
+and GUID and reaches terminal success only after the child publishes its TAP
 interface. Remove marks the GUID removing, prevents duplicate create/remove,
 requests WDF child removal, and reaches terminal success only after child PnP
-removal and interface withdrawal. Enumerate and query report only GUID,
-lifecycle state, and interface identity; the manager never opens, reads, or
-writes a TAP endpoint.
+removal and interface withdrawal. Enumerate and query report GUID, lifecycle
+state, interface identity, and the selected MTU; the manager never opens,
+reads, or writes a TAP endpoint.
 
 ### Child lifetime and TAP interface
 
@@ -853,10 +861,20 @@ same assertions as hosted CI and do not rely on an external network peer.
 
 - The selected WDK baseline uses `EVT_PACKET_QUEUE_ADVANCE` for both directions
   and the ring iterator APIs listed above.
-- The selected frame contract is 14 through 65,535 bytes, with a 65,521-byte
-  Ethernet payload/MTU. NetAdapterCx's complete-frame ceiling is 65,535 bytes;
-  the implementation shall not advertise a larger `MaximumFrameSize`.
-  VLAN-tagged frames remain subject to the selected maximum.
+- The effective Ethernet payload/MTU is supplied in the version-2
+  bus-manager child-create request. An omitted/zero `requested_mtu` selects
+  1,500 bytes; valid values range from 1,500 through 65,521 bytes. Invalid
+  values fail before child publication. The selected value is copied into
+  immutable child/PDO context and remains fixed until child removal. Version 1
+  requests are rejected.
+- The complete frame contract is 14 through `MTU + 14` bytes. NetAdapterCx's
+  complete-frame ceiling is 65,535 bytes; the implementation shall not
+  advertise a larger `MaximumFrameSize`. VLAN-tagged frames remain subject
+  to the selected maximum.
+- Driver, queue, switch, and harness limits shall consume each child's
+  effective MTU and complete-frame maximum so that a creation override cannot
+  create mismatched packet bounds. The switch shall continue to reject
+  endpoint pairs whose effective MTUs differ.
 - The default directional frame queue limit is 256 frames and is not yet
   registry-configurable.
 - **[ASSUMPTION]** A copy at the user/kernel boundary is acceptable for the

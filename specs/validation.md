@@ -14,7 +14,8 @@
 | --- | --- | --- |
 | VAL-001 | REQ-001 | Build and install the NetAdapterCx driver; verify one virtual Ethernet adapter appears with the expected capabilities and identity. |
 | VAL-002 | REQ-002 | Write valid Ethernet frames through the device handle and verify delivery to the Windows networking stack; verify invalid nonzero lengths complete with error 87 without enqueuing a frame and zero-byte writes complete as Win32 no-ops; transmit frames through the stack and verify complete reads in user mode without crossing the two directions. |
-| VAL-037 | REQ-002 | Verify the adapter reports MTU 65,521 and complete-frame maximum 65,535; write and forward a 65,535-byte frame successfully, and reject a 65,536-byte frame with `ERROR_INVALID_PARAMETER` without destabilizing the adapter. |
+| VAL-037 | REQ-002 | With the maximum valid configuration, verify the adapter reports MTU 65,521 and complete-frame maximum 65,535; write and forward a 65,535-byte frame successfully, and reject a 65,536-byte frame with `ERROR_INVALID_PARAMETER` without destabilizing the adapter. |
+| VAL-038 | REQ-002, REQ-046 | Verify omitted creation MTU defaults to 1,500 and frame maximum 1,514; valid creation values including 1,500 and 65,521 produce matching capabilities and packet bounds; below-minimum and above-maximum values fail before child publication; recreated children accept a different MTU; active children have no runtime MTU mutation path; and switch startup rejects endpoints with mismatched effective MTUs. |
 | VAL-003 | REQ-003 | Exercise start, pause, restart, stop, surprise removal, owner close, process termination, and cancellation; verify no hangs, double completions, or leaked objects. |
 | VAL-004 | REQ-004 | Build and execute the supported x64 and ARM64 packages on Windows 10 version 2004+ and reject unsupported platform combinations explicitly. |
 | VAL-005 | REQ-005 | Verify non-administrator open/control attempts fail; verify malformed nonzero lengths complete with error 87 and invalid I/O requests cannot corrupt memory or disclose data. |
@@ -37,7 +38,7 @@
 | VAL-022 | REQ-024 | Verify passive-level TX callbacks deliver complete frames directly to compatible pending READ IRPs before returning ring entries; verify elevated-level callbacks use nonpaged capture and passive deferred completion, no TX entry is held indefinitely, too-small reads preserve frame ownership, and cancellation/teardown complete each request exactly once. |
 | VAL-023 | REQ-025 | Verify passive READ delivery claims frame/request ownership under the state lock but performs WDF buffer access, copying, requeue, and completion only after releasing it; verify no duplicate claims across packet callbacks, `evt_io_read`, and the work item, including too-small-buffer, cancellation, stop, and teardown races. |
 | VAL-024 | REQ-026 | Install the bus and child packages; create, enumerate, and remove children; verify one bus parent and independently managed adapters per active child. |
-| VAL-025 | REQ-027 | Verify non-administrator manager requests and malformed version, length, opcode, and GUID fields fail without child-list mutation, disclosure, leak, or bugcheck. |
+| VAL-025 | REQ-027, REQ-046 | Verify non-administrator manager requests and malformed version, length, opcode, GUID, and MTU fields fail without child-list mutation, disclosure, leak, or bugcheck; verify version 1 requests are rejected and version 2 is required. |
 | VAL-026 | REQ-028, REQ-031 | Create at least three distinct GUID children concurrently; verify one child per GUID, isolated TAP I/O, and explicit resource-exhaustion failure without partial publication. |
 | VAL-027 | REQ-029, REQ-032 | Race create, explicit remove, surprise removal, and bus teardown; verify terminal operation correlation, interface withdrawal, and exactly-once child I/O completion. |
 | VAL-028 | REQ-030 | Verify distinct GUID-correlated TAP interfaces and independent exclusive owners; reject fixed-path and ordinal-discovery assumptions. |
@@ -119,6 +120,10 @@
 | TC-083 | Verify contributor documentation states the MIT policy, supported comment forms, preamble rules, local hook usage, CI behavior, and the process for requesting a justified exclusion. |
 | TC-084 | Add governed files in every repository directory and supported extension family. Verify full-tree, staged, pre-commit, and CI paths apply one consistent policy without directory-specific bypasses. |
 | TC-085 | Run the switch with both dynamic endpoints while forcing transient `ERROR_BUSY` I/O-ring completions. Verify bounded backoff retries the same operation no more than eight times without slot reuse, frame loss caused by premature buffer release, stale completions, or unbounded looping; verify retry exhaustion cancels and releases the consumed slot exactly once before shutdown, and fatal completion errors remain surfaced. |
+| TC-086 | Submit a version-2 create request with `requested_mtu=0`; verify the manager reports the selected MTU as 1,500, the adapter advertises frame maximum 1,514, and normal packet acceptance/rejection bounds apply. |
+| TC-087 | Create children with valid MTU properties of 1,500, an intermediate value, and 65,521; verify the selected value is reported and the advertised MTU, `MaximumFrameSize`, queue limits, maximum accepted frame, and maximum-plus-one rejection all match. |
+| TC-088 | Submit version-2 create requests with zero, below-minimum, above-maximum, malformed, truncated, and unsupported MTU fields; submit version-1 requests and non-create requests with nonzero `requested_mtu`; verify explicit failure before child publication and no partial child state. |
+| TC-089 | Remove and recreate a child with a different MTU; verify the new value applies, an active child has no runtime MTU mutation path, and the switch rejects a pair whose effective MTUs differ. |
 
 ## Functional tests
 

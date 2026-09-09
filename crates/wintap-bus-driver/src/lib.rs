@@ -32,7 +32,7 @@ const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034_u32 as i32;
 const STATUS_UNSUCCESSFUL: NTSTATUS = 0xC000_0001_u32 as i32;
 
-const MANAGER_PROTOCOL_VERSION: u16 = 1;
+const MANAGER_PROTOCOL_VERSION: u16 = 2;
 const MANAGER_OPERATION_CREATE: u16 = 1;
 const MANAGER_OPERATION_REMOVE: u16 = 2;
 const MANAGER_OPERATION_ENUMERATE: u16 = 3;
@@ -40,6 +40,9 @@ const MANAGER_OPERATION_QUERY: u16 = 4;
 const MANAGER_IOCTL: ULONG = 0x0022_2004;
 const MAX_INTERFACE_CHARS: usize = 260;
 const MAX_MANAGER_OUTPUT: usize = 64 * 1024;
+const DEFAULT_MTU: u32 = 1_500;
+const MINIMUM_MTU: u32 = 1_500;
+const MAXIMUM_MTU: u32 = 65_521;
 
 const LIFECYCLE_ABSENT: u32 = 0;
 const LIFECYCLE_CREATING: u32 = 1;
@@ -159,6 +162,7 @@ static CHILD_PDO_CONTEXT_NAME: &[u8] = b"WINTAP_CHILD_PDO_CONTEXT\0";
 struct ChildIdentification {
     header: WDF_CHILD_IDENTIFICATION_DESCRIPTION_HEADER,
     guid: GUID,
+    mtu: u32,
 }
 
 #[repr(C)]
@@ -169,7 +173,7 @@ struct ManagerRequest {
     request_id: u64,
     adapter_guid: GUID,
     cursor: u32,
-    reserved: u32,
+    requested_mtu: u32,
 }
 
 #[repr(C)]
@@ -190,6 +194,7 @@ struct ManagerRecord {
     lifecycle: u32,
     terminal_status: NTSTATUS,
     request_id: u64,
+    mtu: u32,
     interface_length: u16,
     _padding: u16,
     interface_name: [u16; MAX_INTERFACE_CHARS],
@@ -206,6 +211,7 @@ struct ChildNode {
     lifecycle: u32,
     terminal_status: NTSTATUS,
     request_id: u64,
+    mtu: u32,
     pdo: WDFDEVICE,
     interface_length: u16,
     interface_name: [u16; MAX_INTERFACE_CHARS],
@@ -228,6 +234,7 @@ struct ChildPdoContext {
     bus_state: *mut BusState,
     bus_device: WDFDEVICE,
     guid: GUID,
+    mtu: u32,
 }
 
 static mut BUS_CONTEXT_TYPE_INFO: wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO =
@@ -324,6 +331,16 @@ fn valid_guid(guid: &GUID) -> bool {
         || guid.Data4.iter().any(|byte| *byte != 0)
 }
 
+fn effective_mtu(requested_mtu: u32) -> Result<u32, NTSTATUS> {
+    if requested_mtu == 0 {
+        Ok(DEFAULT_MTU)
+    } else if (MINIMUM_MTU..=MAXIMUM_MTU).contains(&requested_mtu) {
+        Ok(requested_mtu)
+    } else {
+        Err(STATUS_INVALID_PARAMETER)
+    }
+}
+
 fn allocate_value<T>(value: T) -> *mut T {
     let allocation = unsafe { alloc(Layout::new::<T>()) }.cast::<T>();
     if !allocation.is_null() {
@@ -361,12 +378,13 @@ unsafe fn reclaim_child(state: *mut BusState, node: *mut ChildNode) {
     }
 }
 
-fn make_identification(guid: GUID) -> ChildIdentification {
+fn make_identification(guid: GUID, mtu: u32) -> ChildIdentification {
     ChildIdentification {
         header: WDF_CHILD_IDENTIFICATION_DESCRIPTION_HEADER {
             IdentificationDescriptionSize: core::mem::size_of::<ChildIdentification>() as ULONG,
         },
         guid,
+        mtu,
     }
 }
 
@@ -446,8 +464,53 @@ fn child_device_id(guid: &GUID) -> [u16; 64] {
     guid_text(guid, &PREFIX)
 }
 
+fn child_mtu_hardware_id(mtu: u32) -> [u16; 32] {
+    const PREFIX: [u16; 14] = [
+        b'W' as u16,
+        b'I' as u16,
+        b'N' as u16,
+        b'T' as u16,
+        b'A' as u16,
+        b'P' as u16,
+        b'B' as u16,
+        b'U' as u16,
+        b'S' as u16,
+        b'M' as u16,
+        b'T' as u16,
+        b'U' as u16,
+        b'\\' as u16,
+        0,
+    ];
+    let mut text = [0u16; 32];
+    let mut offset = 0;
+    for character in PREFIX {
+        if character == 0 {
+            break;
+        }
+        text[offset] = character;
+        offset += 1;
+    }
+    let mut digits = [0u16; 10];
+    let mut count = 0;
+    let mut value = mtu;
+    loop {
+        digits[count] = b'0' as u16 + (value % 10) as u16;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    while count != 0 {
+        count -= 1;
+        text[offset] = digits[count];
+        offset += 1;
+    }
+    text[offset] = 0;
+    text
+}
+
 unsafe fn zero_record(record: *mut ManagerRecord) {
-    // ManagerRecord has four bytes of ABI tail padding.
     unsafe {
         core::ptr::write_bytes(
             record.cast::<u8>(),
@@ -464,6 +527,7 @@ unsafe fn write_record(record: *mut ManagerRecord, node: &ChildNode) {
         (*record).lifecycle = node.lifecycle;
         (*record).terminal_status = node.terminal_status;
         (*record).request_id = node.request_id;
+        (*record).mtu = node.mtu;
         (*record).interface_length = node.interface_length;
         (*record)._padding = 0;
         (*record).interface_name = node.interface_name;
@@ -477,6 +541,7 @@ unsafe fn copy_record(record: *mut ManagerRecord, source: &ManagerRecord) {
         (*record).lifecycle = source.lifecycle;
         (*record).terminal_status = source.terminal_status;
         (*record).request_id = source.request_id;
+        (*record).mtu = source.mtu;
         (*record).interface_length = source.interface_length;
         (*record)._padding = 0;
         (*record).interface_name = source.interface_name;
@@ -735,7 +800,9 @@ extern "C" fn evt_child_list_create_device(
     if identification.is_null() || device_init.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    let guid = unsafe { (*(identification.cast::<ChildIdentification>())).guid };
+    let child_identification = unsafe { &*(identification.cast::<ChildIdentification>()) };
+    let guid = child_identification.guid;
+    let mtu = child_identification.mtu;
     if !valid_guid(&guid) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -765,6 +832,21 @@ extern "C" fn evt_child_list_create_device(
             WdfPdoInitAddHardwareID,
             device_init,
             &device_id as *const UNICODE_STRING,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            mark_child_failure(bus_state, &guid, status);
+        }
+        return status;
+    }
+    let mtu_id_text = child_mtu_hardware_id(mtu);
+    let mtu_id = unicode_string(&mtu_id_text);
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfPdoInitAddHardwareID,
+            device_init,
+            &mtu_id as *const UNICODE_STRING,
         )
     };
     if status != STATUS_SUCCESS {
@@ -827,6 +909,7 @@ extern "C" fn evt_child_list_create_device(
         (*pdo_context).bus_state = core::ptr::null_mut();
         (*pdo_context).bus_device = core::ptr::null_mut();
         (*pdo_context).guid = guid;
+        (*pdo_context).mtu = mtu;
         call_unsafe_wdf_function_binding!(
             WdfObjectReferenceActual,
             bus_device.cast(),
@@ -966,7 +1049,6 @@ extern "C" fn evt_manager_device_control(
     let manager_request = unsafe { input.cast::<ManagerRequest>().read() };
     if manager_request.version != MANAGER_PROTOCOL_VERSION
         || manager_request.length as usize != core::mem::size_of::<ManagerRequest>()
-        || manager_request.reserved != 0
         || manager_request.request_id == 0
         || !matches!(
             manager_request.operation,
@@ -979,6 +1061,8 @@ extern "C" fn evt_manager_device_control(
             && (!valid_guid(&manager_request.adapter_guid) || manager_request.cursor != 0))
         || (manager_request.operation == MANAGER_OPERATION_ENUMERATE
             && valid_guid(&manager_request.adapter_guid))
+        || (manager_request.operation != MANAGER_OPERATION_CREATE
+            && manager_request.requested_mtu != 0)
     {
         complete(request, STATUS_INVALID_PARAMETER);
         return;
@@ -1056,6 +1140,13 @@ fn manager_create(
     manager_request: &ManagerRequest,
     output_length: usize,
 ) {
+    let mtu = match effective_mtu(manager_request.requested_mtu) {
+        Ok(mtu) => mtu,
+        Err(status) => {
+            complete(request, status);
+            return;
+        }
+    };
     let output = match response_buffer(
         request,
         output_length,
@@ -1087,6 +1178,7 @@ fn manager_create(
                 (*existing).lifecycle = LIFECYCLE_CREATING;
                 (*existing).terminal_status = STATUS_PENDING;
                 (*existing).request_id = manager_request.request_id;
+                (*existing).mtu = mtu;
             }
         } else {
             let node = allocate_value(ChildNode {
@@ -1094,6 +1186,7 @@ fn manager_create(
                 lifecycle: LIFECYCLE_CREATING,
                 terminal_status: STATUS_PENDING,
                 request_id: manager_request.request_id,
+                mtu,
                 pdo: core::ptr::null_mut(),
                 interface_length: 0,
                 interface_name: [0; MAX_INTERFACE_CHARS],
@@ -1114,7 +1207,7 @@ fn manager_create(
         }
     }
 
-    let mut identification = make_identification(manager_request.adapter_guid);
+    let mut identification = make_identification(manager_request.adapter_guid, mtu);
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfChildListAddOrUpdateChildDescriptionAsPresent,
@@ -1165,6 +1258,7 @@ fn manager_remove(
         }
     };
     let remove_without_pdo;
+    let mtu;
     {
         let Some(_guard) = (unsafe { BusStateGuard::acquire(state) }) else {
             complete(request, STATUS_DEVICE_NOT_READY);
@@ -1193,12 +1287,13 @@ fn manager_remove(
         }
         unsafe {
             remove_without_pdo = (*node).pdo.is_null();
+            mtu = (*node).mtu;
             (*node).lifecycle = LIFECYCLE_REMOVING;
             (*node).terminal_status = STATUS_PENDING;
             (*node).request_id = manager_request.request_id;
         }
     }
-    let mut identification = make_identification(manager_request.adapter_guid);
+    let mut identification = make_identification(manager_request.adapter_guid, mtu);
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfChildListUpdateChildDescriptionAsMissing,
@@ -1259,6 +1354,7 @@ fn absent_record(guid: &GUID, terminal_status: NTSTATUS, request_id: u64) -> Man
         lifecycle: LIFECYCLE_ABSENT,
         terminal_status,
         request_id,
+        mtu: 0,
         interface_length: 0,
         _padding: 0,
         interface_name: [0; MAX_INTERFACE_CHARS],
