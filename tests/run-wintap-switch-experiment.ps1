@@ -38,7 +38,7 @@ param(
     [ValidateRange(0, 60000)]
     [int]$CompletionTimeoutMilliseconds = 1,
 
-    [ValidateRange(0, 65521)]
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 1500 -and $_ -le 65521) })]
     [uint32]$RequestedMtu = 0,
 
     [switch]$Stats,

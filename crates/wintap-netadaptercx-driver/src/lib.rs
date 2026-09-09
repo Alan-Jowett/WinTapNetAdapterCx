@@ -715,9 +715,25 @@ fn child_properties_from_hardware_id(device: WDFDEVICE) -> Result<(GUID, usize),
         {
             guid = Some(parsed_guid);
         }
-        if let Some(value) =
-            parse_child_mtu_from_hardware_id(&hardware_ids[offset..offset + length])
-        {
+        let hardware_id = &hardware_ids[offset..offset + length];
+        if hardware_id.starts_with(&[
+            b'W' as u16,
+            b'I' as u16,
+            b'N' as u16,
+            b'T' as u16,
+            b'A' as u16,
+            b'P' as u16,
+            b'B' as u16,
+            b'U' as u16,
+            b'S' as u16,
+            b'M' as u16,
+            b'T' as u16,
+            b'U' as u16,
+            b'\\' as u16,
+        ]) {
+            let Some(value) = parse_child_mtu_from_hardware_id(hardware_id) else {
+                return Err(STATUS_INVALID_PARAMETER);
+            };
             mtu = Some(value);
         }
         offset += length + 1;

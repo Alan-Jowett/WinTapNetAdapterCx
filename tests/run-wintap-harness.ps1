@@ -9,6 +9,8 @@ param(
     [switch]$RequireTestSigning,
     [string]$PackageDirectory,
     [string]$DevConPath,
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 1500 -and $_ -le 65521) })]
+    [uint32]$RequestedMtu = 0,
     [string]$DiagnosticsPath = ".\artifacts\wintap-harness",
     [int]$TimeoutSeconds = 15
 )
@@ -739,7 +741,7 @@ function Test-WinTapAdapterIdentity($Adapter) {
 
 function New-WinTapBusChildTracked([Guid]$Guid, [int]$WaitSeconds) {
     Wait-WinTapBusManager $WaitSeconds
-    $result = Invoke-WinTapBusRequest Create $Guid
+    $result = Invoke-WinTapBusRequest Create $Guid 0 $RequestedMtu
     if ($result.Status -notin @(0, 0x103)) {
         throw "WinTap create for $Guid returned NTSTATUS 0x$('{0:X8}' -f [uint32]$result.Status)."
     }
@@ -1021,7 +1023,9 @@ try {
         "Exclusive device open unexpectedly succeeded twice."
 
     Assert-ZeroLengthWrite $handle
-    foreach ($invalidLength in @(1, 13, 65536)) {
+    $effectiveMtu = if ($RequestedMtu -eq 0) { 1500 } else { [int]$RequestedMtu }
+    $maximumFrameLength = $effectiveMtu + 14
+    foreach ($invalidLength in @(1, 13, ($maximumFrameLength + 1))) {
         Assert-InvalidFrameWrite $handle $invalidLength
     }
 
@@ -1033,7 +1037,7 @@ try {
     }
     Write-Frame $handle $frame
 
-    $maximumFrame = [byte[]]::new(65535)
+    $maximumFrame = [byte[]]::new($maximumFrameLength)
     for ($i = 0; $i -lt $maximumFrame.Length; ++$i) {
         $maximumFrame[$i] = [byte]($i -band 0xff)
     }
