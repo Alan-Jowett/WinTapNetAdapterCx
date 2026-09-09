@@ -19,6 +19,9 @@ $ErrorActionPreference = "Stop"
 
 Import-Module (Join-Path $PSScriptRoot "wintap-bus-manager.psm1") -Force
 
+$script:EffectiveMtu = if ($RequestedMtu -eq 0) { 1500 } else { [int]$RequestedMtu }
+$script:MaximumFrameLength = $script:EffectiveMtu + 14
+
 $driverService = "WinTapChild"
 $busService = "WinTapBus"
 $driverInf = "wintap_netadaptercx_driver.inf"
@@ -403,7 +406,7 @@ function Invoke-OverlappedIo(
 function Read-Frame(
     [IntPtr]$Handle,
     [int]$TimeoutMilliseconds = 1000,
-    [int]$MaximumLength = 65535
+    [int]$MaximumLength = $script:MaximumFrameLength
 ) {
     Invoke-OverlappedIo $Handle ([byte[]]::new($MaximumLength)) $false `
         $TimeoutMilliseconds
@@ -1023,9 +1026,7 @@ try {
         "Exclusive device open unexpectedly succeeded twice."
 
     Assert-ZeroLengthWrite $handle
-    $effectiveMtu = if ($RequestedMtu -eq 0) { 1500 } else { [int]$RequestedMtu }
-    $maximumFrameLength = $effectiveMtu + 14
-    foreach ($invalidLength in @(1, 13, ($maximumFrameLength + 1))) {
+    foreach ($invalidLength in @(1, 13, ($script:MaximumFrameLength + 1))) {
         Assert-InvalidFrameWrite $handle $invalidLength
     }
 
@@ -1037,7 +1038,7 @@ try {
     }
     Write-Frame $handle $frame
 
-    $maximumFrame = [byte[]]::new($maximumFrameLength)
+    $maximumFrame = [byte[]]::new($script:MaximumFrameLength)
     for ($i = 0; $i -lt $maximumFrame.Length; ++$i) {
         $maximumFrame[$i] = [byte]($i -band 0xff)
     }
