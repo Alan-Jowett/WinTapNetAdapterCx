@@ -9,6 +9,8 @@ param(
     [switch]$RequireTestSigning,
     [string]$PackageDirectory,
     [string]$DevConPath,
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 1500 -and $_ -le 65521) })]
+    [uint32]$RequestedMtu = 0,
     [string]$DiagnosticsPath = ".\artifacts\wintap-harness",
     [int]$TimeoutSeconds = 15
 )
@@ -16,6 +18,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 Import-Module (Join-Path $PSScriptRoot "wintap-bus-manager.psm1") -Force
+
+$script:EffectiveMtu = if ($RequestedMtu -eq 0) { 1500 } else { [int]$RequestedMtu }
+$script:MaximumFrameLength = $script:EffectiveMtu + 14
 
 $driverService = "WinTapChild"
 $busService = "WinTapBus"
@@ -401,7 +406,7 @@ function Invoke-OverlappedIo(
 function Read-Frame(
     [IntPtr]$Handle,
     [int]$TimeoutMilliseconds = 1000,
-    [int]$MaximumLength = 1514
+    [int]$MaximumLength = $script:MaximumFrameLength
 ) {
     Invoke-OverlappedIo $Handle ([byte[]]::new($MaximumLength)) $false `
         $TimeoutMilliseconds
@@ -739,7 +744,7 @@ function Test-WinTapAdapterIdentity($Adapter) {
 
 function New-WinTapBusChildTracked([Guid]$Guid, [int]$WaitSeconds) {
     Wait-WinTapBusManager $WaitSeconds
-    $result = Invoke-WinTapBusRequest Create $Guid
+    $result = Invoke-WinTapBusRequest Create $Guid 0 $RequestedMtu
     if ($result.Status -notin @(0, 0x103)) {
         throw "WinTap create for $Guid returned NTSTATUS 0x$('{0:X8}' -f [uint32]$result.Status)."
     }
@@ -1021,7 +1026,7 @@ try {
         "Exclusive device open unexpectedly succeeded twice."
 
     Assert-ZeroLengthWrite $handle
-    foreach ($invalidLength in @(1, 13, 1515)) {
+    foreach ($invalidLength in @(1, 13, ($script:MaximumFrameLength + 1))) {
         Assert-InvalidFrameWrite $handle $invalidLength
     }
 
@@ -1032,6 +1037,12 @@ try {
         $frame[$i] = [byte]$i
     }
     Write-Frame $handle $frame
+
+    $maximumFrame = [byte[]]::new($script:MaximumFrameLength)
+    for ($i = 0; $i -lt $maximumFrame.Length; ++$i) {
+        $maximumFrame[$i] = [byte]($i -band 0xff)
+    }
+    Write-Frame $handle $maximumFrame
 
     if ($Extended) {
         Write-Host "Extended outstanding-read cancellation checks deferred with TC-040."

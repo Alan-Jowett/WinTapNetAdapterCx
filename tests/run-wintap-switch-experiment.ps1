@@ -38,7 +38,15 @@ param(
     [ValidateRange(0, 60000)]
     [int]$CompletionTimeoutMilliseconds = 1,
 
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 1500 -and $_ -le 65521) })]
+    [uint32]$RequestedMtu = 0,
+
     [switch]$Stats,
+
+    [string]$IperfPath,
+
+    [ValidateRange(1, 3600)]
+    [int]$IperfDurationSeconds = 10,
 
     [string]$DiagnosticsPath = ".\artifacts\wintap-switch-experiment",
 
@@ -61,6 +69,7 @@ $childInterfaces = @{}
 $createdAddresses = @()
 $createdRoutes = @()
 $switchProcess = $null
+$iperfProcess = $null
 $busInstalled = $false
 $adapters = @()
 
@@ -101,6 +110,8 @@ function Get-AdapterForChild([Guid]$Guid) {
 }
 
 function Add-PointToPointAddress($Adapter, [string]$Address, [string]$PeerAddress) {
+    Set-NetIPInterface -InterfaceIndex $Adapter.ifIndex -AddressFamily IPv4 `
+        -DadTransmits 0 -ErrorAction Stop | Out-Null
     New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $Address `
         -PrefixLength 32 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
     $script:createdAddresses += [pscustomobject]@{
@@ -128,7 +139,20 @@ function Remove-SwitchProcess {
     $script:switchProcess = $null
 }
 
+function Remove-IperfProcess {
+    if ($null -eq $script:iperfProcess) {
+        return
+    }
+    if (-not $script:iperfProcess.HasExited) {
+        Stop-Process -Id $script:iperfProcess.Id -Force -ErrorAction SilentlyContinue
+        $script:iperfProcess.WaitForExit(5000)
+    }
+    $script:iperfProcess.Dispose()
+    $script:iperfProcess = $null
+}
+
 function Remove-ExperimentResources {
+    Remove-IperfProcess
     Remove-SwitchProcess
 
     foreach ($route in @($script:createdRoutes)) {
@@ -183,19 +207,26 @@ try {
 
     foreach ($guid in $childGuids) {
         $createdChildren += $guid
-        $child = New-WinTapBusChild $guid $TimeoutSeconds
+        $child = New-WinTapBusChild $guid -RequestedMtu $RequestedMtu `
+            -TimeoutSeconds $TimeoutSeconds
         $childInterfaces[$guid.ToString()] = $child.InterfacePath
     }
 
     $adapterA = Get-AdapterForChild -Guid $childGuids[0]
     $adapterB = Get-AdapterForChild -Guid $childGuids[1]
     $adapters = @($adapterA, $adapterB)
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$adapters[0].InterfaceGuid)) `
+        "Adapter $($adapters[0].Name) did not expose an interface GUID."
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$adapters[1].InterfaceGuid)) `
+        "Adapter $($adapters[1].Name) did not expose an interface GUID."
     Add-PointToPointAddress $adapters[0] "198.51.100.1" "198.51.100.2"
     Add-PointToPointAddress $adapters[1] "198.51.100.2" "198.51.100.1"
 
+    $interfaceGuidA = ([Guid]$adapters[0].InterfaceGuid).ToString("D")
+    $interfaceGuidB = ([Guid]$adapters[1].InterfaceGuid).ToString("D")
     $arguments = @(
-        "--endpoint", "$($childGuids[0])=$($childInterfaces[$childGuids[0].ToString()])",
-        "--endpoint", "$($childGuids[1])=$($childInterfaces[$childGuids[1].ToString()])",
+        "--endpoint", "$interfaceGuidA=$($childInterfaces[$childGuids[0].ToString()])",
+        "--endpoint", "$interfaceGuidB=$($childInterfaces[$childGuids[1].ToString()])",
         "--read-depth", $ReadDepth,
         "--wait-operations", $WaitOperations,
         "--completion-timeout-ms", $CompletionTimeoutMilliseconds
@@ -210,6 +241,26 @@ try {
         -WorkingDirectory (Split-Path -Parent $switch) -RedirectStandardOutput $stdoutPath `
         -RedirectStandardError $stderrPath -PassThru
     Write-Host "Started wintap-switch.exe (PID $($switchProcess.Id)) for $DurationSeconds seconds."
+    if (-not [string]::IsNullOrWhiteSpace($IperfPath)) {
+        $iperf = (Resolve-Path -LiteralPath $IperfPath -ErrorAction Stop).Path
+        $iperfServerOutput = Join-Path $DiagnosticsPath "iperf-server.txt"
+        $iperfServerError = Join-Path $DiagnosticsPath "iperf-server-error.txt"
+        $iperfClientOutput = Join-Path $DiagnosticsPath "iperf-client.txt"
+        $iperfProcess = Start-Process -FilePath $iperf -ArgumentList "-s" `
+            -RedirectStandardOutput $iperfServerOutput -RedirectStandardError $iperfServerError `
+            -PassThru
+        Start-Sleep -Seconds 1
+        Get-NetIPAddress -InterfaceIndex $adapters[0].ifIndex, $adapters[1].ifIndex `
+            -AddressFamily IPv4 | Format-List * | Out-File (Join-Path $DiagnosticsPath "tap-addresses.txt")
+        Get-NetRoute -InterfaceIndex $adapters[0].ifIndex, $adapters[1].ifIndex `
+            -AddressFamily IPv4 | Format-List * | Out-File (Join-Path $DiagnosticsPath "tap-routes.txt")
+        & $iperf "-c" "198.51.100.2" "-B" "198.51.100.1" "-t" $IperfDurationSeconds `
+            *> $iperfClientOutput
+        if ($LASTEXITCODE -ne 0) {
+            throw "iperf3 failed with exit code $LASTEXITCODE."
+        }
+        Write-Host "iperf3 completed successfully for $IperfDurationSeconds seconds."
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds($DurationSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($switchProcess.WaitForExit(100)) {

@@ -4,7 +4,7 @@ Set-StrictMode -Version Latest
 
 $script:ManagerPath = "\\.\Global\WinTapBusMgr"
 $script:ManagerIoctl = 0x00222004
-$script:ProtocolVersion = 1
+$script:ProtocolVersion = 2
 $script:RequestLength = 40
 $script:ResponseHeaderLength = 32
 $script:RecordLength = 560
@@ -218,7 +218,12 @@ function Wait-WinTapBusManager([int]$TimeoutSeconds = 30) {
     throw "WinTap administrator manager '$script:ManagerPath' was not published before timeout."
 }
 
-function New-WinTapBusRequest([uint16]$Operation, [Guid]$Guid, [uint32]$Cursor = 0) {
+function New-WinTapBusRequest(
+    [uint16]$Operation,
+    [Guid]$Guid,
+    [uint32]$Cursor = 0,
+    [uint32]$RequestedMtu = 0
+) {
     $request = [byte[]]::new($script:RequestLength)
     [BitConverter]::GetBytes([uint16]$script:ProtocolVersion).CopyTo($request, 0)
     [BitConverter]::GetBytes($Operation).CopyTo($request, 2)
@@ -226,6 +231,7 @@ function New-WinTapBusRequest([uint16]$Operation, [Guid]$Guid, [uint32]$Cursor =
     [BitConverter]::GetBytes([uint64][DateTime]::UtcNow.Ticks).CopyTo($request, 8)
     $Guid.ToByteArray().CopyTo($request, 16)
     [BitConverter]::GetBytes($Cursor).CopyTo($request, 32)
+    [BitConverter]::GetBytes($RequestedMtu).CopyTo($request, 36)
     return $request
 }
 
@@ -246,13 +252,13 @@ function ConvertFrom-WinTapBusResponse([byte[]]$Buffer, [uint32]$Returned) {
     for ($index = 0; $index -lt $count; ++$index) {
         $offset = $script:ResponseHeaderLength + ($index * $script:RecordLength)
         $guidBytes = [byte[]]$Buffer[$offset..($offset + 15)]
-        $interfaceLength = [BitConverter]::ToUInt16($Buffer, $offset + 32)
+        $interfaceLength = [BitConverter]::ToUInt16($Buffer, $offset + 36)
         Assert-WinTapBusCondition ($interfaceLength -lt 260) `
             "WinTap manager returned overlong interface identity for record $index."
         $interface = if ($interfaceLength -eq 0) {
             ""
         } else {
-            [Text.Encoding]::Unicode.GetString($Buffer, $offset + 36, $interfaceLength * 2)
+            [Text.Encoding]::Unicode.GetString($Buffer, $offset + 40, $interfaceLength * 2)
         }
         if ($interface.StartsWith('\??\')) {
             $interface = '\\?\' + $interface.Substring(4)
@@ -262,6 +268,7 @@ function ConvertFrom-WinTapBusResponse([byte[]]$Buffer, [uint32]$Returned) {
             Lifecycle = [BitConverter]::ToUInt32($Buffer, $offset + 16)
             TerminalStatus = [BitConverter]::ToInt32($Buffer, $offset + 20)
             RequestId = [BitConverter]::ToUInt64($Buffer, $offset + 24)
+            Mtu = [BitConverter]::ToUInt32($Buffer, $offset + 32)
             InterfacePath = $interface
         }
     }
@@ -277,7 +284,8 @@ function Invoke-WinTapBusRequest(
     [ValidateSet("Create", "Remove", "Enumerate", "Query")]
     [string]$Operation,
     [Guid]$Guid = [Guid]::Empty,
-    [uint32]$Cursor = 0
+    [uint32]$Cursor = 0,
+    [uint32]$RequestedMtu = 0
 ) {
     $opcode = @{
         Create = [uint16]1
@@ -290,7 +298,8 @@ function Invoke-WinTapBusRequest(
     }
     $handle = Open-WinTapBusManager
     try {
-        $input = New-WinTapBusRequest $opcode $Guid $Cursor
+        $input = New-WinTapBusRequest $opcode $Guid $Cursor `
+            $(if ($Operation -eq "Create") { $RequestedMtu } else { 0 })
         $output = [byte[]]::new(65536)
         [uint32]$returned = 0
         $ok = [WinTapBusNative]::DeviceIoControl(
@@ -371,9 +380,13 @@ function Wait-WinTapBusChild(
     throw "WinTap child $Guid did not reach $Target before timeout."
 }
 
-function New-WinTapBusChild([Guid]$Guid, [int]$TimeoutSeconds = 30) {
+function New-WinTapBusChild(
+    [Guid]$Guid,
+    [uint32]$RequestedMtu = 0,
+    [int]$TimeoutSeconds = 30
+) {
     Wait-WinTapBusManager $TimeoutSeconds
-    $result = Invoke-WinTapBusRequest Create $Guid
+    $result = Invoke-WinTapBusRequest Create $Guid 0 $RequestedMtu
     if ($result.Status -notin @($script:StatusSuccess, $script:StatusPending)) {
         throw "WinTap create for $Guid returned NTSTATUS 0x$('{0:X8}' -f [uint32]$result.Status)."
     }

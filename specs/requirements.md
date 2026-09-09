@@ -116,10 +116,19 @@ support overlapped I/O and cancellation.
 with bounded buffering, backpressure when full, and deterministic completion or
 cancellation.
 
-Nonzero writes shorter than 14 bytes or longer than 1514 bytes shall complete
+Nonzero writes shorter than 14 bytes or longer than the negotiated maximum
+frame size shall complete
 promptly without enqueuing a frame, report `ERROR_INVALID_PARAMETER` (87), and
 leave subsequent valid read/write I/O operational. A zero-byte `WriteFile` is a
 native Win32 no-op that completes before dispatching to the driver.
+
+The effective MTU shall be supplied as an optional property in the child
+creation request. When absent, it shall default to 1,500 bytes. Valid values
+shall range from 1,500 through 65,521 bytes inclusive. The complete Ethernet
+frame contract shall therefore be 14 through `MTU + 14` bytes, because
+NetAdapterCx rejects a `MaximumFrameSize` above 65,535 bytes. Driver, switch,
+queue, and harness validation shall use this same effective maximum, and a
+frame one byte above it shall be rejected explicitly.
 
 ### REQ-003 — Windows driver lifecycle
 
@@ -917,6 +926,27 @@ REQ-018 and REQ-020.
 not discard a live operation or reuse its buffer prematurely. Retry remains
 bounded to a finite number of attempts and fatal errors remain fail-closed.
 
+### REQ-046 — Creation-configured MTU
+
+The bus-manager protocol shall advance to version 2. Its child-create request
+shall carry an optional `requested_mtu` property, where zero means omitted and
+selects the 1,500-byte default. Values below 1,500 or above 65,521 shall fail
+the create request explicitly before child publication. The selected value
+shall be stored in immutable child instance state before NetAdapterCx
+capabilities, queues, or packet bounds are initialized. It shall remain fixed
+for the child lifetime; changing it requires removing and recreating the child.
+All in-repository manager clients and tests shall use protocol version 2;
+version 1 compatibility is not required.
+
+**Trace:** User-selected creation-time configuration; user-approved protocol
+update; existing versioned bus-manager child-create protocol and TAP child
+lifecycle.
+**Invariant impact:** Configuration validation shall be bounded and
+deterministic. The effective MTU, complete-frame maximum, queue limits,
+capability advertisement, packet validation, and switch endpoint checks shall
+remain consistent per child, and no configuration shall produce a
+`MaximumFrameSize` above 65,535 bytes.
+
 ### Dynamic-bus traceability
 
 | Requirement | Design coverage | Validation coverage |
@@ -942,6 +972,7 @@ bounded to a finite number of attempts and fatal errors remain fail-closed.
 | REQ-043 | Contributor-facing SPDX documentation | VAL-035; TC-083 |
 | REQ-044 | Complete repository coverage | VAL-032, VAL-033, VAL-034; TC-084 |
 | REQ-045 | I/O-ring resources and completion state | VAL-036; TC-085 |
+| REQ-046 | MTU configuration and frame-size contract | VAL-038; TC-086 through TC-089 |
 
 ## Open questions requiring user decisions
 
@@ -1008,5 +1039,5 @@ bounded to a finite number of attempts and fatal errors remain fail-closed.
 
 ## Specification approval gate
 
-REQ-026 through REQ-045 require approval together with their design and
+REQ-026 through REQ-046 require approval together with their design and
 validation coverage before implementation.
