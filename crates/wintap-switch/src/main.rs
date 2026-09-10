@@ -1194,7 +1194,32 @@ mod windows_runtime {
             let endpoint = &mut self.endpoints[endpoint];
             let wait = endpoint.adaptive_wait.get_or_insert(AdaptiveWait::new()?);
             if wait.pending {
-                return Ok(false);
+                if wait.request.interest == interest {
+                    return Ok(false);
+                }
+                if unsafe { CancelIoEx(endpoint.handle, &mut wait.overlapped) } == 0 {
+                    let error = unsafe { GetLastError() };
+                    if error != ERROR_NOT_FOUND {
+                        return Err(format!(
+                            "CancelIoEx for WAIT_FOR_CHANGE rearm failed for {} with Win32 error {error}",
+                            endpoint.guid
+                        ));
+                    }
+                }
+                let mut bytes = 0;
+                if unsafe {
+                    GetOverlappedResult(endpoint.handle, &mut wait.overlapped, &mut bytes, 1)
+                } == 0
+                {
+                    let error = unsafe { GetLastError() };
+                    if error != ERROR_OPERATION_ABORTED && error != ERROR_NOT_FOUND {
+                        return Err(format!(
+                            "draining WAIT_FOR_CHANGE rearm failed for {} with Win32 error {error}",
+                            endpoint.guid
+                        ));
+                    }
+                }
+                wait.pending = false;
             }
             wait.request.interest = interest;
             wait.response.satisfied = 0;

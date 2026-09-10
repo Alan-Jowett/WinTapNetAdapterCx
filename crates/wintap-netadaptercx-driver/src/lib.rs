@@ -170,6 +170,7 @@ struct InstanceState {
     adaptive_enabled: AtomicBool,
     pending_wait_request: WDFREQUEST,
     pending_wait_interest: u32,
+    pending_wait_cancelable: bool,
     ready_wait_request: WDFREQUEST,
     ready_wait_satisfied: u32,
     lifecycle: core::sync::atomic::AtomicU8,
@@ -210,6 +211,7 @@ impl InstanceState {
             adaptive_enabled: AtomicBool::new(false),
             pending_wait_request: core::ptr::null_mut(),
             pending_wait_interest: 0,
+            pending_wait_cancelable: false,
             ready_wait_request: core::ptr::null_mut(),
             ready_wait_satisfied: 0,
             lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
@@ -2719,6 +2721,11 @@ fn handle_wait_for_change(
         return;
     }
 
+    state_guard.pending_wait_request = request;
+    state_guard.pending_wait_interest = wait.interest;
+    state_guard.pending_wait_cancelable = false;
+    drop(state_guard);
+
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRequestMarkCancelableEx,
@@ -2726,13 +2733,35 @@ fn handle_wait_for_change(
             Some(evt_wait_for_change_cancel),
         )
     };
+    let mut complete_cancelled = status != STATUS_SUCCESS;
+    let mut work_item = core::ptr::null_mut();
     if status == STATUS_SUCCESS {
-        state_guard.pending_wait_request = request;
-        state_guard.pending_wait_interest = wait.interest;
-        return;
+        if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+            if state_guard.pending_wait_request == request {
+                state_guard.pending_wait_cancelable = true;
+                if readiness_mask_locked(&mut state_guard) & wait.interest != 0 {
+                    if claim_wait_for_passive_completion_locked(
+                        &mut state_guard,
+                        wait.interest,
+                    ) {
+                        work_item = state_guard.read_work_item;
+                    }
+                }
+            }
+        }
+        complete_cancelled = false;
+    } else if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+        if state_guard.pending_wait_request == request {
+            state_guard.pending_wait_request = core::ptr::null_mut();
+            state_guard.pending_wait_interest = 0;
+            state_guard.pending_wait_cancelable = false;
+        }
     }
-    drop(state_guard);
-    complete_request(request, STATUS_CANCELLED);
+    if complete_cancelled {
+        complete_request(request, STATUS_CANCELLED);
+    } else if !work_item.is_null() {
+        enqueue_work_item(work_item);
+    }
 }
 
 unsafe extern "C" fn evt_wait_for_change_cancel(request: WDFREQUEST) {
@@ -3193,6 +3222,7 @@ fn readiness_mask_locked(state: &mut InstanceState) -> u32 {
 fn claim_wait_for_passive_completion_locked(state: &mut InstanceState, condition: u32) -> bool {
     if !state.adaptive_enabled.load(Ordering::Acquire)
         || state.pending_wait_request.is_null()
+        || !state.pending_wait_cancelable
         || !state.ready_wait_request.is_null()
     {
         return false;
@@ -3204,6 +3234,7 @@ fn claim_wait_for_passive_completion_locked(state: &mut InstanceState, condition
     let request = state.pending_wait_request;
     state.pending_wait_request = core::ptr::null_mut();
     state.pending_wait_interest = 0;
+    state.pending_wait_cancelable = false;
     state.ready_wait_request = request;
     state.ready_wait_satisfied = satisfied;
     true
@@ -3214,6 +3245,7 @@ fn take_wait_for_cancellation_locked(state: &mut InstanceState) -> Option<WDFREQ
         let request = state.pending_wait_request;
         state.pending_wait_request = core::ptr::null_mut();
         state.pending_wait_interest = 0;
+        state.pending_wait_cancelable = false;
         return Some(request);
     }
     take_ready_wait_locked(state).map(|(request, _)| request)
@@ -3234,6 +3266,7 @@ fn take_wait_request_locked(state: &mut InstanceState, request: WDFREQUEST) -> b
     if state.pending_wait_request == request {
         state.pending_wait_request = core::ptr::null_mut();
         state.pending_wait_interest = 0;
+        state.pending_wait_cancelable = false;
         return true;
     }
     if state.ready_wait_request == request {
