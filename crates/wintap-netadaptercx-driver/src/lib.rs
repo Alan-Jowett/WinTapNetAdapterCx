@@ -6,14 +6,13 @@ extern crate alloc;
 
 use alloc::alloc::alloc;
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 #[cfg(not(test))]
 extern crate wdk_panic;
 
 mod frame_queue;
 mod ring;
-use frame_queue::{Frame, FrameQueue, QueueError};
+use frame_queue::{Frame, FrameQueue, QueueError, QueueState, FRAME_MAXIMUM, FRAME_STORAGE_SIZE};
 use ring::{advance_index, fragment_at, fragment_virtual_address, increment_index, packet_at};
 
 use core::alloc::Layout;
@@ -27,7 +26,8 @@ use wdk_sys::{
     UNICODE_STRING, WDF_DRIVER_CONFIG, WDF_FILEOBJECT_CONFIG, WDF_IO_QUEUE_CONFIG,
     WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
     WDF_WORKITEM_CONFIG, WDFCMRESLIST, WDFDEVICE, WDFDEVICE_INIT, WDFDRIVER, WDFFILEOBJECT,
-    WDFOBJECT, WDFQUEUE, WDFREQUEST, WDFSPINLOCK, WDFWORKITEM, call_unsafe_wdf_function_binding,
+    WDFOBJECT, WDFQUEUE, WDFREQUEST, WDFSPINLOCK, WDFWAITLOCK, WDFWORKITEM,
+    call_unsafe_wdf_function_binding,
 };
 
 unsafe extern "C" {
@@ -71,9 +71,11 @@ const STATUS_CANCELLED: NTSTATUS = 0xC000_0120_u32 as i32;
 const STATUS_DEVICE_NOT_READY: NTSTATUS = 0xC000_00A3_u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as i32;
 const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000_000D_u32 as i32;
+const STATUS_INVALID_DEVICE_REQUEST: NTSTATUS = 0xC000_0010_u32 as i32;
 const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206_u32 as i32;
 const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023_u32 as i32;
 const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as i32;
+const STATUS_NO_MORE_ENTRIES: NTSTATUS = 0x8000_001A_u32 as i32;
 const INSTANCE_OPEN: u8 = 0;
 const INSTANCE_SUSPENDED: u8 = 1;
 const INSTANCE_CLOSING: u8 = 2;
@@ -86,6 +88,12 @@ const DEFAULT_MTU: usize = 1_500;
 const MAXIMUM_MTU: usize = 65_521;
 const MAXIMUM_MULTICAST_ADDRESSES: usize = 64;
 const ETHERNET_ADDRESS_LENGTH: usize = 6;
+const TAP_IOCTL_ENABLE_ADAPTIVE_POLLING: ULONG = 0x0022_2400;
+const TAP_IOCTL_WAIT_FOR_CHANGE: ULONG = 0x0022_2404;
+const ADAPTIVE_POLLING_PROTOCOL_VERSION: u32 = 1;
+const ADAPTIVE_INTEREST_READABLE: u32 = 1;
+const ADAPTIVE_INTEREST_WRITABLE: u32 = 2;
+const ADAPTIVE_INTEREST_SUPPORTED: u32 = ADAPTIVE_INTEREST_READABLE | ADAPTIVE_INTEREST_WRITABLE;
 const TAP_INTERFACE_CLASS: GUID = GUID {
     Data1: 0x25d3_2edf,
     Data2: 0x7c8c,
@@ -103,6 +111,33 @@ static ADAPTER_CONTEXT_NAME: &[u8] = b"WINTAP_ADAPTER_CONTEXT\0";
 static WORK_ITEM_CONTEXT_NAME: &[u8] = b"WINTAP_WORK_ITEM_CONTEXT\0";
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct AdaptiveEnableRequest {
+    version: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AdaptiveEnableResponse {
+    version: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AdaptiveWaitRequest {
+    version: u32,
+    interest: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AdaptiveWaitResponse {
+    satisfied: u32,
+}
+
+#[repr(C)]
 struct InstanceState {
     guid: GUID,
     mtu: usize,
@@ -112,6 +147,7 @@ struct InstanceState {
     adapter: netadaptercx_sys::NETADAPTER,
     read_queue: WDFQUEUE,
     frame_lock: WDFSPINLOCK,
+    frame_pool: wdk_sys::WDFLOOKASIDE,
     state_lock: WDFSPINLOCK,
     injection_queue: Option<FrameQueue>,
     capture_queue: Option<FrameQueue>,
@@ -119,6 +155,7 @@ struct InstanceState {
     active_multicast_address_count: usize,
     active_multicast_addresses: [[u8; ETHERNET_ADDRESS_LENGTH]; MAXIMUM_MULTICAST_ADDRESSES],
     read_work_item: WDFWORKITEM,
+    legacy_direct_read_lock: WDFWAITLOCK,
     tx_queue: netadaptercx_sys::NETPACKETQUEUE,
     rx_queue: netadaptercx_sys::NETPACKETQUEUE,
     tx_rings: *const netadaptercx_sys::NET_RING_COLLECTION,
@@ -129,9 +166,52 @@ struct InstanceState {
     rx_queue_started: AtomicBool,
     rx_notification_armed: AtomicBool,
     pending_reads: AtomicUsize,
+    legacy_direct_read_claims: AtomicUsize,
     pending_writes: AtomicUsize,
     control_open: AtomicBool,
+    adaptive_enabled: AtomicBool,
+    pending_wait_request: WDFREQUEST,
+    pending_wait_interest: u32,
+    pending_wait_cancelable: bool,
+    wait_registration_request: WDFREQUEST,
+    wait_registration_cancelled: bool,
+    ready_wait_request: WDFREQUEST,
+    ready_wait_satisfied: u32,
+    completing_wait_request: WDFREQUEST,
+    owner_generation: u64,
     lifecycle: core::sync::atomic::AtomicU8,
+}
+
+struct LegacyDirectReadGuard {
+    state: *mut InstanceState,
+}
+
+impl LegacyDirectReadGuard {
+    unsafe fn acquire(state: *mut InstanceState) -> Option<Self> {
+        if state.is_null() || unsafe { (*state).legacy_direct_read_lock.is_null() } {
+            return None;
+        }
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfWaitLockAcquire,
+                (*state).legacy_direct_read_lock,
+                core::ptr::null_mut::<i64>(),
+            )
+        };
+        if status == STATUS_SUCCESS {
+            Some(Self { state })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for LegacyDirectReadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfWaitLockRelease, (*self.state).legacy_direct_read_lock);
+        }
+    }
 }
 
 impl InstanceState {
@@ -145,6 +225,7 @@ impl InstanceState {
             adapter: core::ptr::null_mut(),
             read_queue: core::ptr::null_mut(),
             frame_lock: core::ptr::null_mut(),
+            frame_pool: core::ptr::null_mut(),
             state_lock: core::ptr::null_mut(),
             injection_queue: None,
             capture_queue: None,
@@ -152,6 +233,7 @@ impl InstanceState {
             active_multicast_address_count: 0,
             active_multicast_addresses: [[0; ETHERNET_ADDRESS_LENGTH]; MAXIMUM_MULTICAST_ADDRESSES],
             read_work_item: core::ptr::null_mut(),
+            legacy_direct_read_lock: core::ptr::null_mut(),
             tx_queue: core::ptr::null_mut(),
             rx_queue: core::ptr::null_mut(),
             tx_rings: core::ptr::null(),
@@ -162,8 +244,19 @@ impl InstanceState {
             rx_queue_started: AtomicBool::new(false),
             rx_notification_armed: AtomicBool::new(false),
             pending_reads: AtomicUsize::new(0),
+            legacy_direct_read_claims: AtomicUsize::new(0),
             pending_writes: AtomicUsize::new(0),
             control_open: AtomicBool::new(false),
+            adaptive_enabled: AtomicBool::new(false),
+            pending_wait_request: core::ptr::null_mut(),
+            pending_wait_interest: 0,
+            pending_wait_cancelable: false,
+            wait_registration_request: core::ptr::null_mut(),
+            wait_registration_cancelled: false,
+            ready_wait_request: core::ptr::null_mut(),
+            ready_wait_satisfied: 0,
+            completing_wait_request: core::ptr::null_mut(),
+            owner_generation: 0,
             lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
         }
     }
@@ -1137,13 +1230,21 @@ extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
+        let state_ptr = state_guard.state;
         let state = &mut *state_guard;
+        let pending_wait = take_wait_for_cancellation_locked(state);
+        let read_work_item = state.read_work_item;
         if queue == state.tx_queue {
             state.tx_queue_started.store(false, Ordering::Release);
         } else if queue == state.rx_queue {
             state.rx_queue_started.store(false, Ordering::Release);
             state.rx_notification_armed.store(false, Ordering::Release);
         }
+        drop(state_guard);
+        if let Some(request) = pending_wait {
+            cancel_claimed_wait(state_ptr, request);
+        }
+        flush_work_item(read_work_item);
     }
 }
 
@@ -1154,22 +1255,35 @@ extern "C" fn evt_packet_queue_advance(queue: netadaptercx_sys::NETPACKETQUEUE) 
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return;
     };
-    let (is_transmit, tx_rings, tx_extension, read_queue, read_work_item) = {
+    let (
+        is_transmit,
+        tx_rings,
+        tx_extension,
+        read_queue,
+        read_work_item,
+        wait_completion_scheduled,
+    ) = {
         let state_ref = &mut *state_guard;
         let rx_rings = state_ref.rx_rings;
         let rx_extension = state_ref.rx_fragment_extension;
-        if queue == state_ref.rx_queue && !rx_rings.is_null() {
-            inject_receive_frames(state_ref, rx_rings, &rx_extension);
-        }
+        let wait_completion_scheduled = if queue == state_ref.rx_queue && !rx_rings.is_null() {
+            inject_receive_frames(state_ref, rx_rings, &rx_extension)
+        } else {
+            false
+        };
         (
             queue == state_ref.tx_queue && !state_ref.tx_rings.is_null(),
             state_ref.tx_rings,
             state_ref.tx_fragment_extension,
             state_ref.read_queue,
             state_ref.read_work_item,
+            wait_completion_scheduled,
         )
     };
     drop(state_guard);
+    if wait_completion_scheduled {
+        enqueue_work_item(read_work_item);
+    }
     if is_transmit {
         capture_transmit_packets(state, read_queue, read_work_item, tx_rings, &tx_extension);
     }
@@ -1179,11 +1293,11 @@ fn inject_receive_frames(
     state: &mut InstanceState,
     rings: *const netadaptercx_sys::NET_RING_COLLECTION,
     extension: &netadaptercx_sys::NET_EXTENSION,
-) {
+) -> bool {
     let (packet_ring, fragment_ring) = unsafe {
         let collection = match rings.as_ref() {
             Some(collection) => collection,
-            None => return,
+            None => return false,
         };
         (
             collection.Rings[ring::PACKET_RING_INDEX],
@@ -1191,9 +1305,10 @@ fn inject_receive_frames(
         )
     };
     if packet_ring.is_null() || fragment_ring.is_null() {
-        return;
+        return false;
     }
 
+    let mut wait_completion_scheduled = false;
     loop {
         let (packet_begin, packet_end, fragment_begin, fragment_end) = unsafe {
             (
@@ -1207,7 +1322,8 @@ fn inject_receive_frames(
             break;
         }
 
-        let frame = match dequeue_injection_frame(state) {
+        let (frame, injection_was_full) = dequeue_injection_frame(state);
+        let frame = match frame {
             Some(frame) => frame,
             None => break,
         };
@@ -1276,7 +1392,12 @@ fn inject_receive_frames(
             (*packet_ring).BeginIndex = next_packet;
             (*fragment_ring).BeginIndex = next_fragment;
         }
+        if injection_was_full {
+            wait_completion_scheduled |=
+                claim_wait_for_passive_completion_locked(state, ADAPTIVE_INTEREST_WRITABLE);
+        }
     }
+    wait_completion_scheduled
 }
 
 fn capture_transmit_packets(
@@ -1299,8 +1420,18 @@ fn capture_transmit_packets(
     if packet_ring.is_null() || fragment_ring.is_null() {
         return;
     }
+    let capture_generation = {
+        let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        if state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+            return;
+        }
+        state_guard.owner_generation
+    };
 
-    let mut captured = false;
+    let mut captured_for_legacy_read = false;
+    let mut wait_completion_scheduled = false;
     loop {
         let (packet_begin, packet_end, fragment_end) = unsafe {
             (
@@ -1314,17 +1445,31 @@ fn capture_transmit_packets(
         }
 
         let packet = match unsafe { packet_at(packet_ring, packet_begin) } {
-            Some(packet) => unsafe { &*packet },
+            Some(packet) => unsafe { &mut *packet },
             None => break,
         };
         let fragment_count = packet.FragmentCount as u32;
         if fragment_count == 0 {
+            unsafe {
+                (*packet).set_Ignore(1);
+                if let Some(next_packet) = increment_index(&*packet_ring, packet_begin) {
+                    (*packet_ring).BeginIndex = next_packet;
+                    continue;
+                }
+            }
             break;
         }
         let fragment_begin = packet.FragmentIndex;
         if fragment_begin == fragment_end
             || fragment_count > unsafe { (*fragment_ring).NumberOfElements }
         {
+            unsafe {
+                (*packet).set_Ignore(1);
+                if let Some(next_packet) = increment_index(&*packet_ring, packet_begin) {
+                    (*packet_ring).BeginIndex = next_packet;
+                    continue;
+                }
+            }
             break;
         }
 
@@ -1361,10 +1506,27 @@ fn capture_transmit_packets(
             };
         }
         if !valid || !(FRAME_MINIMUM..=unsafe { (*state).frame_maximum }).contains(&total_length) {
-            break;
+            unsafe {
+                (*packet).set_Ignore(1);
+            }
+            let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
+                Some(index) => index,
+                None => break,
+            };
+            let next_fragment =
+                match unsafe { advance_index(&*fragment_ring, fragment_begin, fragment_count) } {
+                    Some(index) => index,
+                    None => break,
+                };
+            unsafe {
+                (*packet_ring).BeginIndex = next_packet;
+                (*fragment_ring).BeginIndex = next_fragment;
+            }
+            continue;
         }
 
-        if at_passive_level()
+        if !adaptive_polling_enabled(state)
+            && at_passive_level()
             && deliver_transmit_packet_to_read(
                 state,
                 read_queue,
@@ -1373,6 +1535,7 @@ fn capture_transmit_packets(
                 fragment_begin,
                 fragment_count,
                 total_length,
+                capture_generation,
             )
         {
             let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
@@ -1391,37 +1554,95 @@ fn capture_transmit_packets(
             continue;
         }
 
-        let mut bytes = Vec::new();
-        if bytes.try_reserve_exact(total_length).is_ok() {
-            fragment_index = fragment_begin;
-            for _ in 0..fragment_count {
-                let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
-                    Some(fragment) => unsafe { &*fragment },
-                    None => return,
-                };
-                let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
-                    Some(address) => unsafe { &*address },
-                    None => return,
-                };
-                let start = unsafe {
-                    (address.VirtualAddress as *const u8).add(fragment.Offset() as usize)
-                };
-                let length = fragment.ValidLength() as usize;
-                let data = unsafe { core::slice::from_raw_parts(start, length) };
-                bytes.extend_from_slice(data);
-                fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
-                    Some(index) => index,
-                    None => return,
-                };
+        let pool = match unsafe { state.as_ref() }.map(|state| state.frame_pool) {
+            Some(pool) if !pool.is_null() => pool,
+            _ => {
+                debug_status(b"Tx capture frame pool", STATUS_DEVICE_NOT_READY);
+                break;
             }
-
-            if let Ok(frame) = Frame::from_vec(bytes) {
-                if unsafe { enqueue_existing_capture_frame(&mut *state, frame) }.is_ok() {
-                    captured = true;
+        };
+        let mut frame = match Frame::new(pool) {
+            Ok(frame) => frame,
+            Err(_) => {
+                debug_status(b"Tx capture frame allocation", STATUS_INSUFFICIENT_RESOURCES);
+                unsafe {
+                    if let Some(packet) = packet_at(packet_ring, packet_begin) {
+                        (*packet).set_Ignore(1);
+                    }
                 }
+                let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
+                    Some(index) => index,
+                    None => break,
+                };
+                let next_fragment =
+                    match unsafe { advance_index(&*fragment_ring, fragment_begin, fragment_count) }
+                    {
+                        Some(index) => index,
+                        None => break,
+                    };
+                unsafe {
+                    (*packet_ring).BeginIndex = next_packet;
+                    (*fragment_ring).BeginIndex = next_fragment;
+                }
+                continue;
             }
-        } else {
-            debug_status(b"Tx capture allocation", STATUS_INSUFFICIENT_RESOURCES);
+        };
+        let mut offset = 0;
+        let mut copy_succeeded = true;
+        fragment_index = fragment_begin;
+        for _ in 0..fragment_count {
+            let fragment = match unsafe { fragment_at(fragment_ring, fragment_index) } {
+                Some(fragment) => unsafe { &*fragment },
+                None => {
+                    copy_succeeded = false;
+                    break;
+                }
+            };
+            let address = match unsafe { fragment_virtual_address(extension, fragment_index) } {
+                Some(address) => unsafe { &*address },
+                None => {
+                    copy_succeeded = false;
+                    break;
+                }
+            };
+            let start = unsafe {
+                (address.VirtualAddress as *const u8).add(fragment.Offset() as usize)
+            };
+            let length = fragment.ValidLength() as usize;
+            let data = unsafe { core::slice::from_raw_parts(start, length) };
+            if frame.copy_from_slice(offset, data).is_err() {
+                copy_succeeded = false;
+                break;
+            }
+            offset += length;
+            fragment_index = match unsafe { increment_index(&*fragment_ring, fragment_index) } {
+                Some(index) => index,
+                None => {
+                    copy_succeeded = false;
+                    break;
+                }
+            };
+        }
+        if copy_succeeded && offset == total_length {
+            frame.set_length(total_length);
+            if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+                if state_guard.lifecycle.load(Ordering::Acquire) == INSTANCE_OPEN
+                    && state_guard.owner_generation == capture_generation
+                {
+                    let adaptive = state_guard.adaptive_enabled.load(Ordering::Acquire);
+                    match enqueue_existing_capture_frame_locked(&mut state_guard, frame) {
+                        Ok(wait_completion_queued) => {
+                            if !adaptive {
+                                captured_for_legacy_read = true;
+                            }
+                            wait_completion_scheduled |= wait_completion_queued;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            } else {
+                (*packet).set_Ignore(1);
+            }
         }
 
         let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
@@ -1439,9 +1660,16 @@ fn capture_transmit_packets(
         }
     }
 
-    if captured {
+    if captured_for_legacy_read || wait_completion_scheduled {
         enqueue_work_item(read_work_item);
     }
+}
+
+fn adaptive_polling_enabled(state: *mut InstanceState) -> bool {
+    if state.is_null() {
+        return false;
+    }
+    unsafe { (*state).adaptive_enabled.load(Ordering::Acquire) }
 }
 
 fn at_passive_level() -> bool {
@@ -1486,7 +1714,21 @@ fn deliver_transmit_packet_to_read(
     fragment_begin: u32,
     fragment_count: u32,
     total_length: usize,
+    owner_generation: u64,
 ) -> bool {
+    let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) })
+    else {
+        return false;
+    };
+    let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        return false;
+    };
+    if state_guard.adaptive_enabled.load(Ordering::Acquire)
+        || state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN
+        || state_guard.owner_generation != owner_generation
+    {
+        return false;
+    }
     let mut request = core::ptr::null_mut();
     let status = unsafe {
         call_unsafe_wdf_function_binding!(WdfIoQueueRetrieveNextRequest, read_queue, &mut request,)
@@ -1494,10 +1736,11 @@ fn deliver_transmit_packet_to_read(
     if status != STATUS_SUCCESS {
         return false;
     }
-
-    unsafe {
-        release_request(&(*state).pending_reads);
-    }
+    release_request(&state_guard.pending_reads);
+    state_guard
+        .legacy_direct_read_claims
+        .fetch_add(1, Ordering::AcqRel);
+    drop(state_guard);
 
     let mut output = core::ptr::null_mut::<c_void>();
     let mut output_length = 0usize;
@@ -1512,10 +1755,12 @@ fn deliver_transmit_packet_to_read(
     };
     if status != STATUS_SUCCESS {
         complete_request(request, status);
+        release_legacy_direct_read_claim(state);
         return false;
     }
     if output_length < total_length {
         complete_request(request, STATUS_BUFFER_TOO_SMALL);
+        release_legacy_direct_read_claim(state);
         return false;
     }
 
@@ -1526,6 +1771,7 @@ fn deliver_transmit_packet_to_read(
             Some(fragment) => unsafe { &*fragment },
             None => {
                 complete_request(request, STATUS_DEVICE_NOT_READY);
+                release_legacy_direct_read_claim(state);
                 return false;
             }
         };
@@ -1533,6 +1779,7 @@ fn deliver_transmit_packet_to_read(
             Some(address) => unsafe { &*address },
             None => {
                 complete_request(request, STATUS_DEVICE_NOT_READY);
+                release_legacy_direct_read_claim(state);
                 return false;
             }
         };
@@ -1547,6 +1794,7 @@ fn deliver_transmit_packet_to_read(
             Some(index) => index,
             None => {
                 complete_request(request, STATUS_DEVICE_NOT_READY);
+                release_legacy_direct_read_claim(state);
                 return false;
             }
         };
@@ -1554,7 +1802,14 @@ fn deliver_transmit_packet_to_read(
 
     debug_assert!(output_offset == total_length);
     complete_request_with_information(request, STATUS_SUCCESS, output_offset);
+    release_legacy_direct_read_claim(state);
     true
+}
+
+fn release_legacy_direct_read_claim(state: *mut InstanceState) {
+    if !state.is_null() {
+        release_request(unsafe { &(*state).legacy_direct_read_claims });
+    }
 }
 
 fn validate_fragment(
@@ -1773,12 +2028,17 @@ unsafe extern "C" fn evt_device_d0_entry(
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
-        let read_queue = {
+        let (read_queue, adaptive) = {
             let state = &mut *state_guard;
-            state.read_queue
+            (
+                state.read_queue,
+                state.adaptive_enabled.load(Ordering::Acquire),
+            )
         };
         drop(state_guard);
-        resume_manual_queue(read_queue);
+        if !adaptive {
+            resume_manual_queue(read_queue);
+        }
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
@@ -1794,16 +2054,31 @@ unsafe extern "C" fn evt_device_d0_exit(
     _target_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
     if let Some(state) = unsafe { instance_from_pnp_device(device) } {
+        let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) })
+        else {
+            return STATUS_DEVICE_NOT_READY;
+        };
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
-        let read_queue = {
+        let (read_queue, read_work_item, adaptive, pending_wait) = {
             let state = &mut *state_guard;
             state.lifecycle.store(INSTANCE_SUSPENDED, Ordering::Release);
-            state.read_queue
+            (
+                state.read_queue,
+                state.read_work_item,
+                state.adaptive_enabled.load(Ordering::Acquire),
+                take_wait_for_cancellation_locked(state),
+            )
         };
         drop(state_guard);
-        purge_queue(read_queue);
+        if let Some(request) = pending_wait {
+            cancel_claimed_wait(state, request);
+        }
+        flush_work_item(read_work_item);
+        if !adaptive {
+            purge_queue(read_queue);
+        }
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
@@ -1951,9 +2226,16 @@ extern "C" fn evt_device_release_hardware(
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    let (adapter, read_queue) = {
+    let (adapter, read_queue, read_work_item, adaptive, pending_wait) = {
         let state = &mut *state_guard;
-        (state.adapter, state.read_queue)
+        state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
+        (
+            state.adapter,
+            state.read_queue,
+            state.read_work_item,
+            state.adaptive_enabled.load(Ordering::Acquire),
+            take_wait_for_cancellation_locked(state),
+        )
     };
     drop(state_guard);
     if !adapter.is_null() {
@@ -1967,13 +2249,25 @@ extern "C" fn evt_device_release_hardware(
         // after the framework has stopped datapath activity.
         unsafe { stop(netadaptercx_sys::NetDriverGlobals, adapter) };
     }
+    let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
 
-    purge_queue(read_queue);
+    if let Some(request) = pending_wait {
+        cancel_claimed_wait(state, request);
+    }
+    flush_work_item(read_work_item);
+    if !adaptive {
+        purge_queue(read_queue);
+    }
+    flush_work_item(read_work_item);
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
     let state = &mut *state_guard;
     clear_frame_queues(state);
+    // The lookaside list is parented to the device; leave it alive until WDF
+    // tears down the device so any in-flight Frame can release its memory.
     clear_receive_filter_state(state);
     state.pending_reads.store(0, Ordering::Release);
     state.pending_writes.store(0, Ordering::Release);
@@ -2003,6 +2297,30 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
     };
+    let mut lookaside_attributes = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ParentObject: device.cast(),
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ..WDF_OBJECT_ATTRIBUTES::default()
+    };
+    let mut frame_pool: wdk_sys::WDFLOOKASIDE = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfLookasideListCreate,
+            &mut lookaside_attributes,
+            FRAME_STORAGE_SIZE,
+            wdk_sys::_POOL_TYPE::NonPagedPoolNx,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            u32::from_le_bytes(*b"WTFR"),
+            &mut frame_pool,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        debug_status(b"FramePoolCreate", status);
+        return status;
+    }
     let injection_queue = match FrameQueue::try_new(FRAME_QUEUE_LIMIT, queue_byte_limit) {
         Ok(queue) => queue,
         Err(_) => {
@@ -2044,6 +2362,65 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
     let mut state_lock: WDFSPINLOCK = core::ptr::null_mut();
     let status = unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockCreate, &mut lock_attributes, &mut state_lock,)
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return status;
+    }
+    let mut legacy_direct_read_lock: WDFWAITLOCK = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfWaitLockCreate,
+            &mut lock_attributes,
+            &mut legacy_direct_read_lock,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return status;
+    }
+
+    let mut control_queue_config = WDF_IO_QUEUE_CONFIG {
+        Size: core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
+        DispatchType: wdk_sys::_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchParallel,
+        AllowZeroLengthRequests: 1,
+        EvtIoDeviceControl: Some(evt_io_device_control),
+        EvtIoStop: Some(evt_io_stop),
+        ..WDF_IO_QUEUE_CONFIG::default()
+    };
+    unsafe {
+        control_queue_config
+            .Settings
+            .Parallel
+            .NumberOfPresentedRequests = ULONG::MAX;
+    }
+    let mut control_queue: WDFQUEUE = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoQueueCreate,
+            device,
+            &mut control_queue_config,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut control_queue,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return status;
+    }
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceConfigureRequestDispatching,
+            device,
+            control_queue,
+            wdk_sys::_WDF_REQUEST_TYPE::WdfRequestTypeDeviceControl,
+        )
     };
     if status != STATUS_SUCCESS {
         unsafe {
@@ -2157,7 +2534,9 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
 
     state.read_queue = read_queue;
     state.frame_lock = frame_lock;
+    state.frame_pool = frame_pool;
     state.state_lock = state_lock;
+    state.legacy_direct_read_lock = legacy_direct_read_lock;
     state.injection_queue = Some(injection_queue);
     state.capture_queue = Some(capture_queue);
     state.read_work_item = read_work_item;
@@ -2178,11 +2557,7 @@ unsafe extern "C" fn evt_instance_context_destroy(object: WDFOBJECT) {
     }
 }
 
-extern "C" fn evt_file_create(
-    device: WDFDEVICE,
-    request: WDFREQUEST,
-    _file_object: WDFFILEOBJECT,
-) {
+extern "C" fn evt_file_create(device: WDFDEVICE, request: WDFREQUEST, _file_object: WDFFILEOBJECT) {
     let Some(state) = (unsafe { instance_from_device(device) }) else {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
@@ -2206,17 +2581,34 @@ extern "C" fn evt_file_close(_file_object: WDFFILEOBJECT) {}
 extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
     let device = unsafe { call_unsafe_wdf_function_binding!(WdfFileObjectGetDevice, file_object) };
     if let Some(state) = unsafe { instance_from_device(device) } {
+        let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) })
+        else {
+            return;
+        };
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
-        let (was_suspended, read_queue) = {
+        let (was_suspended, read_queue, read_work_item, adaptive, pending_wait) = {
             let state = &mut *state_guard;
             let was_suspended = state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
+            state.owner_generation = state.owner_generation.wrapping_add(1);
             state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
-            (was_suspended, state.read_queue)
+            (
+                was_suspended,
+                state.read_queue,
+                state.read_work_item,
+                state.adaptive_enabled.load(Ordering::Acquire),
+                take_wait_for_cancellation_locked(state),
+            )
         };
         drop(state_guard);
-        purge_queue(read_queue);
+        if let Some(request) = pending_wait {
+            cancel_claimed_wait(state, request);
+        }
+        flush_work_item(read_work_item);
+        if !adaptive {
+            purge_queue(read_queue);
+        }
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
@@ -2228,11 +2620,6 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
             !state.adapter.is_null() && !was_suspended
         };
         drop(state_guard);
-        if should_resume {
-            // WdfIoQueueStart can synchronously dispatch request handlers.
-            resume_manual_queue(read_queue);
-        }
-
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
@@ -2244,8 +2631,296 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
             reopen_frame_queues(state);
             state.lifecycle.store(INSTANCE_OPEN, Ordering::Release);
         }
+        state.adaptive_enabled.store(false, Ordering::Release);
         state.control_open.store(false, Ordering::Release);
+        drop(state_guard);
+        if should_resume {
+            // A reopened manual queue belongs to a future legacy owner, never to this adaptive owner.
+            resume_manual_queue(read_queue);
+        }
     }
+}
+
+extern "C" fn evt_io_device_control(
+    queue: WDFQUEUE,
+    request: WDFREQUEST,
+    output_length: usize,
+    input_length: usize,
+    ioctl: ULONG,
+) {
+    let Some(state) = (unsafe { instance_from_io_queue(queue) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
+
+    match ioctl {
+        TAP_IOCTL_ENABLE_ADAPTIVE_POLLING => {
+            handle_enable_adaptive_polling(state, request, output_length, input_length);
+        }
+        TAP_IOCTL_WAIT_FOR_CHANGE => {
+            handle_wait_for_change(state, request, output_length, input_length);
+        }
+        _ => complete_request(request, STATUS_INVALID_DEVICE_REQUEST),
+    }
+}
+
+fn handle_enable_adaptive_polling(
+    state: *mut InstanceState,
+    request: WDFREQUEST,
+    output_length: usize,
+    input_length: usize,
+) {
+    if input_length != core::mem::size_of::<AdaptiveEnableRequest>()
+        || output_length != core::mem::size_of::<AdaptiveEnableResponse>()
+    {
+        complete_request(request, STATUS_INVALID_BUFFER_SIZE);
+        return;
+    }
+
+    let mut input = core::ptr::null_mut::<c_void>();
+    let mut actual_input_length = 0usize;
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestRetrieveInputBuffer,
+            request,
+            core::mem::size_of::<AdaptiveEnableRequest>(),
+            &mut input,
+            &mut actual_input_length,
+        )
+    };
+    if status != STATUS_SUCCESS
+        || actual_input_length != core::mem::size_of::<AdaptiveEnableRequest>()
+    {
+        complete_request(
+            request,
+            if status == STATUS_SUCCESS {
+                STATUS_INVALID_BUFFER_SIZE
+            } else {
+                status
+            },
+        );
+        return;
+    }
+    let enable = unsafe { input.cast::<AdaptiveEnableRequest>().read() };
+    if enable.version != ADAPTIVE_POLLING_PROTOCOL_VERSION
+        || enable.flags == 0
+        || enable.flags & !ADAPTIVE_INTEREST_SUPPORTED != 0
+    {
+        complete_request(request, STATUS_NOT_SUPPORTED);
+        return;
+    }
+
+    let mut output = core::ptr::null_mut::<c_void>();
+    let mut actual_output_length = 0usize;
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestRetrieveOutputBuffer,
+            request,
+            core::mem::size_of::<AdaptiveEnableResponse>(),
+            &mut output,
+            &mut actual_output_length,
+        )
+    };
+    if status != STATUS_SUCCESS
+        || actual_output_length < core::mem::size_of::<AdaptiveEnableResponse>()
+    {
+        complete_request(
+            request,
+            if status == STATUS_SUCCESS {
+                STATUS_BUFFER_TOO_SMALL
+            } else {
+                status
+            },
+        );
+        return;
+    }
+
+    let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
+    if state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+        drop(state_guard);
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+    if state_guard.adaptive_enabled.load(Ordering::Acquire)
+        || state_guard.pending_reads.load(Ordering::Acquire) != 0
+        || state_guard
+            .legacy_direct_read_claims
+            .load(Ordering::Acquire)
+            != 0
+    {
+        drop(state_guard);
+        complete_request(request, STATUS_DEVICE_BUSY);
+        return;
+    }
+    state_guard.adaptive_enabled.store(true, Ordering::Release);
+    drop(state_guard);
+
+    unsafe {
+        output
+            .cast::<AdaptiveEnableResponse>()
+            .write(AdaptiveEnableResponse {
+                version: ADAPTIVE_POLLING_PROTOCOL_VERSION,
+                flags: enable.flags,
+            });
+    }
+    complete_request_with_information(
+        request,
+        STATUS_SUCCESS,
+        core::mem::size_of::<AdaptiveEnableResponse>(),
+    );
+}
+
+fn handle_wait_for_change(
+    state: *mut InstanceState,
+    request: WDFREQUEST,
+    output_length: usize,
+    input_length: usize,
+) {
+    if input_length != core::mem::size_of::<AdaptiveWaitRequest>()
+        || output_length != core::mem::size_of::<AdaptiveWaitResponse>()
+    {
+        complete_request(request, STATUS_INVALID_BUFFER_SIZE);
+        return;
+    }
+
+    let mut input = core::ptr::null_mut::<c_void>();
+    let mut actual_input_length = 0usize;
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestRetrieveInputBuffer,
+            request,
+            core::mem::size_of::<AdaptiveWaitRequest>(),
+            &mut input,
+            &mut actual_input_length,
+        )
+    };
+    if status != STATUS_SUCCESS
+        || actual_input_length != core::mem::size_of::<AdaptiveWaitRequest>()
+    {
+        complete_request(
+            request,
+            if status == STATUS_SUCCESS {
+                STATUS_INVALID_BUFFER_SIZE
+            } else {
+                status
+            },
+        );
+        return;
+    }
+    let wait = unsafe { input.cast::<AdaptiveWaitRequest>().read() };
+    if wait.version != ADAPTIVE_POLLING_PROTOCOL_VERSION
+        || wait.interest == 0
+        || wait.interest & !ADAPTIVE_INTEREST_SUPPORTED != 0
+    {
+        complete_request(request, STATUS_NOT_SUPPORTED);
+        return;
+    }
+
+    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
+    if state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+        drop(state_guard);
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+    if !state_guard.adaptive_enabled.load(Ordering::Acquire) {
+        drop(state_guard);
+        complete_request(request, STATUS_INVALID_DEVICE_REQUEST);
+        return;
+    }
+    if !state_guard.rx_queue_started.load(Ordering::Acquire) {
+        drop(state_guard);
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+    if !state_guard.pending_wait_request.is_null()
+        || !state_guard.ready_wait_request.is_null()
+        || !state_guard.wait_registration_request.is_null()
+        || !state_guard.completing_wait_request.is_null()
+    {
+        drop(state_guard);
+        complete_request(request, STATUS_DEVICE_BUSY);
+        return;
+    }
+
+    let satisfied = readiness_mask_locked(&mut state_guard) & wait.interest;
+    if satisfied != 0 {
+        drop(state_guard);
+        complete_wait_response(request, STATUS_SUCCESS, satisfied);
+        return;
+    }
+
+    state_guard.wait_registration_request = request;
+    state_guard.wait_registration_cancelled = false;
+    drop(state_guard);
+
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestMarkCancelableEx,
+            request,
+            Some(evt_wait_for_change_cancel),
+        )
+    };
+    let mut complete_cancelled = false;
+    let mut unmark_cancelable = false;
+    let mut work_item = core::ptr::null_mut();
+    if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+        if state_guard.wait_registration_request == request {
+            let cancelled = state_guard.wait_registration_cancelled;
+            state_guard.wait_registration_request = core::ptr::null_mut();
+            state_guard.wait_registration_cancelled = false;
+            if status == STATUS_SUCCESS && !cancelled {
+                state_guard.pending_wait_request = request;
+                state_guard.pending_wait_interest = wait.interest;
+                state_guard.pending_wait_cancelable = true;
+                if readiness_mask_locked(&mut state_guard) & wait.interest != 0
+                    && claim_wait_for_passive_completion_locked(
+                        &mut state_guard,
+                        wait.interest,
+                    )
+                {
+                    work_item = state_guard.read_work_item;
+                }
+            } else {
+                complete_cancelled =
+                    !cancelled || (status != STATUS_SUCCESS && status != STATUS_CANCELLED);
+                unmark_cancelable = status == STATUS_SUCCESS;
+            }
+        } else {
+            complete_cancelled = status != STATUS_SUCCESS && status != STATUS_CANCELLED;
+        }
+    } else if status != STATUS_SUCCESS && status != STATUS_CANCELLED {
+        complete_cancelled = true;
+    }
+    if unmark_cancelable {
+        let unmark_status = unsafe {
+            call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request)
+        };
+        complete_cancelled = unmark_status != STATUS_CANCELLED;
+    }
+    if complete_cancelled {
+        complete_request(request, STATUS_CANCELLED);
+    } else if !work_item.is_null() {
+        enqueue_work_item(work_item);
+    }
+}
+
+unsafe extern "C" fn evt_wait_for_change_cancel(request: WDFREQUEST) {
+    let queue = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetIoQueue, request) };
+    if let Some(state) = unsafe { instance_from_io_queue(queue) } {
+        if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+            let _ = take_wait_request_locked(&mut state_guard, request);
+        }
+        complete_request(request, STATUS_CANCELLED);
+        clear_completing_wait_request(state, request);
+        return;
+    }
+    complete_request(request, STATUS_CANCELLED);
 }
 
 extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize) {
@@ -2261,22 +2936,34 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     }
+    if state_guard.adaptive_enabled.load(Ordering::Acquire) {
+        let owner_generation = state_guard.owner_generation;
+        let frame = dequeue_capture_frame(&mut state_guard);
+        drop(state_guard);
+        if let Some(frame) = frame {
+            let status = complete_captured_frame_to_read(request, &frame);
+            if status != STATUS_SUCCESS {
+                requeue_capture_frame_and_schedule_wait(state, frame, owner_generation);
+                complete_request(request, status);
+            }
+        } else {
+            complete_request(request, STATUS_NO_MORE_ENTRIES);
+        }
+        return;
+    }
     if !try_admit(&state_guard.pending_reads, PENDING_READ_LIMIT) {
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
     }
     let frame = dequeue_capture_frame(&mut *state_guard);
     if let Some(frame) = frame {
+        let owner_generation = state_guard.owner_generation;
         release_request(&state_guard.pending_reads);
         drop(state_guard);
 
         let status = complete_captured_frame_to_read(request, &frame);
         if status != STATUS_SUCCESS {
-            if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-                let state = &mut *state_guard;
-                let _ = enqueue_existing_capture_frame(state, frame);
-                drop(state_guard);
-            }
+            requeue_capture_frame_and_schedule_wait(state, frame, owner_generation);
             complete_request(request, status);
         }
         return;
@@ -2380,11 +3067,20 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
         complete_request(request, STATUS_CANCELLED);
         return;
     };
+    let state_ptr = state_guard.state;
     let state = &mut *state_guard;
-    if queue == state.read_queue {
+    let wait_claim = take_wait_request_locked(state, request);
+    if matches!(wait_claim, WaitRequestClaim::None) && queue == state.read_queue {
         release_request(&state.pending_reads);
     }
-    complete_request(request, STATUS_CANCELLED);
+    drop(state_guard);
+    match wait_claim {
+        WaitRequestClaim::Cancelable => cancel_claimed_wait(state_ptr, request),
+        WaitRequestClaim::Completing | WaitRequestClaim::Registering => {
+            acknowledge_stopped_request(request);
+        }
+        WaitRequestClaim::None => complete_request(request, STATUS_CANCELLED),
+    }
 }
 
 fn forward_request(request: WDFREQUEST, target_queue: WDFQUEUE) -> bool {
@@ -2469,6 +3165,14 @@ fn enqueue_work_item(work_item: WDFWORKITEM) {
     }
 }
 
+fn flush_work_item(work_item: WDFWORKITEM) {
+    if !work_item.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfWorkItemFlush, work_item);
+        }
+    }
+}
+
 fn take_rx_notification(state: &InstanceState) -> netadaptercx_sys::NETPACKETQUEUE {
     if state.rx_notification_armed.swap(false, Ordering::AcqRel) {
         state.rx_queue
@@ -2497,8 +3201,19 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
         return;
     };
     loop {
+        let ready_wait = {
+            let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+                return;
+            };
+            take_ready_wait_locked(&mut state_guard)
+        };
+        if let Some((request, satisfied)) = ready_wait {
+            complete_claimed_wait_at_passive(state, request, satisfied);
+            continue;
+        }
+
         let mut request = core::ptr::null_mut();
-        let frame = {
+        let (frame, owner_generation) = {
             let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
                 return;
             };
@@ -2524,21 +3239,33 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
                 }
             };
             release_request(&state.pending_reads);
-            frame
+            (frame, state.owner_generation)
         };
         let status = complete_captured_frame_to_read(request, &frame);
         if status != STATUS_SUCCESS {
-            if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-                let state = &mut *state_guard;
-                let _ = enqueue_existing_capture_frame(state, frame);
-            }
+            requeue_capture_frame_and_schedule_wait(state, frame, owner_generation);
             complete_request(request, status);
         }
     }
 }
 
 fn enqueue_injection_frame(state: &mut InstanceState, bytes: &[u8]) -> Result<(), QueueError> {
-    let frame = Frame::from_bytes(bytes)?;
+    let lock = state.frame_lock;
+    if lock.is_null() {
+        return Err(QueueError::Closed);
+    }
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
+        let capacity = state
+            .injection_queue
+            .as_ref()
+            .ok_or(QueueError::Closed)
+            .and_then(|queue| queue.check_capacity(bytes.len()));
+        call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+        capacity?;
+    }
+
+    let frame = Frame::from_bytes(state.frame_pool, bytes)?;
     enqueue_existing_injection_frame(state, frame)
 }
 
@@ -2562,37 +3289,72 @@ fn enqueue_existing_injection_frame(
     }
 }
 
-fn enqueue_existing_capture_frame(
+fn enqueue_existing_capture_frame_locked(
     state: &mut InstanceState,
     frame: Frame,
-) -> Result<(), QueueError> {
+) -> Result<bool, QueueError> {
     let lock = state.frame_lock;
     if lock.is_null() {
         return Err(QueueError::Closed);
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let result = state
-            .capture_queue
-            .as_mut()
-            .ok_or(QueueError::Closed)
-            .and_then(|queue| queue.enqueue(frame));
+        let (result, was_empty) = match state.capture_queue.as_mut() {
+            Some(queue) => {
+                let was_empty = queue.is_empty();
+                (queue.enqueue(frame), was_empty)
+            }
+            None => (Err(QueueError::Closed), false),
+        };
+        let wait_completion_scheduled = if result.is_ok() && was_empty {
+            claim_wait_for_passive_completion_locked(state, ADAPTIVE_INTEREST_READABLE)
+        } else {
+            false
+        };
         call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
-        result
+        result.map(|()| wait_completion_scheduled)
     }
 }
 
-fn dequeue_injection_frame(state: &mut InstanceState) -> Option<Frame> {
+fn dequeue_injection_frame(state: &mut InstanceState) -> (Option<Frame>, bool) {
     let lock = state.frame_lock;
     if lock.is_null() {
-        return None;
+        return (None, false);
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let frame = state.injection_queue.as_mut().and_then(FrameQueue::dequeue);
+        let (frame, was_full) = match state.injection_queue.as_mut() {
+            Some(queue) => {
+                let was_full =
+                    queue.state() == QueueState::Open && queue.len() == FRAME_QUEUE_LIMIT;
+                (queue.dequeue(), was_full)
+            }
+            None => (None, false),
+        };
+        let was_full_transition = frame.is_some() && was_full;
         call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
-        frame
+        (frame, was_full_transition)
     }
+}
+
+fn requeue_capture_frame_and_schedule_wait(
+    state: *mut InstanceState,
+    frame: Frame,
+    owner_generation: u64,
+) {
+    let work_item = if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+        if state_guard.lifecycle.load(Ordering::Acquire) == INSTANCE_OPEN
+            && state_guard.owner_generation == owner_generation
+            && enqueue_existing_capture_frame_locked(&mut state_guard, frame).unwrap_or(false)
+        {
+            state_guard.read_work_item
+        } else {
+            core::ptr::null_mut()
+        }
+    } else {
+        core::ptr::null_mut()
+    };
+    enqueue_work_item(work_item);
 }
 
 fn dequeue_capture_frame(state: &mut InstanceState) -> Option<Frame> {
@@ -2605,6 +3367,214 @@ fn dequeue_capture_frame(state: &mut InstanceState) -> Option<Frame> {
         let frame = state.capture_queue.as_mut().and_then(FrameQueue::dequeue);
         call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
         frame
+    }
+}
+
+fn readiness_mask_locked(state: &mut InstanceState) -> u32 {
+    let lock = state.frame_lock;
+    if lock.is_null() {
+        return 0;
+    }
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
+        let mut ready = 0;
+        if state
+            .capture_queue
+            .as_ref()
+            .is_some_and(|queue| !queue.is_empty())
+        {
+            ready |= ADAPTIVE_INTEREST_READABLE;
+        }
+        if state.injection_queue.as_ref().is_some_and(|queue| {
+            queue.state() == QueueState::Open && queue.len() < FRAME_QUEUE_LIMIT
+        }) {
+            ready |= ADAPTIVE_INTEREST_WRITABLE;
+        }
+        call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+        ready
+    }
+}
+
+fn claim_wait_for_passive_completion_locked(state: &mut InstanceState, condition: u32) -> bool {
+    if !state.adaptive_enabled.load(Ordering::Acquire)
+        || state.pending_wait_request.is_null()
+        || !state.pending_wait_cancelable
+        || !state.ready_wait_request.is_null()
+    {
+        return false;
+    }
+    let satisfied = state.pending_wait_interest & condition;
+    if satisfied == 0 {
+        return false;
+    }
+    let request = state.pending_wait_request;
+    state.pending_wait_request = core::ptr::null_mut();
+    state.pending_wait_interest = 0;
+    state.pending_wait_cancelable = false;
+    state.ready_wait_request = request;
+    state.ready_wait_satisfied = satisfied;
+    true
+}
+
+fn take_wait_for_cancellation_locked(state: &mut InstanceState) -> Option<WDFREQUEST> {
+    if !state.pending_wait_request.is_null() {
+        let request = state.pending_wait_request;
+        state.pending_wait_request = core::ptr::null_mut();
+        state.pending_wait_interest = 0;
+        state.pending_wait_cancelable = false;
+        state.completing_wait_request = request;
+        return Some(request);
+    }
+    if !state.wait_registration_request.is_null() {
+        state.wait_registration_cancelled = true;
+    }
+    take_ready_wait_for_cancellation_locked(state)
+}
+
+fn take_ready_wait_locked(state: &mut InstanceState) -> Option<(WDFREQUEST, u32)> {
+    if state.ready_wait_request.is_null() {
+        return None;
+    }
+    let request = state.ready_wait_request;
+    let satisfied = state.ready_wait_satisfied;
+    state.ready_wait_request = core::ptr::null_mut();
+    state.ready_wait_satisfied = 0;
+    state.completing_wait_request = request;
+    Some((request, satisfied))
+}
+
+fn take_ready_wait_for_cancellation_locked(state: &mut InstanceState) -> Option<WDFREQUEST> {
+    if state.ready_wait_request.is_null() {
+        return None;
+    }
+    let request = state.ready_wait_request;
+    state.ready_wait_request = core::ptr::null_mut();
+    state.ready_wait_satisfied = 0;
+    state.completing_wait_request = request;
+    Some(request)
+}
+
+enum WaitRequestClaim {
+    None,
+    Cancelable,
+    Registering,
+    Completing,
+}
+
+fn take_wait_request_locked(state: &mut InstanceState, request: WDFREQUEST) -> WaitRequestClaim {
+    if state.pending_wait_request == request {
+        state.pending_wait_request = core::ptr::null_mut();
+        state.pending_wait_interest = 0;
+        state.pending_wait_cancelable = false;
+        state.completing_wait_request = request;
+        return WaitRequestClaim::Cancelable;
+    }
+    if state.ready_wait_request == request {
+        state.ready_wait_request = core::ptr::null_mut();
+        state.ready_wait_satisfied = 0;
+        state.completing_wait_request = request;
+        return WaitRequestClaim::Cancelable;
+    }
+    if state.wait_registration_request == request {
+        state.wait_registration_cancelled = true;
+        return WaitRequestClaim::Registering;
+    }
+    if state.completing_wait_request == request {
+        return WaitRequestClaim::Completing;
+    }
+    WaitRequestClaim::None
+}
+
+fn complete_wait_response(request: WDFREQUEST, status: NTSTATUS, satisfied: u32) {
+    if status != STATUS_SUCCESS {
+        complete_request(request, status);
+        return;
+    }
+    let mut output = core::ptr::null_mut::<c_void>();
+    let mut output_length = 0usize;
+    let output_status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestRetrieveOutputBuffer,
+            request,
+            core::mem::size_of::<AdaptiveWaitResponse>(),
+            &mut output,
+            &mut output_length,
+        )
+    };
+    if output_status != STATUS_SUCCESS
+        || output_length < core::mem::size_of::<AdaptiveWaitResponse>()
+    {
+        complete_request(
+            request,
+            if output_status == STATUS_SUCCESS {
+                STATUS_BUFFER_TOO_SMALL
+            } else {
+                output_status
+            },
+        );
+        return;
+    }
+    unsafe {
+        output
+            .cast::<AdaptiveWaitResponse>()
+            .write(AdaptiveWaitResponse { satisfied });
+    }
+    complete_request_with_information(
+        request,
+        STATUS_SUCCESS,
+        core::mem::size_of::<AdaptiveWaitResponse>(),
+    );
+}
+
+fn complete_claimed_wait_at_passive(state: *mut InstanceState, request: WDFREQUEST, satisfied: u32) {
+    debug_assert!(at_passive_level());
+    let cancelled = unsafe { InstanceStateGuard::new(state) }
+        .is_none_or(|state_guard| {
+            state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN
+                || !state_guard.rx_queue_started.load(Ordering::Acquire)
+        });
+    let cancel_status =
+        unsafe { call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request) };
+    if cancel_status == STATUS_SUCCESS {
+        if cancelled {
+            complete_request(request, STATUS_CANCELLED);
+        } else {
+            complete_wait_response(request, STATUS_SUCCESS, satisfied);
+        }
+    } else if cancel_status != STATUS_CANCELLED {
+        complete_request(request, cancel_status);
+    }
+    if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+        if state_guard.completing_wait_request == request {
+            state_guard.completing_wait_request = core::ptr::null_mut();
+        }
+    }
+}
+
+fn cancel_claimed_wait(state: *mut InstanceState, request: WDFREQUEST) {
+    let cancel_status =
+        unsafe { call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request) };
+    if cancel_status == STATUS_SUCCESS {
+        complete_request(request, STATUS_CANCELLED);
+    } else if cancel_status != STATUS_CANCELLED {
+        complete_request(request, cancel_status);
+    }
+    if cancel_status != STATUS_CANCELLED {
+        clear_completing_wait_request(state, request);
+    }
+}
+
+fn clear_completing_wait_request(state: *mut InstanceState, request: WDFREQUEST) {
+    if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+        if state_guard.completing_wait_request == request {
+            state_guard.completing_wait_request = core::ptr::null_mut();
+        }
+    }
+}
+
+fn acknowledge_stopped_request(request: WDFREQUEST) {
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfRequestStopAcknowledge, request, 0);
     }
 }
 

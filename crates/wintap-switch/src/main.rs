@@ -13,8 +13,13 @@ mod windows_runtime {
     use std::time::{Duration, Instant};
 
     use wintap_switch_core::{
-        BufferPool, EndpointId, FRAME_MAXIMUM, ForwardingError, IoRingCapabilities, IoRingVersion,
-        Switch, select_io_ring_version,
+        ADAPTIVE_INTEREST_ALL, ADAPTIVE_INTEREST_READABLE, ADAPTIVE_INTEREST_WRITABLE,
+        ADAPTIVE_POLLING_PROTOCOL_VERSION,
+        AdaptiveEnableRequest, AdaptiveEnableResponse, AdaptiveEndpointCapability,
+        AdaptiveWaitRequest, AdaptiveWaitResponse, BufferPool, EndpointId, FRAME_MAXIMUM,
+        ForwardingError, IoRingCapabilities, IoRingVersion, Switch,
+        TAP_IOCTL_ENABLE_ADAPTIVE_POLLING, TAP_IOCTL_WAIT_FOR_CHANGE, select_adaptive_polling,
+        select_io_ring_version,
     };
 
     type Handle = *mut core::ffi::c_void;
@@ -33,6 +38,9 @@ mod windows_runtime {
     const WAIT_TIMEOUT: HResult = 0x8007_05B4u32 as HResult;
     const IORING_E_SUBMISSION_QUEUE_FULL: HResult = 0x8046_0002u32 as HResult;
     const HRESULT_FROM_NT_STATUS_DEVICE_BUSY: HResult = 0x9000_0011u32 as HResult;
+    const HRESULT_FROM_NT_STATUS_NO_MORE_ENTRIES: HResult = 0x9000_001Au32 as HResult;
+    const STATUS_NO_MORE_ENTRIES: HResult = 0x8000_001Au32 as HResult;
+    const HRESULT_FROM_WIN32_ERROR_NO_MORE_ITEMS: HResult = 0x8007_0103u32 as HResult;
     const HRESULT_FROM_WIN32_INVALID_USER_BUFFER: HResult = 0x8007_06F8u32 as HResult;
     const HRESULT_FROM_WIN32_ERROR_BUSY: HResult = 0x8007_00AAu32 as HResult;
     const IORING_OP_READ: Dword = 1;
@@ -48,6 +56,7 @@ mod windows_runtime {
     const DEFAULT_WAIT_OPERATIONS: Dword = 32;
     const BUSY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(1);
     const BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(64);
+    const DEFAULT_ADAPTIVE_POLLING_BUDGET: Duration = Duration::from_micros(100);
     const ENDPOINT_COUNT: usize = 2;
     const DEFAULT_READ_DEPTH: usize = 128;
     const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -58,7 +67,18 @@ mod windows_runtime {
     const SLOT_MASK: Ulonglong = (1_u64 << SLOT_BITS) - 1;
     const GENERATION_MASK: Ulonglong = (1_u64 << GENERATION_BITS) - 1;
     const ERROR_SUCCESS: Dword = 0;
-
+    const ERROR_INVALID_FUNCTION: Dword = 1;
+    const ERROR_NOT_SUPPORTED: Dword = 50;
+    const ERROR_SHARING_VIOLATION: Dword = 32;
+    const ERROR_BUSY: Dword = 170;
+    const ERROR_IO_PENDING: Dword = 997;
+    const ERROR_OPERATION_ABORTED: Dword = 995;
+    const ERROR_NOT_FOUND: Dword = 1168;
+    const WAIT_OBJECT_0: Dword = 0;
+    const WAIT_TIMEOUT_RESULT: Dword = 258;
+    const WAIT_FAILED: Dword = 0xffff_ffff;
+    const CLEANUP_REOPEN_ATTEMPTS: u32 = 50;
+    const CLEANUP_REOPEN_DELAY: Duration = Duration::from_millis(10);
     #[repr(C)]
     struct RawIoRingCapabilities {
         max_version: Dword,
@@ -229,6 +249,24 @@ mod windows_runtime {
         information: Ulonglong,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: Dword,
+        offset_high: Dword,
+        event: Handle,
+    }
+
+    struct AdaptiveWait {
+        event: Handle,
+        overlapped: Overlapped,
+        request: AdaptiveWaitRequest,
+        response: AdaptiveWaitResponse,
+        pending: bool,
+    }
+
     static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
     unsafe extern "system" fn console_handler(control_type: Dword) -> i32 {
@@ -243,6 +281,37 @@ mod windows_runtime {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CloseHandle(handle: Handle) -> i32;
+        fn CreateEventW(
+            attributes: *mut core::ffi::c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> Handle;
+        fn GetLastError() -> Dword;
+        fn ResetEvent(event: Handle) -> i32;
+        fn DeviceIoControl(
+            handle: Handle,
+            code: Dword,
+            input: *mut core::ffi::c_void,
+            input_length: Dword,
+            output: *mut core::ffi::c_void,
+            output_length: Dword,
+            bytes_returned: *mut Dword,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn GetOverlappedResult(
+            handle: Handle,
+            overlapped: *mut Overlapped,
+            bytes_transferred: *mut Dword,
+            wait: i32,
+        ) -> i32;
+        fn CancelIoEx(handle: Handle, overlapped: *mut Overlapped) -> i32;
+        fn WaitForMultipleObjects(
+            count: Dword,
+            handles: *const Handle,
+            wait_all: i32,
+            milliseconds: Dword,
+        ) -> Dword;
         fn SetConsoleCtrlHandler(
             handler: Option<unsafe extern "system" fn(Dword) -> i32>,
             add: i32,
@@ -322,6 +391,7 @@ mod windows_runtime {
         id: EndpointId,
         guid: String,
         handle: Handle,
+        adaptive_wait: Option<AdaptiveWait>,
     }
 
     struct EndpointConfig {
@@ -332,8 +402,38 @@ mod windows_runtime {
     impl Drop for Endpoint {
         fn drop(&mut self) {
             unsafe {
+                if let Some(wait) = self.adaptive_wait.take() {
+                    CloseHandle(wait.event);
+                }
                 CloseHandle(self.handle);
             }
+        }
+    }
+
+    impl AdaptiveWait {
+        fn new() -> Result<Self, String> {
+            let event = unsafe { CreateEventW(null_mut(), 1, 0, std::ptr::null()) };
+            if event.is_null() {
+                return Err(format!("CreateEventW failed with error {}", unsafe {
+                    GetLastError()
+                }));
+            }
+            Ok(Self {
+                event,
+                overlapped: Overlapped {
+                    internal: 0,
+                    internal_high: 0,
+                    offset: 0,
+                    offset_high: 0,
+                    event,
+                },
+                request: AdaptiveWaitRequest {
+                    version: ADAPTIVE_POLLING_PROTOCOL_VERSION,
+                    interest: 0,
+                },
+                response: AdaptiveWaitResponse { satisfied: 0 },
+                pending: false,
+            })
         }
     }
 
@@ -370,6 +470,8 @@ mod windows_runtime {
         wait_operations: Dword,
         completion_wait_milliseconds: Dword,
         frame_maximum: usize,
+        adaptive_polling: bool,
+        polling_budget: Duration,
         stats: RuntimeStats,
     }
 
@@ -396,6 +498,7 @@ mod windows_runtime {
         completions: u64,
         reads: u64,
         writes: u64,
+        empty_reads: u64,
         max_batch: u64,
     }
 
@@ -412,15 +515,21 @@ mod windows_runtime {
                 completions: 0,
                 reads: 0,
                 writes: 0,
+                empty_reads: 0,
                 max_batch: 0,
             }
         }
 
-        fn record_wait(&mut self, signaled: bool) {
+        fn record_wait_submission(&mut self) {
             self.wait_calls += 1;
-            if signaled {
-                self.signaled_wakes += 1;
-            }
+        }
+
+        fn record_signaled_wake(&mut self) {
+            self.signaled_wakes += 1;
+        }
+
+        fn record_empty_read(&mut self) {
+            self.empty_reads += 1;
         }
 
         fn record_batch(&mut self, reads: u64, writes: u64) {
@@ -448,16 +557,18 @@ mod windows_runtime {
             } else {
                 self.reads as f64 / self.signaled_wakes as f64
             };
-            eprintln!(
-                "io-ring stats: elapsed={elapsed:.1}s waits={} signaled_wakes={} batches={} completions={} reads={} writes={} avg_completions_per_batch={average_batch:.2} avg_reads_per_wake={average_reads_per_wake:.2} max_batch={}",
+            let message = format!(
+                "io-ring stats: elapsed={elapsed:.1}s waits={} signaled_wakes={} batches={} completions={} reads={} writes={} empty_reads={} avg_completions_per_batch={average_batch:.2} avg_reads_per_wake={average_reads_per_wake:.2} max_batch={}",
                 self.wait_calls,
                 self.signaled_wakes,
                 self.batches,
                 self.completions,
                 self.reads,
                 self.writes,
+                self.empty_reads,
                 self.max_batch,
             );
+            eprintln!("{message}");
             self.last_report = Instant::now();
         }
     }
@@ -479,6 +590,7 @@ mod windows_runtime {
             stats_enabled: bool,
             wait_operations: Dword,
             completion_wait_milliseconds: Dword,
+            polling_budget: Duration,
             endpoint_configs: [EndpointConfig; ENDPOINT_COUNT],
         ) -> Result<Self, String> {
             if total_depth == 0 || total_depth % ENDPOINT_COUNT != 0 {
@@ -513,21 +625,15 @@ mod windows_runtime {
             let maximum_version = query_capabilities()?;
 
             let [first, second] = endpoint_configs;
-            let endpoints = [
-                Endpoint {
-                    id: EndpointId::new(1),
-                    handle: open_endpoint(&first.interface_path)?,
-                    guid: first.guid,
-                },
-                Endpoint {
-                    id: EndpointId::new(2),
-                    handle: open_endpoint(&second.interface_path)?,
-                    guid: second.guid,
-                },
-            ];
+            let mut endpoints = open_endpoints(&first, &second).map_err(|error| error.message())?;
+            let (adaptive_polling, reopen_for_legacy) = negotiate_adaptive_polling(&mut endpoints)?;
+            if reopen_for_legacy {
+                drop(endpoints);
+                endpoints = reopen_legacy_endpoints_after_cleanup(&first, &second)?;
+            }
             eprintln!(
-                "selected dynamic endpoints: {}={:?} {}={:?}",
-                endpoints[0].guid, endpoints[0].id, endpoints[1].guid, endpoints[1].id,
+                "selected dynamic endpoints: {}={:?} {}={:?}; adaptive polling={adaptive_polling}",
+                endpoints[0].guid, endpoints[0].id, endpoints[1].guid, endpoints[1].id
             );
             let flags = IoRingCreateFlags {
                 required: 0,
@@ -651,6 +757,8 @@ mod windows_runtime {
                 wait_operations,
                 completion_wait_milliseconds,
                 frame_maximum,
+                adaptive_polling,
+                polling_budget,
                 stats: RuntimeStats::new(stats_enabled),
             };
             for slot in 0..total_depth {
@@ -761,14 +869,21 @@ mod windows_runtime {
             &mut self,
             switch: &mut Switch,
             completion: IoRingCompletion,
-        ) -> Result<bool, String> {
+        ) -> Result<Option<bool>, String> {
             let (slot, generation, is_write) = self.validate_completion(&completion)?;
             let slot_completion = wintap_switch_core::SlotCompletion { slot, generation };
             if is_device_busy(completion.result_code) {
                 self.retry_busy_operation(slot)?;
-                return Ok(!is_write);
+                return Ok(None);
             }
             self.active[slot] = None;
+            if self.adaptive_polling && !is_write && is_no_more_entries(completion.result_code) {
+                self.pool
+                    .cancel(slot_completion)
+                    .map_err(|error| format!("empty adaptive read completion: {error:?}"))?;
+                self.stats.record_empty_read();
+                return Ok(None);
+            }
             if completion.result_code != S_OK {
                 self.pool
                     .cancel(slot_completion)
@@ -797,7 +912,7 @@ mod windows_runtime {
                                 .complete_dispatch(slot_completion)
                                 .map_err(|error| format!("invalid frame: {error:?}"))?;
                             self.post_read(slot)?;
-                            return Ok(true);
+                            return Ok(Some(true));
                         }
                         Err(error) => {
                             return Err(format!("forwarding failure: {error:?}"));
@@ -851,7 +966,7 @@ mod windows_runtime {
                     self.post_read(slot)?;
                 }
             }
-            Ok(!is_write)
+            Ok(Some(!is_write))
         }
 
         fn run(&mut self) -> Result<(), String> {
@@ -868,6 +983,13 @@ mod windows_runtime {
         }
 
         fn run_until_stopped(&mut self) -> Result<(), String> {
+            if self.adaptive_polling {
+                return self.run_until_stopped_adaptive();
+            }
+            self.run_until_stopped_legacy()
+        }
+
+        fn run_until_stopped_legacy(&mut self) -> Result<(), String> {
             let mut switch =
                 Switch::from_endpoints(self.endpoints.iter().map(|endpoint| endpoint.id))
                     .map_err(|error| format!("selected endpoint collection: {error:?}"))?;
@@ -880,16 +1002,24 @@ mod windows_runtime {
                 let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
                 if status == S_FALSE {
                     let signaled = self.wait_for_completion()?;
-                    self.stats.record_wait(signaled);
+                    self.stats.record_wait_submission();
+                    if signaled {
+                        self.stats.record_signaled_wake();
+                    }
+                    self.stats.report(false);
                     continue;
                 }
                 check_hr(status, "PopIoRingCompletion")?;
                 let mut reads = 0;
                 let mut writes = 0;
-                if self.process_completion(&mut switch, unsafe { completion.assume_init() })? {
-                    reads += 1;
-                } else {
-                    writes += 1;
+                if let Some(is_read) =
+                    self.process_completion(&mut switch, unsafe { completion.assume_init() })?
+                {
+                    if is_read {
+                        reads += 1;
+                    } else {
+                        writes += 1;
+                    }
                 }
 
                 loop {
@@ -899,10 +1029,14 @@ mod windows_runtime {
                         break;
                     }
                     check_hr(status, "PopIoRingCompletion")?;
-                    if self.process_completion(&mut switch, unsafe { completion.assume_init() })? {
-                        reads += 1;
-                    } else {
-                        writes += 1;
+                    if let Some(is_read) =
+                        self.process_completion(&mut switch, unsafe { completion.assume_init() })?
+                    {
+                        if is_read {
+                            reads += 1;
+                        } else {
+                            writes += 1;
+                        }
                     }
                 }
 
@@ -911,17 +1045,314 @@ mod windows_runtime {
             }
         }
 
+        fn run_until_stopped_adaptive(&mut self) -> Result<(), String> {
+            let mut switch =
+                Switch::from_endpoints(self.endpoints.iter().map(|endpoint| endpoint.id))
+                    .map_err(|error| format!("selected endpoint collection: {error:?}"))?;
+            let mut idle_since = Instant::now();
+            loop {
+                if STOP_REQUESTED.load(Ordering::SeqCst) {
+                    self.stats.report(true);
+                    return Ok(());
+                }
+
+                let mut saw_completion = false;
+                let mut made_progress = false;
+                let mut reads = 0;
+                let mut writes = 0;
+                loop {
+                    let mut completion = MaybeUninit::<IoRingCompletion>::zeroed();
+                    let status = unsafe { PopIoRingCompletion(self.ring, completion.as_mut_ptr()) };
+                    if status == S_FALSE {
+                        break;
+                    }
+                    check_hr(status, "PopIoRingCompletion")?;
+                    saw_completion = true;
+                    if let Some(is_read) =
+                        self.process_completion(&mut switch, unsafe { completion.assume_init() })?
+                    {
+                        made_progress = true;
+                        if is_read {
+                            reads += 1;
+                        } else {
+                            writes += 1;
+                        }
+                    }
+                }
+
+                if saw_completion {
+                    self.submit_pending_operations()?;
+                    self.stats.record_batch(reads, writes);
+                    self.stats.report(false);
+                }
+                if made_progress {
+                    idle_since = Instant::now();
+                    continue;
+                }
+                if idle_since.elapsed() >= self.polling_budget {
+                    self.stats.record_wait_submission();
+                    let signaled = self.wait_for_adaptive_change()?;
+                    if signaled {
+                        self.stats.record_signaled_wake();
+                    }
+                    if signaled {
+                        self.post_adaptive_idle_reads()?;
+                        self.submit_pending_operations()?;
+                        idle_since = Instant::now();
+                    }
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+
+        fn post_adaptive_idle_reads(&mut self) -> Result<(), String> {
+            for slot in 0..self.active.len() {
+                if self.active[slot].is_none() {
+                    self.post_read(slot)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn adaptive_interest_for_endpoint(&self, endpoint: usize) -> u32 {
+            let handle = self.endpoints[endpoint].handle;
+            let backpressured_write = self.active.iter().flatten().any(|active| {
+                active.is_write && active.handle == handle && active.busy_retries != 0
+            });
+            ADAPTIVE_INTEREST_READABLE
+                | if backpressured_write {
+                    ADAPTIVE_INTEREST_WRITABLE
+                } else {
+                    0
+                }
+        }
+
+        fn wait_for_adaptive_change(&mut self) -> Result<bool, String> {
+            let mut pending_events = [core::ptr::null_mut(); ENDPOINT_COUNT];
+            let mut pending_indices = [0usize; ENDPOINT_COUNT];
+            let mut pending_count = 0usize;
+            let mut immediately_ready = false;
+            for endpoint in 0..ENDPOINT_COUNT {
+                let interest = self.adaptive_interest_for_endpoint(endpoint);
+                if self.submit_adaptive_wait(endpoint, interest)? {
+                    immediately_ready = true;
+                    continue;
+                }
+                let wait = self.endpoints[endpoint]
+                    .adaptive_wait
+                    .as_ref()
+                    .expect("adaptive endpoint has a wait context");
+                if wait.pending {
+                    pending_events[pending_count] = wait.event;
+                    pending_indices[pending_count] = endpoint;
+                    pending_count += 1;
+                }
+            }
+            if immediately_ready {
+                // Keep waits already pended on the other endpoint armed. A writable
+                // result can be immediate while the peer still needs a readable wake.
+                return Ok(true);
+            }
+            if pending_count == 0 {
+                return Ok(true);
+            }
+            let result = loop {
+                let result = unsafe {
+                    WaitForMultipleObjects(
+                        Dword::try_from(pending_count).expect("endpoint count fits Dword"),
+                        pending_events.as_ptr(),
+                        0,
+                        self.completion_wait_milliseconds,
+                    )
+                };
+                if result != WAIT_TIMEOUT_RESULT || STOP_REQUESTED.load(Ordering::SeqCst) {
+                    break result;
+                }
+                self.stats.report(false);
+            };
+            if result == WAIT_FAILED {
+                return Err(format!(
+                    "WaitForMultipleObjects failed with error {}",
+                    unsafe { GetLastError() }
+                ));
+            }
+            if result == WAIT_TIMEOUT_RESULT {
+                return Ok(false);
+            }
+            let offset = result
+                .checked_sub(WAIT_OBJECT_0)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value < pending_count)
+                .ok_or_else(|| {
+                    format!("WaitForMultipleObjects returned unexpected value {result}")
+                })?;
+            self.complete_adaptive_wait(pending_indices[offset])?;
+            Ok(true)
+        }
+
+        fn submit_adaptive_wait(&mut self, endpoint: usize, interest: u32) -> Result<bool, String> {
+            let endpoint = &mut self.endpoints[endpoint];
+            let wait = endpoint.adaptive_wait.get_or_insert(AdaptiveWait::new()?);
+            if wait.pending {
+                if wait.request.interest == interest {
+                    return Ok(false);
+                }
+                if unsafe { CancelIoEx(endpoint.handle, &mut wait.overlapped) } == 0 {
+                    let error = unsafe { GetLastError() };
+                    if error != ERROR_NOT_FOUND {
+                        return Err(format!(
+                            "CancelIoEx for WAIT_FOR_CHANGE rearm failed for {} with Win32 error {error}",
+                            endpoint.guid
+                        ));
+                    }
+                }
+                let mut bytes = 0;
+                if unsafe {
+                    GetOverlappedResult(endpoint.handle, &mut wait.overlapped, &mut bytes, 1)
+                } == 0
+                {
+                    let error = unsafe { GetLastError() };
+                    if error != ERROR_OPERATION_ABORTED && error != ERROR_NOT_FOUND {
+                        return Err(format!(
+                            "draining WAIT_FOR_CHANGE rearm failed for {} with Win32 error {error}",
+                            endpoint.guid
+                        ));
+                    }
+                }
+                wait.pending = false;
+            }
+            wait.request.interest = interest;
+            wait.response.satisfied = 0;
+            wait.overlapped = Overlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: 0,
+                offset_high: 0,
+                event: wait.event,
+            };
+            if unsafe { ResetEvent(wait.event) } == 0 {
+                return Err(format!(
+                    "ResetEvent failed for {} with Win32 error {}",
+                    endpoint.guid,
+                    unsafe { GetLastError() }
+                ));
+            }
+            let mut bytes = 0;
+            let completed = unsafe {
+                DeviceIoControl(
+                    endpoint.handle,
+                    TAP_IOCTL_WAIT_FOR_CHANGE,
+                    (&mut wait.request as *mut AdaptiveWaitRequest).cast(),
+                    Dword::try_from(std::mem::size_of::<AdaptiveWaitRequest>())
+                        .expect("wait input fits Dword"),
+                    (&mut wait.response as *mut AdaptiveWaitResponse).cast(),
+                    Dword::try_from(std::mem::size_of::<AdaptiveWaitResponse>())
+                        .expect("wait output fits Dword"),
+                    &mut bytes,
+                    &mut wait.overlapped,
+                )
+            };
+            if completed != 0 {
+                validate_adaptive_wait_response(bytes, interest, wait.response)?;
+                return Ok(true);
+            }
+            let error = unsafe { GetLastError() };
+            if error == ERROR_IO_PENDING {
+                wait.pending = true;
+                Ok(false)
+            } else {
+                Err(format!(
+                    "WAIT_FOR_CHANGE failed for {} with Win32 error {error}",
+                    endpoint.guid
+                ))
+            }
+        }
+
+        fn complete_adaptive_wait(&mut self, endpoint: usize) -> Result<(), String> {
+            let endpoint = &mut self.endpoints[endpoint];
+            let wait = endpoint
+                .adaptive_wait
+                .as_mut()
+                .expect("adaptive endpoint has a wait context");
+            if !wait.pending {
+                return Ok(());
+            }
+            let mut bytes = 0;
+            if unsafe { GetOverlappedResult(endpoint.handle, &mut wait.overlapped, &mut bytes, 0) }
+                == 0
+            {
+                return Err(format!(
+                    "WAIT_FOR_CHANGE completion failed for {} with Win32 error {}",
+                    endpoint.guid,
+                    unsafe { GetLastError() }
+                ));
+            }
+            wait.pending = false;
+            validate_adaptive_wait_response(bytes, wait.request.interest, wait.response)
+        }
+
+        fn cancel_adaptive_waits(&mut self) -> Result<(), String> {
+            let mut first_error = None;
+            for endpoint in &mut self.endpoints {
+                let Some(wait) = endpoint.adaptive_wait.as_mut() else {
+                    continue;
+                };
+                if !wait.pending {
+                    continue;
+                }
+                if unsafe { CancelIoEx(endpoint.handle, &mut wait.overlapped) } == 0 {
+                    let error = unsafe { GetLastError() };
+                    if error != ERROR_NOT_FOUND {
+                        first_error.get_or_insert_with(|| {
+                            format!(
+                            "CancelIoEx for WAIT_FOR_CHANGE failed for {} with Win32 error {error}",
+                            endpoint.guid
+                        )
+                        });
+                    }
+                }
+            }
+            for endpoint in &mut self.endpoints {
+                let Some(wait) = endpoint.adaptive_wait.as_mut() else {
+                    continue;
+                };
+                if !wait.pending {
+                    continue;
+                }
+                let mut bytes = 0;
+                if unsafe {
+                    GetOverlappedResult(endpoint.handle, &mut wait.overlapped, &mut bytes, 1)
+                } == 0
+                {
+                    let error = unsafe { GetLastError() };
+                    if error != ERROR_OPERATION_ABORTED {
+                        first_error.get_or_insert_with(|| {
+                            format!(
+                                "draining WAIT_FOR_CHANGE failed for {} with Win32 error {error}",
+                                endpoint.guid
+                            )
+                        });
+                    }
+                }
+                wait.pending = false;
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
         fn shutdown(&mut self) -> Result<(), String> {
+            let mut cancellation_error = self.cancel_adaptive_waits().err();
             self.retire_unqueued_operations()?;
             for active in self.active.iter_mut().flatten() {
                 if active.is_write && active.queued && !active.submitted {
                     active.drain_before_cancellation = true;
                 }
             }
-
             self.submit_pending_operations()?;
 
-            let mut cancellation_error = None;
             while self
                 .active
                 .iter()
@@ -1154,7 +1585,25 @@ mod windows_runtime {
         Ok(raw.max_version)
     }
 
-    fn open_endpoint(path: &str) -> Result<Handle, String> {
+    struct EndpointOpenError {
+        path: String,
+        error: Dword,
+    }
+
+    impl EndpointOpenError {
+        fn message(&self) -> String {
+            format!(
+                "CreateFileW failed for {} with Win32 error {}",
+                self.path, self.error
+            )
+        }
+
+        fn cleanup_is_pending(&self) -> bool {
+            self.error == ERROR_BUSY || self.error == ERROR_SHARING_VIOLATION
+        }
+    }
+
+    fn open_endpoint(path: &str) -> Result<Handle, EndpointOpenError> {
         let wide: Vec<u16> = OsStr::new(path)
             .encode_wide()
             .chain(std::iter::once(0))
@@ -1171,10 +1620,180 @@ mod windows_runtime {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            Err(format!("CreateFileW failed for {path}"))
+            Err(EndpointOpenError {
+                path: path.to_string(),
+                error: unsafe { GetLastError() },
+            })
         } else {
             Ok(handle)
         }
+    }
+
+    fn open_endpoints(
+        first: &EndpointConfig,
+        second: &EndpointConfig,
+    ) -> Result<[Endpoint; ENDPOINT_COUNT], EndpointOpenError> {
+        Ok([
+            Endpoint {
+                id: EndpointId::new(1),
+                handle: open_endpoint(&first.interface_path)?,
+                guid: first.guid.clone(),
+                adaptive_wait: None,
+            },
+            Endpoint {
+                id: EndpointId::new(2),
+                handle: open_endpoint(&second.interface_path)?,
+                guid: second.guid.clone(),
+                adaptive_wait: None,
+            },
+        ])
+    }
+
+    fn reopen_legacy_endpoints_after_cleanup(
+        first: &EndpointConfig,
+        second: &EndpointConfig,
+    ) -> Result<[Endpoint; ENDPOINT_COUNT], String> {
+        for attempt in 0..CLEANUP_REOPEN_ATTEMPTS {
+            match open_endpoints(first, second) {
+                Ok(endpoints) => return Ok(endpoints),
+                Err(error) if error.cleanup_is_pending() => {
+                    std::thread::sleep(CLEANUP_REOPEN_DELAY);
+                }
+                Err(error) => return Err(error.message()),
+            }
+            if attempt + 1 == CLEANUP_REOPEN_ATTEMPTS {
+                break;
+            }
+        }
+        Err(format!(
+            "timed out waiting for endpoint cleanup after {} attempts",
+            CLEANUP_REOPEN_ATTEMPTS
+        ))
+    }
+
+    fn negotiate_adaptive_polling(
+        endpoints: &mut [Endpoint; ENDPOINT_COUNT],
+    ) -> Result<(bool, bool), String> {
+        let first = negotiate_adaptive_endpoint(&endpoints[0])?;
+        let second = negotiate_adaptive_endpoint(&endpoints[1])?;
+        let adaptive_polling = select_adaptive_polling(&[first, second]).is_some();
+        let reopen_for_legacy = !adaptive_polling
+            && (matches!(first, AdaptiveEndpointCapability::Supported { .. })
+                || matches!(second, AdaptiveEndpointCapability::Supported { .. }));
+        Ok((adaptive_polling, reopen_for_legacy))
+    }
+
+    fn negotiate_adaptive_endpoint(
+        endpoint: &Endpoint,
+    ) -> Result<AdaptiveEndpointCapability, String> {
+        let mut request = AdaptiveEnableRequest {
+            version: ADAPTIVE_POLLING_PROTOCOL_VERSION,
+            flags: ADAPTIVE_INTEREST_ALL,
+        };
+        let mut response = AdaptiveEnableResponse {
+            version: 0,
+            flags: 0,
+        };
+        match synchronous_device_control(
+            endpoint.handle,
+            TAP_IOCTL_ENABLE_ADAPTIVE_POLLING,
+            &mut request,
+            &mut response,
+        ) {
+            Ok(bytes) => {
+                if bytes as usize != std::mem::size_of::<AdaptiveEnableResponse>() {
+                    return Err(format!(
+                        "adaptive enable returned an invalid response size for {}",
+                        endpoint.guid
+                    ));
+                }
+                if response.version != ADAPTIVE_POLLING_PROTOCOL_VERSION
+                    || response.flags != ADAPTIVE_INTEREST_ALL
+                {
+                    eprintln!(
+                        "adaptive polling incompatible for {}: version={} flags=0x{:08X}",
+                        endpoint.guid, response.version, response.flags
+                    );
+                    Ok(AdaptiveEndpointCapability::Incompatible)
+                } else {
+                    eprintln!(
+                        "adaptive polling enabled for {}: version={} flags=0x{:08X}",
+                        endpoint.guid, response.version, response.flags
+                    );
+                    Ok(AdaptiveEndpointCapability::Supported {
+                        version: response.version,
+                        accepted_flags: response.flags,
+                    })
+                }
+            }
+            Err(error) if is_adaptive_unsupported(error) => {
+                eprintln!(
+                    "adaptive polling unsupported for {} with Win32 error {error}",
+                    endpoint.guid
+                );
+                Ok(AdaptiveEndpointCapability::Unsupported)
+            }
+            Err(error) => Err(format!(
+                "adaptive enable failed for {} with Win32 error {error}",
+                endpoint.guid
+            )),
+        }
+    }
+
+    fn synchronous_device_control<Input, Output>(
+        handle: Handle,
+        code: Dword,
+        input: &mut Input,
+        output: &mut Output,
+    ) -> Result<Dword, Dword> {
+        let event = unsafe { CreateEventW(null_mut(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(unsafe { GetLastError() });
+        }
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event,
+        };
+        let mut bytes = 0;
+        let result = unsafe {
+            DeviceIoControl(
+                handle,
+                code,
+                (input as *mut Input).cast(),
+                Dword::try_from(std::mem::size_of::<Input>()).expect("protocol input fits Dword"),
+                (output as *mut Output).cast(),
+                Dword::try_from(std::mem::size_of::<Output>()).expect("protocol output fits Dword"),
+                &mut bytes,
+                &mut overlapped,
+            )
+        };
+        if result == 0 {
+            let error = unsafe { GetLastError() };
+            if error != ERROR_IO_PENDING {
+                unsafe {
+                    CloseHandle(event);
+                }
+                return Err(error);
+            }
+            if unsafe { GetOverlappedResult(handle, &mut overlapped, &mut bytes, 1) } == 0 {
+                let error = unsafe { GetLastError() };
+                unsafe {
+                    CloseHandle(event);
+                }
+                return Err(error);
+            }
+        }
+        unsafe {
+            CloseHandle(event);
+        }
+        Ok(bytes)
+    }
+
+    fn is_adaptive_unsupported(error: Dword) -> bool {
+        error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED
     }
 
     fn buffer_ref(index: Dword) -> IoRingBufferRef {
@@ -1223,6 +1842,26 @@ mod windows_runtime {
             || status == HRESULT_FROM_WIN32_ERROR_BUSY
     }
 
+    fn is_no_more_entries(status: HResult) -> bool {
+        status == HRESULT_FROM_NT_STATUS_NO_MORE_ENTRIES
+            || status == STATUS_NO_MORE_ENTRIES
+            || status == HRESULT_FROM_WIN32_ERROR_NO_MORE_ITEMS
+    }
+
+    fn validate_adaptive_wait_response(
+        bytes: Dword,
+        interest: u32,
+        response: AdaptiveWaitResponse,
+    ) -> Result<(), String> {
+        if bytes as usize != std::mem::size_of::<AdaptiveWaitResponse>()
+            || response.satisfied == 0
+            || response.satisfied & !interest != 0
+        {
+            return Err("WAIT_FOR_CHANGE returned an invalid readiness response".to_string());
+        }
+        Ok(())
+    }
+
     fn busy_retry_delay(retries: u32) -> Duration {
         let shift = retries.saturating_sub(1).min(6);
         BUSY_RETRY_INITIAL_DELAY
@@ -1263,12 +1902,13 @@ mod windows_runtime {
     }
 
     fn parse_arguments()
-    -> Result<(usize, bool, Dword, Dword, [EndpointConfig; ENDPOINT_COUNT]), String> {
+    -> Result<(usize, bool, Dword, Dword, Duration, [EndpointConfig; ENDPOINT_COUNT]), String> {
         let mut args = env::args().skip(1);
         let mut read_depth = DEFAULT_READ_DEPTH;
         let mut stats_enabled = false;
         let mut wait_operations = DEFAULT_WAIT_OPERATIONS;
         let mut completion_wait_milliseconds = DEFAULT_COMPLETION_WAIT_MILLISECONDS;
+        let mut polling_budget = DEFAULT_ADAPTIVE_POLLING_BUDGET;
         let mut endpoints = Vec::with_capacity(ENDPOINT_COUNT);
         while let Some(argument) = args.next() {
             if argument == "--read-depth" {
@@ -1294,6 +1934,17 @@ mod windows_runtime {
                 completion_wait_milliseconds = value
                     .parse()
                     .map_err(|_| format!("invalid completion timeout '{value}'"))?;
+            } else if argument == "--adaptive-polling-budget-us" {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--adaptive-polling-budget-us requires a value".to_string())?;
+                let microseconds: u64 = value
+                    .parse()
+                    .map_err(|_| format!("invalid adaptive polling budget '{value}'"))?;
+                if microseconds == 0 {
+                    return Err("adaptive polling budget must be positive".to_string());
+                }
+                polling_budget = Duration::from_micros(microseconds);
             } else if argument == "--endpoint" {
                 let value = args.next().ok_or_else(|| {
                     "--endpoint requires <GUID>=<device-interface-path>".to_string()
@@ -1308,11 +1959,15 @@ mod windows_runtime {
                 endpoints.push(endpoint);
             } else if argument == "--help" || argument == "-h" {
                 println!(
-                    "Usage: wintap-switch.exe --endpoint <GUID>=<interface> --endpoint <GUID>=<interface> [--read-depth <positive even total>] [--wait-operations <positive>] [--completion-timeout-ms <milliseconds>] [--stats]"
+                    "Usage: wintap-switch.exe --endpoint <GUID>=<interface> --endpoint <GUID>=<interface> [--read-depth <positive even total>] [--wait-operations <positive>] [--completion-timeout-ms <milliseconds>] [--adaptive-polling-budget-us <positive>] [--stats]"
                 );
                 println!("Default read depth: {DEFAULT_READ_DEPTH}");
                 println!("Default wait operations: {DEFAULT_WAIT_OPERATIONS}");
                 println!("Default completion timeout: {DEFAULT_COMPLETION_WAIT_MILLISECONDS} ms");
+                println!(
+                    "Default adaptive polling budget: {} microseconds",
+                    DEFAULT_ADAPTIVE_POLLING_BUDGET.as_micros()
+                );
                 println!("--stats reports I/O-ring batching counters every 5 seconds");
                 println!(
                     "Pass manager-returned GUID/interface pairs; fixed DOS paths are not supported."
@@ -1335,12 +1990,20 @@ mod windows_runtime {
             stats_enabled,
             wait_operations,
             completion_wait_milliseconds,
+            polling_budget,
             endpoints,
         ))
     }
 
     pub fn run() -> Result<(), String> {
-        let (read_depth, stats_enabled, wait_operations, completion_wait_milliseconds, endpoints) =
+        let (
+            read_depth,
+            stats_enabled,
+            wait_operations,
+            completion_wait_milliseconds,
+            polling_budget,
+            endpoints,
+        ) =
             parse_arguments()?;
         if unsafe { SetConsoleCtrlHandler(Some(console_handler), 1) } == 0 {
             return Err("SetConsoleCtrlHandler failed".to_string());
@@ -1350,6 +2013,7 @@ mod windows_runtime {
             stats_enabled,
             wait_operations,
             completion_wait_milliseconds,
+            polling_budget,
             endpoints,
         )?
         .run();

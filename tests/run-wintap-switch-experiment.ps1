@@ -69,7 +69,12 @@ $childInterfaces = @{}
 $createdAddresses = @()
 $createdRoutes = @()
 $switchProcess = $null
+$switchProcessStarted = $false
 $iperfProcess = $null
+$switchStdoutTask = $null
+$switchStderrTask = $null
+$switchStdoutPath = $null
+$switchStderrPath = $null
 $busInstalled = $false
 $adapters = @()
 
@@ -127,16 +132,86 @@ function Add-PointToPointAddress($Adapter, [string]$Address, [string]$PeerAddres
     }
 }
 
+function Wait-ForPointToPointAddress($Adapter, [string]$Address) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $match = Get-NetIPAddress -InterfaceIndex $Adapter.ifIndex `
+            -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -eq $Address -and $_.AddressState -eq "Preferred" } |
+            Select-Object -First 1
+        if ($null -ne $match) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Address $Address did not become Preferred on adapter $($Adapter.Name) (ifIndex $($Adapter.ifIndex))."
+}
+
+function ConvertTo-WindowsCommandLineArgument([string]$Argument) {
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+    $builder = [Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($character -eq '"') {
+            for ($index = 0; $index -lt (2 * $backslashes + 1); $index++) {
+                [void]$builder.Append('\')
+            }
+            [void]$builder.Append('"')
+        } else {
+            for ($index = 0; $index -lt $backslashes; $index++) {
+                [void]$builder.Append('\')
+            }
+            [void]$builder.Append($character)
+        }
+        $backslashes = 0
+    }
+    for ($index = 0; $index -lt (2 * $backslashes); $index++) {
+        [void]$builder.Append('\')
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
 function Remove-SwitchProcess {
     if ($null -eq $script:switchProcess) {
         return
     }
-    if (-not $script:switchProcess.HasExited) {
-        Stop-Process -Id $script:switchProcess.Id -Force -ErrorAction SilentlyContinue
-        $script:switchProcess.WaitForExit(5000)
+    if ($script:switchProcessStarted -and -not $script:switchProcess.HasExited) {
+        try {
+            $script:switchProcess.Kill()
+        } catch {
+            Write-Warning "wintap-switch.exe exited before cleanup could terminate it."
+        }
+        if (-not $script:switchProcess.HasExited -and -not $script:switchProcess.WaitForExit(5000)) {
+            Write-Warning "wintap-switch.exe did not exit after 5 seconds; forcing termination."
+            Stop-Process -Id $script:switchProcess.Id -Force -ErrorAction SilentlyContinue
+            [void]$script:switchProcess.WaitForExit(5000)
+        }
+    }
+    if ($null -ne $script:switchStdoutTask) {
+        [IO.File]::WriteAllText(
+            $script:switchStdoutPath,
+            $script:switchStdoutTask.GetAwaiter().GetResult()
+        )
+        $script:switchStdoutTask = $null
+    }
+    if ($null -ne $script:switchStderrTask) {
+        [IO.File]::WriteAllText(
+            $script:switchStderrPath,
+            $script:switchStderrTask.GetAwaiter().GetResult()
+        )
+        $script:switchStderrTask = $null
     }
     $script:switchProcess.Dispose()
     $script:switchProcess = $null
+    $script:switchProcessStarted = $false
 }
 
 function Remove-IperfProcess {
@@ -221,6 +296,10 @@ try {
         "Adapter $($adapters[1].Name) did not expose an interface GUID."
     Add-PointToPointAddress $adapters[0] "198.51.100.1" "198.51.100.2"
     Add-PointToPointAddress $adapters[1] "198.51.100.2" "198.51.100.1"
+    Wait-ForPointToPointAddress $adapters[0] "198.51.100.1"
+    Wait-ForPointToPointAddress $adapters[1] "198.51.100.2"
+    Write-Host "Endpoint mapping: $($childGuids[0]) -> $($childInterfaces[$childGuids[0].ToString()]) -> ifIndex $($adapters[0].ifIndex) -> 198.51.100.1"
+    Write-Host "Endpoint mapping: $($childGuids[1]) -> $($childInterfaces[$childGuids[1].ToString()]) -> ifIndex $($adapters[1].ifIndex) -> 198.51.100.2"
 
     $interfaceGuidA = ([Guid]$adapters[0].InterfaceGuid).ToString("D")
     $interfaceGuidB = ([Guid]$adapters[1].InterfaceGuid).ToString("D")
@@ -235,11 +314,30 @@ try {
         $arguments += "--stats"
     }
 
-    $stdoutPath = Join-Path $DiagnosticsPath "switch-stdout.txt"
-    $stderrPath = Join-Path $DiagnosticsPath "switch-stderr.txt"
-    $switchProcess = Start-Process -FilePath $switch -ArgumentList $arguments `
-        -WorkingDirectory (Split-Path -Parent $switch) -RedirectStandardOutput $stdoutPath `
-        -RedirectStandardError $stderrPath -PassThru
+    $switchStdoutPath = Join-Path $DiagnosticsPath "switch-stdout.txt"
+    $switchStderrPath = Join-Path $DiagnosticsPath "switch-stderr.txt"
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $switch
+    $startInfo.WorkingDirectory = Split-Path -Parent $switch
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    if ($null -ne $startInfo.PSObject.Properties["ArgumentList"]) {
+        foreach ($argument in $arguments) {
+            [void]$startInfo.ArgumentList.Add([string]$argument)
+        }
+    } else {
+        $startInfo.Arguments = ($arguments | ForEach-Object {
+            ConvertTo-WindowsCommandLineArgument ([string]$_)
+        }) -join ' '
+    }
+    $switchProcess = [Diagnostics.Process]::new()
+    $switchProcess.StartInfo = $startInfo
+    $started = $switchProcess.Start()
+    Assert-Condition $started "Failed to start wintap-switch.exe."
+    $script:switchProcessStarted = $true
+    $switchStdoutTask = $switchProcess.StandardOutput.ReadToEndAsync()
+    $switchStderrTask = $switchProcess.StandardError.ReadToEndAsync()
     Write-Host "Started wintap-switch.exe (PID $($switchProcess.Id)) for $DurationSeconds seconds."
     if (-not [string]::IsNullOrWhiteSpace($IperfPath)) {
         $iperf = (Resolve-Path -LiteralPath $IperfPath -ErrorAction Stop).Path

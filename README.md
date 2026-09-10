@@ -226,8 +226,11 @@ all resources it created when the bounded run ends:
   -PackageDirectory C:\Temp\WinTapSwitch\package `
   -SwitchPath C:\Temp\WinTapSwitch\wintap-switch.exe `
   -DevConPath C:\Temp\WinTapSwitch\devcon.exe `
-  -DurationSeconds 300 -Stats
+  -DurationSeconds 300 -RequestedMtu 1500 -Stats
 ```
+
+`-RequestedMtu` applies the requested MTU to both dynamically created adapters
+before their addresses and routes are configured; it defaults to `1500`.
 
 ### 6. Run the routed driver relay validation
 
@@ -240,12 +243,14 @@ scp .\tests\run-wintap-dual-adapter-harness.ps1 `
     "$VmUser@$VmIp:$RemoteRoot/run-wintap-dual-adapter-harness.ps1"
 
 ssh "$VmUser@$VmIp" `
-    "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Temp\WinTapSwitch\run-wintap-dual-adapter-harness.ps1 -PackageDirectory C:\Temp\WinTapSwitch\package -Architecture x64 -DevConPath C:\Temp\WinTapSwitch\devcon.exe -DiagnosticsPath C:\Temp\WinTapSwitch\diagnostics -RelayIterations 257"
+    "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Temp\WinTapSwitch\run-wintap-dual-adapter-harness.ps1 -PackageDirectory C:\Temp\WinTapSwitch\package -Architecture x64 -DevConPath C:\Temp\WinTapSwitch\devcon.exe -DiagnosticsPath C:\Temp\WinTapSwitch\diagnostics -RelayIterations 257 -MtuSize 1500"
 ```
 
 The harness uses documentation-only IPv4/IPv6 addresses, exact host routes,
 static neighbors, and run-scoped firewall rules. It refuses to modify
 pre-existing matching adapters and removes only state created by that run.
+`-MtuSize` applies the requested MTU to both dynamically created adapters
+before addresses and routes are configured; it defaults to `1500`.
 Inspect `C:\Temp\WinTapSwitch\diagnostics` after a failure and copy it back
 with `scp -r` before cleaning the VM.
 

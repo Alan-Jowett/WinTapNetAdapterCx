@@ -947,6 +947,148 @@ capability advertisement, packet validation, and switch endpoint checks shall
 remain consistent per child, and no configuration shall produce a
 `MaximumFrameSize` above 65,535 bytes.
 
+### REQ-047 — Opt-in adaptive polling and queue-change notification
+
+**Before:** The switch posts TAP READ requests that may remain pending until a
+captured frame is available, then waits for one I/O-ring completion. Completing
+an individual READ can wake the switch through the I/O-ring completion event
+path. Valid writes already complete inline, but the switch has no dedicated
+queue-change notification contract with which to choose between polling and
+blocking.
+
+**After:** The driver and switch shall support a new, explicitly negotiated
+adaptive-polling mode on an exclusively opened TAP control handle. The mode is
+additive: a client that has not successfully enabled it retains the existing
+pending-READ and normal WRITE contract.
+
+In adaptive-polling mode:
+
+1. A READ shall complete inline with one captured frame when available, or
+   `STATUS_NO_MORE_ENTRIES` when the capture queue is empty. It shall not be
+   retained in a WDF manual queue solely to await a future frame.
+2. A valid WRITE shall continue to complete inline after enqueueing its frame,
+   or return `STATUS_DEVICE_BUSY` if injection capacity is unavailable. It
+   shall not be retained solely to await capacity.
+3. The driver shall expose a versioned, cancellable `WAIT_FOR_CHANGE` control
+   operation with an interest mask for readable capture data, writable
+   injection capacity, or both. Each exclusive control handle permits at most
+   one pending wait; a second wait shall fail explicitly without replacing the
+   first. A pending wait shall complete when a requested condition becomes
+   satisfied: capture transitions empty-to-nonempty, or injection transitions
+   full-to-nonfull.
+4. Wait registration and satisfaction testing shall be level-sensitive and
+   atomic with respect to the frame-queue state. If a requested condition is
+   already true, the wait completes immediately; otherwise the request is
+   registered before releasing queue synchronization. Queue transitions claim
+   waits while synchronized and complete them after releasing locks.
+5. Cancellation, owner close, D0 exit, adapter stop, surprise removal, queue
+   closure, and teardown shall cancel or complete every outstanding wait
+   exactly once, without retaining user buffers, requests, frames, or stale
+   notification state.
+6. The switch shall negotiate adaptive-polling mode on every selected endpoint
+   before using it. It shall enter adaptive mode only when every endpoint
+   accepts the same protocol version and flags. If an endpoint has enabled
+   adaptive mode before a selected peer fails negotiation, the switch shall
+   close every negotiating handle, allow each owner-cleanup path to restore
+   legacy state, then reopen every endpoint for all-legacy operation. It shall
+   not mix adaptive and legacy request semantics within one relay run.
+   Following progress it may poll immediate I/O-ring completions for an
+   adaptive, configured microsecond budget. After the budget expires without
+   progress, it shall submit `WAIT_FOR_CHANGE` and block until that operation
+   completes, then resume polling. It shall not use a one-completion I/O-ring
+   wait for normal per-frame progress in this mode.
+
+**Trace:** User proposal based on the CPU trace hot path
+`evt_packet_queue_advance -> WdfRequestCompleteWithInformation ->
+IopCompleteIoRingEntry -> KeSetEvent -> KiExitDispatcher ->
+HalpInterruptSendIpi`; repository evidence in `evt_io_read`,
+`evt_io_write`, `capture_transmit_packets`, `wintap-switch` I/O-ring
+submission, and `adaptive-polling-proposal.md`; extends REQ-002, REQ-003,
+REQ-005, REQ-006, REQ-018, REQ-021, REQ-024, and REQ-025.
+
+**Invariant impact:** The opted-in path replaces pending request ownership with
+explicit queue-state notification without changing frame direction, bounded
+queue ownership, or exactly-once request completion. A notification cannot be
+lost between observing no progress and registering a wait. Legacy clients
+retain their existing contract, and adaptive-mode clients cannot cause
+per-frame blocking wakeups merely by processing normal traffic.
+
+### REQ-048 — Adaptive-path observability and endpoint-correlated validation
+
+**Before:** An unsupported adaptive enable result may select legacy mode
+without recording the endpoint, Win32 error, or negotiated result. Switch
+statistics can omit idle wait state, and VM probes can observe a stale TAP
+interface rather than the manager-created endpoint owned by the switch.
+
+**After:** The switch and its experiment validation shall make adaptive-path
+state diagnosable without exposing frame payloads:
+
+1. For every selected endpoint, startup diagnostics shall record whether
+   adaptive enable succeeded, was unsupported, was incompatible, or failed;
+   unsupported and incompatible results shall include the endpoint GUID and
+   protocol/error result.
+2. When statistics are enabled, the switch shall periodically report submitted
+   waits, signaled wakes, and completed read/write batches while idle as well
+   as while forwarding.
+3. The experiment shall correlate each assigned test address, route, and probe
+   source interface to the exact manager-created GUID and device interface
+   passed to the switch. It shall reject pre-existing or stale TAP interfaces
+   rather than using them as probe endpoints.
+4. Functional adaptive validation shall prove, for each correlated endpoint,
+   enable, `WAIT_FOR_CHANGE` registration, readable capture transition, wait
+   completion, resumed read, and peer forwarding before collecting performance
+   measurements.
+
+**Trace:** User debugging request following failed two-TAP ARP/ICMP probes;
+WinDbg evidence that capture can occur on a non-switch-owned stale TAP
+instance; extends REQ-047.
+
+**Invariant impact:** Diagnostics are control-plane metadata only. They shall
+not retain or disclose frame payloads, alter exclusive-handle ownership,
+change queue readiness, or convert a failed adaptive negotiation into a
+successful legacy test result.
+
+### REQ-049 — OS-managed lookaside-backed frame storage
+
+**Before:** Driver-owned frames use individually allocated `Vec<u8>` storage.
+Capturing a stack-transmitted frame allocates and copies a payload on the
+datapath hot path, and user writes allocate frame storage before entering the
+injection queue.
+
+**After:** The driver shall use the operating system's nonpaged lookaside-list
+facility for driver-owned frame objects. Each lookaside element shall contain
+one full-size `FRAME_MAXIMUM` payload buffer and its valid length metadata.
+
+1. The lookaside list shall manage frame-object caching and capacity; the
+   driver shall not implement a second frame free list or capacity policy.
+2. Existing directional queue limits remain the admission and backpressure
+   boundary. Lookaside allocation failure shall be surfaced explicitly using
+   the affected queue's existing resource-exhaustion behavior.
+3. A frame shall be acquired before ownership enters either directional frame
+   queue and returned exactly once after delivery, rejection, cancellation,
+   queue drain, or teardown.
+4. NetAdapterCx packet and fragment ring entries remain framework-owned and
+   callback-scoped. A lookaside frame is required when ownership crosses that
+   callback boundary.
+5. Acquisition and release shall be valid at every callback execution level
+   that handles the operation and shall not retain a user buffer or framework
+   ring entry when acquisition fails.
+6. Initialization shall establish the OS lookaside object before datapath
+   publication and fail explicitly if its element size or required setup is
+   invalid. Teardown shall block new acquisitions, drain all frame ownership,
+   and delete the lookaside object only after no frame can reference it.
+7. Reused elements shall not expose bytes from their prior owner to a later
+   frame or user request.
+
+**Trace:** User request to use OS-provided lookaside lists with full-sized
+frame elements; existing per-frame `Vec` allocation in the driver frame and
+capture paths; refines REQ-016, REQ-021, REQ-024, and REQ-047.
+
+**Invariant impact:** Changes only driver-owned frame storage and allocation
+behavior. It shall preserve directional isolation, queue bounds, NetAdapterCx
+ring ownership, IRQL/pageability rules, exact-once completion, adaptive/legacy
+semantics, and teardown safety.
+
 ### Dynamic-bus traceability
 
 | Requirement | Design coverage | Validation coverage |
@@ -972,7 +1114,10 @@ remain consistent per child, and no configuration shall produce a
 | REQ-043 | Contributor-facing SPDX documentation | VAL-035; TC-083 |
 | REQ-044 | Complete repository coverage | VAL-032, VAL-033, VAL-034; TC-084 |
 | REQ-045 | I/O-ring resources and completion state | VAL-036; TC-085 |
-| REQ-046 | MTU configuration and frame-size contract | VAL-038; TC-086 through TC-089 |
+| REQ-046 | MTU configuration and frame-size contract | VAL-037; VAL-038; TC-086 through TC-089 |
+| REQ-047 | Adaptive-polling control contract and switch execution | VAL-040; TC-092 through TC-095 |
+| REQ-048 | Adaptive-path diagnostics and endpoint-correlated functional validation | VAL-041; TC-090 |
+| REQ-049 | OS-managed nonpaged lookaside frame storage and lifecycle | VAL-039; TC-091 |
 
 ## Open questions requiring user decisions
 
@@ -1030,14 +1175,23 @@ remain consistent per child, and no configuration shall produce a
 25. **Resolved:** Passive READ delivery claims frame/request ownership under
     the state lock but performs WDF buffer access, copying, requeue, and
     request completion only after releasing that lock.
-26. **Resolved:** SPDX enforcement uses MIT identifiers and comment syntax
+26. **Resolved:** Driver-owned frames use OS-provided nonpaged lookaside
+    storage with one full-size frame payload per element; the OS manages
+    lookaside caching/capacity and existing directional queues remain the
+    backpressure boundary.
+27. **Resolved:** SPDX enforcement uses MIT identifiers and comment syntax
     compatible with each governed file type, following the established
     LexonGraph and ebpf-for-windows patterns.
-27. **Resolved:** Binary files and generated outputs that cannot contain
+28. **Resolved:** Binary files and generated outputs that cannot contain
     comments are explicit validator exclusions; source, scripts, metadata,
     specifications, and documentation are not excluded by default.
+29. **[ASSUMPTION]:** “a no model” in the `/evolve` request means a new
+    additive mode that requires both the switch and driver to opt in. The
+    existing control-handle contract remains the default.
+30. **Resolved:** Each exclusive adaptive-polling handle permits one pending
+    `WAIT_FOR_CHANGE` IOCTL; a second wait fails explicitly.
 
 ## Specification approval gate
 
-REQ-026 through REQ-046 require approval together with their design and
+REQ-026 through REQ-049 require approval together with their design and
 validation coverage before implementation.

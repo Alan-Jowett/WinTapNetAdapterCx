@@ -29,7 +29,10 @@ param(
     [int]$TimeoutSeconds = 30,
 
     [ValidateRange(1, 4096)]
-    [int]$RelayIterations = 257
+    [int]$RelayIterations = 257,
+
+    [ValidateRange(1500, 65521)]
+    [int]$MtuSize = 1500
 )
 
 $ErrorActionPreference = "Stop"
@@ -686,6 +689,21 @@ function Map-Adapters([object[]]$Children) {
     return @{
         A = $mapped[$script:ChildGuidA.ToString()]
         B = $mapped[$script:ChildGuidB.ToString()]
+    }
+}
+
+function Set-TestMtu($Adapters) {
+    foreach ($adapter in @($Adapters.A, $Adapters.B)) {
+        foreach ($family in @("IPv4", "IPv6")) {
+            Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily $family `
+                -NlMtuBytes $MtuSize -PolicyStore ActiveStore -ErrorAction Stop
+        }
+        $interfaces = @(
+            Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -ErrorAction Stop |
+                Where-Object { $_.AddressFamily -in @("IPv4", "IPv6") }
+        )
+        Assert-True (@($interfaces | Where-Object { $_.NlMtu -ne $MtuSize }).Count -eq 0) `
+            "Adapter '$($adapter.Name)' did not apply MTU $MtuSize."
     }
 }
 
@@ -1875,9 +1893,9 @@ function Invoke-Cleanup {
     return $errors
 }
 
-function New-WinTapBusChildTracked([Guid]$Guid, [int]$WaitSeconds) {
+function New-WinTapBusChildTracked([Guid]$Guid, [uint32]$RequestedMtu, [int]$WaitSeconds) {
     Wait-WinTapBusManager $WaitSeconds
-    $result = Invoke-WinTapBusRequest Create $Guid
+    $result = Invoke-WinTapBusRequest Create $Guid 0 $RequestedMtu
     if ($result.Status -notin @(0, 0x103)) {
         throw "WinTap create for $Guid returned NTSTATUS 0x$('{0:X8}' -f [uint32]$result.Status)."
     }
@@ -1887,7 +1905,7 @@ function New-WinTapBusChildTracked([Guid]$Guid, [int]$WaitSeconds) {
 
 function Invoke-DualAdapterHarness {
     Ensure-DiagnosticsDirectory
-    Write-Diagnostic "dual: start runId=$script:RunId relayIterations=$RelayIterations timeoutSeconds=$TimeoutSeconds"
+    Write-Diagnostic "dual: start runId=$script:RunId relayIterations=$RelayIterations mtu=$MtuSize timeoutSeconds=$TimeoutSeconds"
     Write-Diagnostic "dual: checking test signing"
     Assert-TestSigning
     Write-Diagnostic "dual: test signing enabled"
@@ -1913,8 +1931,8 @@ function Invoke-DualAdapterHarness {
         @("install", $script:BusInfPath, $busHardwareId) | Out-Null
     $script:BusInstalledByHarness = $true
     Write-Diagnostic "dual: creating GUID-correlated TAP children"
-    $childA = New-WinTapBusChildTracked $script:ChildGuidA $TimeoutSeconds
-    $childB = New-WinTapBusChildTracked $script:ChildGuidB $TimeoutSeconds
+    $childA = New-WinTapBusChildTracked $script:ChildGuidA $MtuSize $TimeoutSeconds
+    $childB = New-WinTapBusChildTracked $script:ChildGuidB $MtuSize $TimeoutSeconds
     $script:controlPathA = $childA.InterfacePath
     $script:controlPathB = $childB.InterfacePath
     Assert-True ($script:controlPathA -ne $script:controlPathB) "Manager returned duplicate TAP interface identities."
@@ -1923,6 +1941,7 @@ function Invoke-DualAdapterHarness {
 
     Update-AddedDriverPackage "driver-store-after"
     $adapters = Map-Adapters @($childA, $childB)
+    Set-TestMtu $adapters
 
     $script:Handles.A = Open-ControlHandle $controlPathA
     Assert-ExclusiveHandle $controlPathA
