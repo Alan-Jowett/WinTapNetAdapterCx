@@ -1352,7 +1352,6 @@ mod windows_runtime {
                 }
             }
             self.submit_pending_operations()?;
-            self.submit_pending_operations()?;
 
             while self
                 .active
