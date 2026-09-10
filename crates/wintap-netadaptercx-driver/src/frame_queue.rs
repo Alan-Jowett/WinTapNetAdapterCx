@@ -211,19 +211,27 @@ impl FrameQueue {
         if self.state != QueueState::Open {
             return Err(QueueError::Closed);
         }
-        let remaining_bytes = match self.byte_limit.checked_sub(self.bytes) {
-            Some(remaining) => remaining,
-            None => return Err(QueueError::Full),
-        };
         let frame_length = frame.as_bytes().len();
-        if self.length >= self.limit || frame_length > remaining_bytes {
-            return Err(QueueError::Full);
-        }
+        self.check_capacity(frame_length)?;
 
         let index = (self.head + self.length) % self.limit;
         self.frames[index].write(frame);
         self.length += 1;
         self.bytes += frame_length;
+        Ok(())
+    }
+
+    pub fn check_capacity(&self, frame_length: usize) -> Result<(), QueueError> {
+        if self.state != QueueState::Open {
+            return Err(QueueError::Closed);
+        }
+        let remaining_bytes = self
+            .byte_limit
+            .checked_sub(self.bytes)
+            .ok_or(QueueError::Full)?;
+        if self.length >= self.limit || frame_length > remaining_bytes {
+            return Err(QueueError::Full);
+        }
         Ok(())
     }
 

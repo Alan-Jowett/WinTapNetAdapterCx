@@ -3175,6 +3175,21 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
 }
 
 fn enqueue_injection_frame(state: &mut InstanceState, bytes: &[u8]) -> Result<(), QueueError> {
+    let lock = state.frame_lock;
+    if lock.is_null() {
+        return Err(QueueError::Closed);
+    }
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
+        let capacity = state
+            .injection_queue
+            .as_ref()
+            .ok_or(QueueError::Closed)
+            .and_then(|queue| queue.check_capacity(bytes.len()));
+        call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+        capacity?;
+    }
+
     let frame = Frame::from_bytes(state.frame_pool, bytes)?;
     enqueue_existing_injection_frame(state, frame)
 }
