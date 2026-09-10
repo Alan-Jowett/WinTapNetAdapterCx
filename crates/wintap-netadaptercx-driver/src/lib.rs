@@ -2975,9 +2975,8 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
     }
     drop(state_guard);
     match wait_claim {
-        WaitRequestClaim::Cancelable | WaitRequestClaim::Completing => {
-            cancel_claimed_wait(request)
-        }
+        WaitRequestClaim::Cancelable => cancel_claimed_wait(request),
+        WaitRequestClaim::Completing => {}
         WaitRequestClaim::Registering => {}
         WaitRequestClaim::None => complete_request(request, STATUS_CANCELLED),
     }
@@ -3305,7 +3304,7 @@ fn take_wait_for_cancellation_locked(state: &mut InstanceState) -> Option<WDFREQ
     if !state.wait_registration_request.is_null() {
         state.wait_registration_cancelled = true;
     }
-    take_ready_wait_locked(state).map(|(request, _)| request)
+    take_ready_wait_for_cancellation_locked(state)
 }
 
 fn take_ready_wait_locked(state: &mut InstanceState) -> Option<(WDFREQUEST, u32)> {
@@ -3318,6 +3317,16 @@ fn take_ready_wait_locked(state: &mut InstanceState) -> Option<(WDFREQUEST, u32)
     state.ready_wait_satisfied = 0;
     state.completing_wait_request = request;
     Some((request, satisfied))
+}
+
+fn take_ready_wait_for_cancellation_locked(state: &mut InstanceState) -> Option<WDFREQUEST> {
+    if state.ready_wait_request.is_null() {
+        return None;
+    }
+    let request = state.ready_wait_request;
+    state.ready_wait_request = core::ptr::null_mut();
+    state.ready_wait_satisfied = 0;
+    Some(request)
 }
 
 enum WaitRequestClaim {
