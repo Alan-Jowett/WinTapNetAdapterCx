@@ -1394,17 +1394,31 @@ fn capture_transmit_packets(
         }
 
         let packet = match unsafe { packet_at(packet_ring, packet_begin) } {
-            Some(packet) => unsafe { &*packet },
+            Some(packet) => unsafe { &mut *packet },
             None => break,
         };
         let fragment_count = packet.FragmentCount as u32;
         if fragment_count == 0 {
+            unsafe {
+                (*packet).set_Ignore(1);
+                if let Some(next_packet) = increment_index(&*packet_ring, packet_begin) {
+                    (*packet_ring).BeginIndex = next_packet;
+                    continue;
+                }
+            }
             break;
         }
         let fragment_begin = packet.FragmentIndex;
         if fragment_begin == fragment_end
             || fragment_count > unsafe { (*fragment_ring).NumberOfElements }
         {
+            unsafe {
+                (*packet).set_Ignore(1);
+                if let Some(next_packet) = increment_index(&*packet_ring, packet_begin) {
+                    (*packet_ring).BeginIndex = next_packet;
+                    continue;
+                }
+            }
             break;
         }
 
@@ -1441,7 +1455,23 @@ fn capture_transmit_packets(
             };
         }
         if !valid || !(FRAME_MINIMUM..=unsafe { (*state).frame_maximum }).contains(&total_length) {
-            break;
+            unsafe {
+                (*packet).set_Ignore(1);
+            }
+            let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
+                Some(index) => index,
+                None => break,
+            };
+            let next_fragment =
+                match unsafe { advance_index(&*fragment_ring, fragment_begin, fragment_count) } {
+                    Some(index) => index,
+                    None => break,
+                };
+            unsafe {
+                (*packet_ring).BeginIndex = next_packet;
+                (*fragment_ring).BeginIndex = next_fragment;
+            }
+            continue;
         }
 
         if !adaptive_polling_enabled(state)
@@ -2936,16 +2966,16 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
         return;
     };
     let state = &mut *state_guard;
-    let is_wait = take_wait_request_locked(state, request);
-    if !is_wait && queue == state.read_queue {
+    let wait_claim = take_wait_request_locked(state, request);
+    if matches!(wait_claim, WaitRequestClaim::None) && queue == state.read_queue {
         release_request(&state.pending_reads);
     }
     drop(state_guard);
-    if is_wait {
-        cancel_claimed_wait(request);
-        return;
+    match wait_claim {
+        WaitRequestClaim::Cancelable => cancel_claimed_wait(request),
+        WaitRequestClaim::Registering => {}
+        WaitRequestClaim::None => complete_request(request, STATUS_CANCELLED),
     }
-    complete_request(request, STATUS_CANCELLED);
 }
 
 fn forward_request(request: WDFREQUEST, target_queue: WDFQUEUE) -> bool {
@@ -3284,23 +3314,29 @@ fn take_ready_wait_locked(state: &mut InstanceState) -> Option<(WDFREQUEST, u32)
     Some((request, satisfied))
 }
 
-fn take_wait_request_locked(state: &mut InstanceState, request: WDFREQUEST) -> bool {
+enum WaitRequestClaim {
+    None,
+    Cancelable,
+    Registering,
+}
+
+fn take_wait_request_locked(state: &mut InstanceState, request: WDFREQUEST) -> WaitRequestClaim {
     if state.pending_wait_request == request {
         state.pending_wait_request = core::ptr::null_mut();
         state.pending_wait_interest = 0;
         state.pending_wait_cancelable = false;
-        return true;
+        return WaitRequestClaim::Cancelable;
     }
     if state.ready_wait_request == request {
         state.ready_wait_request = core::ptr::null_mut();
         state.ready_wait_satisfied = 0;
-        return true;
+        return WaitRequestClaim::Cancelable;
     }
     if state.wait_registration_request == request {
         state.wait_registration_cancelled = true;
-        return true;
+        return WaitRequestClaim::Registering;
     }
-    false
+    WaitRequestClaim::None
 }
 
 fn complete_wait_response(request: WDFREQUEST, status: NTSTATUS, satisfied: u32) {

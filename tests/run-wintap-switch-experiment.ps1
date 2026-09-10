@@ -184,8 +184,12 @@ function Remove-SwitchProcess {
         return
     }
     if ($script:switchProcessStarted -and -not $script:switchProcess.HasExited) {
-        $script:switchProcess.Kill()
-        if (-not $script:switchProcess.WaitForExit(5000)) {
+        try {
+            $script:switchProcess.Kill()
+        } catch {
+            Write-Warning "wintap-switch.exe exited before cleanup could terminate it."
+        }
+        if (-not $script:switchProcess.HasExited -and -not $script:switchProcess.WaitForExit(5000)) {
             Write-Warning "wintap-switch.exe did not exit after 5 seconds; forcing termination."
             Stop-Process -Id $script:switchProcess.Id -Force -ErrorAction SilentlyContinue
             [void]$script:switchProcess.WaitForExit(5000)
