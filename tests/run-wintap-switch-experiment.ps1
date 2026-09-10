@@ -147,13 +147,49 @@ function Wait-ForPointToPointAddress($Adapter, [string]$Address) {
     throw "Address $Address did not become Preferred on adapter $($Adapter.Name) (ifIndex $($Adapter.ifIndex))."
 }
 
+function ConvertTo-WindowsCommandLineArgument([string]$Argument) {
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+    $builder = [Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($character -eq '"') {
+            for ($index = 0; $index -lt (2 * $backslashes + 1); $index++) {
+                [void]$builder.Append('\')
+            }
+            [void]$builder.Append('"')
+        } else {
+            for ($index = 0; $index -lt $backslashes; $index++) {
+                [void]$builder.Append('\')
+            }
+            [void]$builder.Append($character)
+        }
+        $backslashes = 0
+    }
+    for ($index = 0; $index -lt (2 * $backslashes); $index++) {
+        [void]$builder.Append('\')
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
 function Remove-SwitchProcess {
     if ($null -eq $script:switchProcess) {
         return
     }
     if ($script:switchProcessStarted -and -not $script:switchProcess.HasExited) {
         $script:switchProcess.Kill()
-        $script:switchProcess.WaitForExit()
+        if (-not $script:switchProcess.WaitForExit(5000)) {
+            Write-Warning "wintap-switch.exe did not exit after 5 seconds; forcing termination."
+            Stop-Process -Id $script:switchProcess.Id -Force -ErrorAction SilentlyContinue
+            [void]$script:switchProcess.WaitForExit(5000)
+        }
     }
     if ($null -ne $script:switchStdoutTask) {
         [IO.File]::WriteAllText(
@@ -282,9 +318,15 @@ try {
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $startInfo.Arguments = ($arguments | ForEach-Object {
-        '"' + ([string]$_).Replace('"', '\"') + '"'
-    }) -join ' '
+    if ($null -ne $startInfo.PSObject.Properties["ArgumentList"]) {
+        foreach ($argument in $arguments) {
+            [void]$startInfo.ArgumentList.Add([string]$argument)
+        }
+    } else {
+        $startInfo.Arguments = ($arguments | ForEach-Object {
+            ConvertTo-WindowsCommandLineArgument ([string]$_)
+        }) -join ' '
+    }
     $switchProcess = [Diagnostics.Process]::new()
     $switchProcess.StartInfo = $startInfo
     $started = $switchProcess.Start()

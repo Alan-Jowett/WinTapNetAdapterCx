@@ -288,6 +288,7 @@ mod windows_runtime {
             name: *const u16,
         ) -> Handle;
         fn GetLastError() -> Dword;
+        fn ResetEvent(event: Handle) -> i32;
         fn DeviceIoControl(
             handle: Handle,
             code: Dword,
@@ -1230,6 +1231,13 @@ mod windows_runtime {
                 offset_high: 0,
                 event: wait.event,
             };
+            if unsafe { ResetEvent(wait.event) } == 0 {
+                return Err(format!(
+                    "ResetEvent failed for {} with Win32 error {}",
+                    endpoint.guid,
+                    unsafe { GetLastError() }
+                ));
+            }
             let mut bytes = 0;
             let completed = unsafe {
                 DeviceIoControl(

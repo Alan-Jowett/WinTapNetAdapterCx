@@ -171,6 +171,8 @@ struct InstanceState {
     pending_wait_request: WDFREQUEST,
     pending_wait_interest: u32,
     pending_wait_cancelable: bool,
+    wait_registration_request: WDFREQUEST,
+    wait_registration_cancelled: bool,
     ready_wait_request: WDFREQUEST,
     ready_wait_satisfied: u32,
     lifecycle: core::sync::atomic::AtomicU8,
@@ -212,6 +214,8 @@ impl InstanceState {
             pending_wait_request: core::ptr::null_mut(),
             pending_wait_interest: 0,
             pending_wait_cancelable: false,
+            wait_registration_request: core::ptr::null_mut(),
+            wait_registration_cancelled: false,
             ready_wait_request: core::ptr::null_mut(),
             ready_wait_satisfied: 0,
             lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
@@ -2203,7 +2207,7 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
             WdfLookasideListCreate,
             &mut lookaside_attributes,
             FRAME_STORAGE_SIZE,
-            wdk_sys::_POOL_TYPE::NonPagedPool,
+            wdk_sys::_POOL_TYPE::NonPagedPoolNx,
             WDF_NO_OBJECT_ATTRIBUTES,
             u32::from_le_bytes(*b"WTFR"),
             &mut frame_pool,
@@ -2708,7 +2712,10 @@ fn handle_wait_for_change(
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     }
-    if !state_guard.pending_wait_request.is_null() || !state_guard.ready_wait_request.is_null() {
+    if !state_guard.pending_wait_request.is_null()
+        || !state_guard.ready_wait_request.is_null()
+        || !state_guard.wait_registration_request.is_null()
+    {
         drop(state_guard);
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
@@ -2721,9 +2728,8 @@ fn handle_wait_for_change(
         return;
     }
 
-    state_guard.pending_wait_request = request;
-    state_guard.pending_wait_interest = wait.interest;
-    state_guard.pending_wait_cancelable = false;
+    state_guard.wait_registration_request = request;
+    state_guard.wait_registration_cancelled = false;
     drop(state_guard);
 
     let status = unsafe {
@@ -2733,29 +2739,42 @@ fn handle_wait_for_change(
             Some(evt_wait_for_change_cancel),
         )
     };
-    let mut complete_cancelled = status != STATUS_SUCCESS;
+    let mut complete_cancelled = false;
+    let mut unmark_cancelable = false;
     let mut work_item = core::ptr::null_mut();
-    if status == STATUS_SUCCESS {
-        if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-            if state_guard.pending_wait_request == request {
+    if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+        if state_guard.wait_registration_request == request {
+            let cancelled = state_guard.wait_registration_cancelled;
+            state_guard.wait_registration_request = core::ptr::null_mut();
+            state_guard.wait_registration_cancelled = false;
+            if status == STATUS_SUCCESS && !cancelled {
+                state_guard.pending_wait_request = request;
+                state_guard.pending_wait_interest = wait.interest;
                 state_guard.pending_wait_cancelable = true;
-                if readiness_mask_locked(&mut state_guard) & wait.interest != 0 {
-                    if claim_wait_for_passive_completion_locked(
+                if readiness_mask_locked(&mut state_guard) & wait.interest != 0
+                    && claim_wait_for_passive_completion_locked(
                         &mut state_guard,
                         wait.interest,
-                    ) {
-                        work_item = state_guard.read_work_item;
-                    }
+                    )
+                {
+                    work_item = state_guard.read_work_item;
                 }
+            } else {
+                complete_cancelled =
+                    !cancelled || (status != STATUS_SUCCESS && status != STATUS_CANCELLED);
+                unmark_cancelable = status == STATUS_SUCCESS;
             }
+        } else {
+            complete_cancelled = status != STATUS_SUCCESS && status != STATUS_CANCELLED;
         }
-        complete_cancelled = false;
-    } else if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-        if state_guard.pending_wait_request == request {
-            state_guard.pending_wait_request = core::ptr::null_mut();
-            state_guard.pending_wait_interest = 0;
-            state_guard.pending_wait_cancelable = false;
-        }
+    } else if status != STATUS_SUCCESS && status != STATUS_CANCELLED {
+        complete_cancelled = true;
+    }
+    if unmark_cancelable {
+        let unmark_status = unsafe {
+            call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request)
+        };
+        complete_cancelled = unmark_status != STATUS_CANCELLED;
     }
     if complete_cancelled {
         complete_request(request, STATUS_CANCELLED);
@@ -3248,6 +3267,9 @@ fn take_wait_for_cancellation_locked(state: &mut InstanceState) -> Option<WDFREQ
         state.pending_wait_cancelable = false;
         return Some(request);
     }
+    if !state.wait_registration_request.is_null() {
+        state.wait_registration_cancelled = true;
+    }
     take_ready_wait_locked(state).map(|(request, _)| request)
 }
 
@@ -3272,6 +3294,10 @@ fn take_wait_request_locked(state: &mut InstanceState, request: WDFREQUEST) -> b
     if state.ready_wait_request == request {
         state.ready_wait_request = core::ptr::null_mut();
         state.ready_wait_satisfied = 0;
+        return true;
+    }
+    if state.wait_registration_request == request {
+        state.wait_registration_cancelled = true;
         return true;
     }
     false
