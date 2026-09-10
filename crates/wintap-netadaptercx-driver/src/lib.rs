@@ -175,6 +175,7 @@ struct InstanceState {
     wait_registration_cancelled: bool,
     ready_wait_request: WDFREQUEST,
     ready_wait_satisfied: u32,
+    completing_wait_request: WDFREQUEST,
     lifecycle: core::sync::atomic::AtomicU8,
 }
 
@@ -218,6 +219,7 @@ impl InstanceState {
             wait_registration_cancelled: false,
             ready_wait_request: core::ptr::null_mut(),
             ready_wait_satisfied: 0,
+            completing_wait_request: core::ptr::null_mut(),
             lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
         }
     }
@@ -2745,6 +2747,7 @@ fn handle_wait_for_change(
     if !state_guard.pending_wait_request.is_null()
         || !state_guard.ready_wait_request.is_null()
         || !state_guard.wait_registration_request.is_null()
+        || !state_guard.completing_wait_request.is_null()
     {
         drop(state_guard);
         complete_request(request, STATUS_DEVICE_BUSY);
@@ -2972,7 +2975,9 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
     }
     drop(state_guard);
     match wait_claim {
-        WaitRequestClaim::Cancelable => cancel_claimed_wait(request),
+        WaitRequestClaim::Cancelable | WaitRequestClaim::Completing => {
+            cancel_claimed_wait(request)
+        }
         WaitRequestClaim::Registering => {}
         WaitRequestClaim::None => complete_request(request, STATUS_CANCELLED),
     }
@@ -3103,7 +3108,7 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
             take_ready_wait_locked(&mut state_guard)
         };
         if let Some((request, satisfied)) = ready_wait {
-            complete_claimed_wait_at_passive(request, satisfied);
+            complete_claimed_wait_at_passive(state, request, satisfied);
             continue;
         }
 
@@ -3311,6 +3316,7 @@ fn take_ready_wait_locked(state: &mut InstanceState) -> Option<(WDFREQUEST, u32)
     let satisfied = state.ready_wait_satisfied;
     state.ready_wait_request = core::ptr::null_mut();
     state.ready_wait_satisfied = 0;
+    state.completing_wait_request = request;
     Some((request, satisfied))
 }
 
@@ -3318,6 +3324,7 @@ enum WaitRequestClaim {
     None,
     Cancelable,
     Registering,
+    Completing,
 }
 
 fn take_wait_request_locked(state: &mut InstanceState, request: WDFREQUEST) -> WaitRequestClaim {
@@ -3335,6 +3342,9 @@ fn take_wait_request_locked(state: &mut InstanceState, request: WDFREQUEST) -> W
     if state.wait_registration_request == request {
         state.wait_registration_cancelled = true;
         return WaitRequestClaim::Registering;
+    }
+    if state.completing_wait_request == request {
+        return WaitRequestClaim::Completing;
     }
     WaitRequestClaim::None
 }
@@ -3380,7 +3390,7 @@ fn complete_wait_response(request: WDFREQUEST, status: NTSTATUS, satisfied: u32)
     );
 }
 
-fn complete_claimed_wait_at_passive(request: WDFREQUEST, satisfied: u32) {
+fn complete_claimed_wait_at_passive(state: *mut InstanceState, request: WDFREQUEST, satisfied: u32) {
     debug_assert!(at_passive_level());
     let cancel_status =
         unsafe { call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request) };
@@ -3388,6 +3398,11 @@ fn complete_claimed_wait_at_passive(request: WDFREQUEST, satisfied: u32) {
         complete_wait_response(request, STATUS_SUCCESS, satisfied);
     } else if cancel_status != STATUS_CANCELLED {
         complete_request(request, cancel_status);
+    }
+    if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+        if state_guard.completing_wait_request == request {
+            state_guard.completing_wait_request = core::ptr::null_mut();
+        }
     }
 }
 
