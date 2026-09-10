@@ -2701,6 +2701,11 @@ fn handle_wait_for_change(
         complete_request(request, STATUS_INVALID_DEVICE_REQUEST);
         return;
     }
+    if !state_guard.rx_queue_started.load(Ordering::Acquire) {
+        drop(state_guard);
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
     if !state_guard.pending_wait_request.is_null() || !state_guard.ready_wait_request.is_null() {
         drop(state_guard);
         complete_request(request, STATUS_DEVICE_BUSY);
