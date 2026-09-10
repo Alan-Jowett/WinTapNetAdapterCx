@@ -947,7 +947,7 @@ capability advertisement, packet validation, and switch endpoint checks shall
 remain consistent per child, and no configuration shall produce a
 `MaximumFrameSize` above 65,535 bytes.
 
-### REQ-046 — Opt-in adaptive polling and queue-change notification
+### REQ-047 — Opt-in adaptive polling and queue-change notification
 
 **Before:** The switch posts TAP READ requests that may remain pending until a
 captured frame is available, then waits for one I/O-ring completion. Completing
@@ -1013,7 +1013,7 @@ lost between observing no progress and registering a wait. Legacy clients
 retain their existing contract, and adaptive-mode clients cannot cause
 per-frame blocking wakeups merely by processing normal traffic.
 
-### REQ-047 — Adaptive-path observability and endpoint-correlated validation
+### REQ-048 — Adaptive-path observability and endpoint-correlated validation
 
 **Before:** An unsupported adaptive enable result may select legacy mode
 without recording the endpoint, Win32 error, or negotiated result. Switch
@@ -1041,14 +1041,14 @@ state diagnosable without exposing frame payloads:
 
 **Trace:** User debugging request following failed two-TAP ARP/ICMP probes;
 WinDbg evidence that capture can occur on a non-switch-owned stale TAP
-instance; extends REQ-046.
+instance; extends REQ-047.
 
 **Invariant impact:** Diagnostics are control-plane metadata only. They shall
 not retain or disclose frame payloads, alter exclusive-handle ownership,
 change queue readiness, or convert a failed adaptive negotiation into a
 successful legacy test result.
 
-### REQ-048 — OS-managed lookaside-backed frame storage
+### REQ-049 — OS-managed lookaside-backed frame storage
 
 **Before:** Driver-owned frames use individually allocated `Vec<u8>` storage.
 Capturing a stack-transmitted frame allocates and copies a payload on the
@@ -1082,7 +1082,7 @@ one full-size `FRAME_MAXIMUM` payload buffer and its valid length metadata.
 
 **Trace:** User request to use OS-provided lookaside lists with full-sized
 frame elements; existing per-frame `Vec` allocation in the driver frame and
-capture paths; refines REQ-016, REQ-021, REQ-024, and REQ-046.
+capture paths; refines REQ-016, REQ-021, REQ-024, and REQ-047.
 
 **Invariant impact:** Changes only driver-owned frame storage and allocation
 behavior. It shall preserve directional isolation, queue bounds, NetAdapterCx
@@ -1114,9 +1114,10 @@ semantics, and teardown safety.
 | REQ-043 | Contributor-facing SPDX documentation | VAL-035; TC-083 |
 | REQ-044 | Complete repository coverage | VAL-032, VAL-033, VAL-034; TC-084 |
 | REQ-045 | I/O-ring resources and completion state | VAL-036; TC-085 |
-| REQ-046 | MTU configuration and frame-size contract; adaptive-polling control contract and switch execution | VAL-037; VAL-038; TC-086 through TC-089 |
-| REQ-047 | Adaptive-path diagnostics and endpoint-correlated functional validation | VAL-038; TC-090 |
-| REQ-048 | OS-managed nonpaged lookaside frame storage and lifecycle | VAL-039; TC-091 |
+| REQ-046 | MTU configuration and frame-size contract | VAL-037; VAL-038; TC-086 through TC-089 |
+| REQ-047 | Adaptive-polling control contract and switch execution | VAL-040; TC-092 through TC-095 |
+| REQ-048 | Adaptive-path diagnostics and endpoint-correlated functional validation | VAL-041; TC-090 |
+| REQ-049 | OS-managed nonpaged lookaside frame storage and lifecycle | VAL-039; TC-091 |
 
 ## Open questions requiring user decisions
 
@@ -1192,5 +1193,5 @@ semantics, and teardown safety.
 
 ## Specification approval gate
 
-REQ-026 through REQ-048 require approval together with their design and
+REQ-026 through REQ-049 require approval together with their design and
 validation coverage before implementation.

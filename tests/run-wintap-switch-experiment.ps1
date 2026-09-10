@@ -69,6 +69,7 @@ $childInterfaces = @{}
 $createdAddresses = @()
 $createdRoutes = @()
 $switchProcess = $null
+$switchProcessStarted = $false
 $iperfProcess = $null
 $switchStdoutTask = $null
 $switchStderrTask = $null
@@ -150,7 +151,7 @@ function Remove-SwitchProcess {
     if ($null -eq $script:switchProcess) {
         return
     }
-    if (-not $script:switchProcess.HasExited) {
+    if ($script:switchProcessStarted -and -not $script:switchProcess.HasExited) {
         $script:switchProcess.Kill()
         $script:switchProcess.WaitForExit()
     }
@@ -170,6 +171,7 @@ function Remove-SwitchProcess {
     }
     $script:switchProcess.Dispose()
     $script:switchProcess = $null
+    $script:switchProcessStarted = $false
 }
 
 function Remove-IperfProcess {
@@ -285,7 +287,9 @@ try {
     }) -join ' '
     $switchProcess = [Diagnostics.Process]::new()
     $switchProcess.StartInfo = $startInfo
-    Assert-Condition $switchProcess.Start() "Failed to start wintap-switch.exe."
+    $started = $switchProcess.Start()
+    Assert-Condition $started "Failed to start wintap-switch.exe."
+    $script:switchProcessStarted = $true
     $switchStdoutTask = $switchProcess.StandardOutput.ReadToEndAsync()
     $switchStderrTask = $switchProcess.StandardError.ReadToEndAsync()
     Write-Host "Started wintap-switch.exe (PID $($switchProcess.Id)) for $DurationSeconds seconds."

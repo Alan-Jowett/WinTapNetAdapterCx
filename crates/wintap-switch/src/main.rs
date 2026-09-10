@@ -13,7 +13,8 @@ mod windows_runtime {
     use std::time::{Duration, Instant};
 
     use wintap_switch_core::{
-        ADAPTIVE_INTEREST_ALL, ADAPTIVE_INTEREST_READABLE, ADAPTIVE_POLLING_PROTOCOL_VERSION,
+        ADAPTIVE_INTEREST_ALL, ADAPTIVE_INTEREST_READABLE, ADAPTIVE_INTEREST_WRITABLE,
+        ADAPTIVE_POLLING_PROTOCOL_VERSION,
         AdaptiveEnableRequest, AdaptiveEnableResponse, AdaptiveEndpointCapability,
         AdaptiveWaitRequest, AdaptiveWaitResponse, BufferPool, EndpointId, FRAME_MAXIMUM,
         ForwardingError, IoRingCapabilities, IoRingVersion, Switch,
@@ -1113,8 +1114,17 @@ mod windows_runtime {
             Ok(())
         }
 
-        fn adaptive_interest_for_endpoint(&self, _endpoint: usize) -> u32 {
+        fn adaptive_interest_for_endpoint(&self, endpoint: usize) -> u32 {
+            let handle = self.endpoints[endpoint].handle;
+            let backpressured_write = self.active.iter().flatten().any(|active| {
+                active.is_write && active.handle == handle && active.busy_retries != 0
+            });
             ADAPTIVE_INTEREST_READABLE
+                | if backpressured_write {
+                    ADAPTIVE_INTEREST_WRITABLE
+                } else {
+                    0
+                }
         }
 
         fn wait_for_adaptive_change(&mut self) -> Result<bool, String> {

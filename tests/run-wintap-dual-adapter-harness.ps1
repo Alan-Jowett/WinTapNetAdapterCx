@@ -31,7 +31,7 @@ param(
     [ValidateRange(1, 4096)]
     [int]$RelayIterations = 257,
 
-    [ValidateRange(576, 65535)]
+    [ValidateRange(576, 65521)]
     [int]$MtuSize = 1500
 )
 

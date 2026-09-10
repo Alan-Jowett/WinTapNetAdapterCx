@@ -1274,8 +1274,7 @@ fn inject_receive_frames(
             break;
         }
 
-        let (frame, wait_completion_queued) = dequeue_injection_frame(state);
-        wait_completion_scheduled |= wait_completion_queued;
+        let (frame, injection_was_full) = dequeue_injection_frame(state);
         let frame = match frame {
             Some(frame) => frame,
             None => break,
@@ -1344,6 +1343,10 @@ fn inject_receive_frames(
         unsafe {
             (*packet_ring).BeginIndex = next_packet;
             (*fragment_ring).BeginIndex = next_fragment;
+        }
+        if injection_was_full {
+            wait_completion_scheduled |=
+                claim_wait_for_passive_completion_locked(state, ADAPTIVE_INTEREST_WRITABLE);
         }
     }
     wait_completion_scheduled
@@ -1474,7 +1477,26 @@ fn capture_transmit_packets(
             Ok(frame) => frame,
             Err(_) => {
                 debug_status(b"Tx capture frame allocation", STATUS_INSUFFICIENT_RESOURCES);
-                break;
+                unsafe {
+                    if let Some(packet) = packet_at(packet_ring, packet_begin) {
+                        (*packet).set_Ignore(1);
+                    }
+                }
+                let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
+                    Some(index) => index,
+                    None => break,
+                };
+                let next_fragment =
+                    match unsafe { advance_index(&*fragment_ring, fragment_begin, fragment_count) }
+                    {
+                        Some(index) => index,
+                        None => break,
+                    };
+                unsafe {
+                    (*packet_ring).BeginIndex = next_packet;
+                    (*fragment_ring).BeginIndex = next_fragment;
+                }
+                continue;
             }
         };
         let mut offset = 0;
@@ -2098,12 +2120,13 @@ extern "C" fn evt_device_release_hardware(
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    let (adapter, read_queue, adaptive, pending_wait) = {
+    let (adapter, read_queue, read_work_item, adaptive, pending_wait) = {
         let state = &mut *state_guard;
         state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
         (
             state.adapter,
             state.read_queue,
+            state.read_work_item,
             state.adaptive_enabled.load(Ordering::Acquire),
             take_wait_for_cancellation_locked(state),
         )
@@ -2127,18 +2150,14 @@ extern "C" fn evt_device_release_hardware(
     if !adaptive {
         purge_queue(read_queue);
     }
+    flush_work_item(read_work_item);
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
     let state = &mut *state_guard;
     clear_frame_queues(state);
-    let frame_pool = state.frame_pool;
-    state.frame_pool = core::ptr::null_mut();
-    if !frame_pool.is_null() {
-        unsafe {
-            call_unsafe_wdf_function_binding!(WdfObjectDelete, frame_pool.cast());
-        }
-    }
+    // The lookaside list is parented to the device; leave it alive until WDF
+    // tears down the device so any in-flight Frame can release its memory.
     clear_receive_filter_state(state);
     state.pending_reads.store(0, Ordering::Release);
     state.pending_writes.store(0, Ordering::Release);
@@ -2589,6 +2608,7 @@ fn handle_enable_adaptive_polling(
         return;
     };
     if state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+        drop(state_guard);
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     }
@@ -2599,6 +2619,7 @@ fn handle_enable_adaptive_polling(
             .load(Ordering::Acquire)
             != 0
     {
+        drop(state_guard);
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
     }
@@ -2671,14 +2692,17 @@ fn handle_wait_for_change(
         return;
     };
     if state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+        drop(state_guard);
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     }
     if !state_guard.adaptive_enabled.load(Ordering::Acquire) {
+        drop(state_guard);
         complete_request(request, STATUS_INVALID_DEVICE_REQUEST);
         return;
     }
     if !state_guard.pending_wait_request.is_null() || !state_guard.ready_wait_request.is_null() {
+        drop(state_guard);
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
     }
@@ -2953,6 +2977,14 @@ fn enqueue_work_item(work_item: WDFWORKITEM) {
     }
 }
 
+fn flush_work_item(work_item: WDFWORKITEM) {
+    if !work_item.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfWorkItemFlush, work_item);
+        }
+    }
+}
+
 fn take_rx_notification(state: &InstanceState) -> netadaptercx_sys::NETPACKETQUEUE {
     if state.rx_notification_armed.swap(false, Ordering::AcqRel) {
         state.rx_queue
@@ -3096,13 +3128,9 @@ fn dequeue_injection_frame(state: &mut InstanceState) -> (Option<Frame>, bool) {
             }
             None => (None, false),
         };
-        let wait_completion_scheduled = if frame.is_some() && was_full {
-            claim_wait_for_passive_completion_locked(state, ADAPTIVE_INTEREST_WRITABLE)
-        } else {
-            false
-        };
+        let was_full_transition = frame.is_some() && was_full;
         call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
-        (frame, wait_completion_scheduled)
+        (frame, was_full_transition)
     }
 }
 

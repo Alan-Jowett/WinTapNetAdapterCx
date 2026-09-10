@@ -226,10 +226,10 @@ all resources it created when the bounded run ends:
   -PackageDirectory C:\Temp\WinTapSwitch\package `
   -SwitchPath C:\Temp\WinTapSwitch\wintap-switch.exe `
   -DevConPath C:\Temp\WinTapSwitch\devcon.exe `
-  -DurationSeconds 300 -MtuSize 1500 -Stats
+  -DurationSeconds 300 -RequestedMtu 1500 -Stats
 ```
 
-`-MtuSize` applies the requested MTU to both dynamically created adapters
+`-RequestedMtu` applies the requested MTU to both dynamically created adapters
 before their addresses and routes are configured; it defaults to `1500`.
 
 ### 6. Run the routed driver relay validation
