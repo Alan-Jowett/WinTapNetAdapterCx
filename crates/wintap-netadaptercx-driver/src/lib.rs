@@ -12,26 +12,63 @@ extern crate wdk_panic;
 
 mod frame_queue;
 mod ring;
-use frame_queue::{Frame, FrameQueue, QueueError, QueueState, FRAME_MAXIMUM, FRAME_STORAGE_SIZE};
+use frame_queue::{Frame, FrameQueue, QueueError, QueueState, FRAME_STORAGE_SIZE};
 use ring::{advance_index, fragment_at, fragment_virtual_address, increment_index, packet_at};
 
 use core::alloc::Layout;
 use core::ffi::c_void;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 #[cfg(not(test))]
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{
-    DRIVER_OBJECT, GUID, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_DEVICE_BUSY, ULONG,
-    UNICODE_STRING, WDF_DRIVER_CONFIG, WDF_FILEOBJECT_CONFIG, WDF_IO_QUEUE_CONFIG,
+    call_unsafe_wdf_function_binding, DRIVER_OBJECT, GUID, NTSTATUS, PCUNICODE_STRING,
+    PDRIVER_OBJECT, STATUS_DEVICE_BUSY, ULONG, UNICODE_STRING, WDFCMRESLIST, WDFDEVICE,
+    WDFDEVICE_INIT, WDFDRIVER, WDFFILEOBJECT, WDFOBJECT, WDFQUEUE, WDFREQUEST, WDFSPINLOCK,
+    WDFWAITLOCK, WDFWORKITEM, WDF_DRIVER_CONFIG, WDF_FILEOBJECT_CONFIG, WDF_IO_QUEUE_CONFIG,
     WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
-    WDF_WORKITEM_CONFIG, WDFCMRESLIST, WDFDEVICE, WDFDEVICE_INIT, WDFDRIVER, WDFFILEOBJECT,
-    WDFOBJECT, WDFQUEUE, WDFREQUEST, WDFSPINLOCK, WDFWAITLOCK, WDFWORKITEM,
-    call_unsafe_wdf_function_binding,
+    WDF_WORKITEM_CONFIG,
 };
 
 unsafe extern "C" {
     fn DbgPrintEx(component_id: ULONG, level: ULONG, format: *const i8, ...) -> ULONG;
+}
+
+struct WriteLifetimeGuard {
+    state: *mut InstanceState,
+}
+
+impl WriteLifetimeGuard {
+    unsafe fn acquire(state: *mut InstanceState) -> Option<Self> {
+        if state.is_null() || unsafe { (*state).write_lifetime_lock.is_null() } {
+            return None;
+        }
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfWaitLockAcquire,
+                (*state).write_lifetime_lock,
+                core::ptr::null_mut::<i64>(),
+            )
+        };
+        if status == STATUS_SUCCESS {
+            Some(Self { state })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for WriteLifetimeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfWaitLockRelease,
+                (*self.state).write_lifetime_lock
+            );
+        }
+    }
 }
 
 const DPFLTR_IHVDRIVER_ID: ULONG = 77;
@@ -80,6 +117,13 @@ const INSTANCE_OPEN: u8 = 0;
 const INSTANCE_SUSPENDED: u8 = 1;
 const INSTANCE_CLOSING: u8 = 2;
 const INSTANCE_CLOSED: u8 = 3;
+const WAIT_FREE: u8 = 0;
+const WAIT_REGISTERING: u8 = 1;
+const WAIT_PENDING: u8 = 2;
+const WAIT_CLAIMED: u8 = 3;
+const WAIT_READY: u8 = 4;
+const WAIT_TEARDOWN: u8 = 5;
+const WAIT_CANCELLED: u8 = 6;
 const PENDING_READ_LIMIT: usize = 256;
 const PENDING_WRITE_LIMIT: usize = 256;
 const FRAME_QUEUE_LIMIT: usize = 256;
@@ -146,7 +190,8 @@ struct InstanceState {
     pnp_device: WDFDEVICE,
     adapter: netadaptercx_sys::NETADAPTER,
     read_queue: WDFQUEUE,
-    frame_lock: WDFSPINLOCK,
+    injection_lock: WDFSPINLOCK,
+    capture_lock: WDFSPINLOCK,
     frame_pool: wdk_sys::WDFLOOKASIDE,
     state_lock: WDFSPINLOCK,
     injection_queue: Option<FrameQueue>,
@@ -156,12 +201,9 @@ struct InstanceState {
     active_multicast_addresses: [[u8; ETHERNET_ADDRESS_LENGTH]; MAXIMUM_MULTICAST_ADDRESSES],
     read_work_item: WDFWORKITEM,
     legacy_direct_read_lock: WDFWAITLOCK,
+    write_lifetime_lock: WDFWAITLOCK,
     tx_queue: netadaptercx_sys::NETPACKETQUEUE,
     rx_queue: netadaptercx_sys::NETPACKETQUEUE,
-    tx_rings: *const netadaptercx_sys::NET_RING_COLLECTION,
-    rx_rings: *const netadaptercx_sys::NET_RING_COLLECTION,
-    tx_fragment_extension: netadaptercx_sys::NET_EXTENSION,
-    rx_fragment_extension: netadaptercx_sys::NET_EXTENSION,
     tx_queue_started: AtomicBool,
     rx_queue_started: AtomicBool,
     rx_notification_armed: AtomicBool,
@@ -170,16 +212,19 @@ struct InstanceState {
     pending_writes: AtomicUsize,
     control_open: AtomicBool,
     adaptive_enabled: AtomicBool,
-    pending_wait_request: WDFREQUEST,
-    pending_wait_interest: u32,
-    pending_wait_cancelable: bool,
-    wait_registration_request: WDFREQUEST,
-    wait_registration_cancelled: bool,
-    ready_wait_request: WDFREQUEST,
-    ready_wait_satisfied: u32,
-    completing_wait_request: WDFREQUEST,
-    owner_generation: u64,
-    lifecycle: core::sync::atomic::AtomicU8,
+    injection_generation: AtomicU64,
+    capture_generation: AtomicU64,
+    wait_state: AtomicU8,
+    wait_registration_request: AtomicPtr<c_void>,
+    wait_pending_request: AtomicPtr<c_void>,
+    wait_claimed_request: AtomicPtr<c_void>,
+    wait_ready_request: AtomicPtr<c_void>,
+    wait_interest: AtomicU32,
+    wait_registration_capture_generation: AtomicU64,
+    wait_registration_injection_generation: AtomicU64,
+    wait_ready_satisfied: AtomicU32,
+    owner_generation: AtomicU64,
+    lifecycle: AtomicU8,
 }
 
 struct LegacyDirectReadGuard {
@@ -209,7 +254,10 @@ impl LegacyDirectReadGuard {
 impl Drop for LegacyDirectReadGuard {
     fn drop(&mut self) {
         unsafe {
-            call_unsafe_wdf_function_binding!(WdfWaitLockRelease, (*self.state).legacy_direct_read_lock);
+            call_unsafe_wdf_function_binding!(
+                WdfWaitLockRelease,
+                (*self.state).legacy_direct_read_lock
+            );
         }
     }
 }
@@ -224,7 +272,8 @@ impl InstanceState {
             pnp_device: core::ptr::null_mut(),
             adapter: core::ptr::null_mut(),
             read_queue: core::ptr::null_mut(),
-            frame_lock: core::ptr::null_mut(),
+            injection_lock: core::ptr::null_mut(),
+            capture_lock: core::ptr::null_mut(),
             frame_pool: core::ptr::null_mut(),
             state_lock: core::ptr::null_mut(),
             injection_queue: None,
@@ -234,12 +283,9 @@ impl InstanceState {
             active_multicast_addresses: [[0; ETHERNET_ADDRESS_LENGTH]; MAXIMUM_MULTICAST_ADDRESSES],
             read_work_item: core::ptr::null_mut(),
             legacy_direct_read_lock: core::ptr::null_mut(),
+            write_lifetime_lock: core::ptr::null_mut(),
             tx_queue: core::ptr::null_mut(),
             rx_queue: core::ptr::null_mut(),
-            tx_rings: core::ptr::null(),
-            rx_rings: core::ptr::null(),
-            tx_fragment_extension: netadaptercx_sys::NET_EXTENSION::default(),
-            rx_fragment_extension: netadaptercx_sys::NET_EXTENSION::default(),
             tx_queue_started: AtomicBool::new(false),
             rx_queue_started: AtomicBool::new(false),
             rx_notification_armed: AtomicBool::new(false),
@@ -248,16 +294,19 @@ impl InstanceState {
             pending_writes: AtomicUsize::new(0),
             control_open: AtomicBool::new(false),
             adaptive_enabled: AtomicBool::new(false),
-            pending_wait_request: core::ptr::null_mut(),
-            pending_wait_interest: 0,
-            pending_wait_cancelable: false,
-            wait_registration_request: core::ptr::null_mut(),
-            wait_registration_cancelled: false,
-            ready_wait_request: core::ptr::null_mut(),
-            ready_wait_satisfied: 0,
-            completing_wait_request: core::ptr::null_mut(),
-            owner_generation: 0,
-            lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
+            injection_generation: AtomicU64::new(0),
+            capture_generation: AtomicU64::new(0),
+            wait_state: AtomicU8::new(WAIT_FREE),
+            wait_registration_request: AtomicPtr::new(core::ptr::null_mut()),
+            wait_pending_request: AtomicPtr::new(core::ptr::null_mut()),
+            wait_claimed_request: AtomicPtr::new(core::ptr::null_mut()),
+            wait_ready_request: AtomicPtr::new(core::ptr::null_mut()),
+            wait_interest: AtomicU32::new(0),
+            wait_registration_capture_generation: AtomicU64::new(0),
+            wait_registration_injection_generation: AtomicU64::new(0),
+            wait_ready_satisfied: AtomicU32::new(0),
+            owner_generation: AtomicU64::new(0),
+            lifecycle: AtomicU8::new(INSTANCE_OPEN),
         }
     }
 }
@@ -359,10 +408,12 @@ static mut WORK_ITEM_CONTEXT_TYPE_INFO: wdk_sys::_WDF_OBJECT_CONTEXT_TYPE_INFO =
 #[repr(C)]
 struct QueueContext {
     is_transmit: bool,
-    started: bool,
-    _padding: [u8; 5],
+    _padding: [u8; 7],
     instance: *mut InstanceState,
     rings: netadaptercx_sys::NET_RING_COLLECTION,
+    fragment_extension: netadaptercx_sys::NET_EXTENSION,
+    frame_maximum: usize,
+    frame_pool: wdk_sys::WDFLOOKASIDE,
 }
 
 #[repr(C)]
@@ -458,16 +509,8 @@ unsafe fn instance_from_work_item(work_item: WDFWORKITEM) -> Option<*mut Instanc
     }
 }
 
-unsafe fn instance_from_packet_queue(
-    queue: netadaptercx_sys::NETPACKETQUEUE,
-) -> Option<*mut InstanceState> {
-    let context =
-        unsafe { object_context::<QueueContext>(queue.cast(), &raw const QUEUE_CONTEXT_TYPE_INFO) };
-    if context.is_null() || unsafe { (*context).instance.is_null() } {
-        None
-    } else {
-        Some(unsafe { (*context).instance })
-    }
+unsafe fn packet_queue_context(queue: netadaptercx_sys::NETPACKETQUEUE) -> *mut QueueContext {
+    unsafe { object_context::<QueueContext>(queue.cast(), &raw const QUEUE_CONTEXT_TYPE_INFO) }
 }
 
 /// Required WDF driver entry point.
@@ -1105,8 +1148,7 @@ fn create_packet_queue(
         Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
         ContextTypeInfo: &raw const QUEUE_CONTEXT_TYPE_INFO,
         ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
-        SynchronizationScope:
-            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        SynchronizationScope: wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone,
         ..WDF_OBJECT_ATTRIBUTES::default()
     };
     let status = unsafe {
@@ -1149,10 +1191,6 @@ fn create_packet_queue(
         if queue_context.is_null() {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        unsafe {
-            (*queue_context).is_transmit = is_transmit;
-            (*queue_context).instance = state;
-        }
         let get_rings: unsafe extern "system" fn(
             netadaptercx_sys::PNET_DRIVER_GLOBALS,
             netadaptercx_sys::NETPACKETQUEUE,
@@ -1192,112 +1230,111 @@ fn create_packet_queue(
                 &mut extension,
             );
         }
+        if rings.is_null() {
+            return STATUS_DEVICE_NOT_READY;
+        }
         // Queue-ring discovery is a PASSIVE_LEVEL NetAdapterCx operation.
-        // InstanceStateGuard owns a WDF spin lock and therefore cannot cover it.
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
+        let state_ptr = state_guard.state;
         let state = &mut *state_guard;
+        let frame_maximum = state.frame_maximum;
+        let frame_pool = state.frame_pool;
         if is_transmit {
             state.tx_queue = packet_queue;
-            state.tx_rings = rings;
-            state.tx_fragment_extension = extension;
         } else {
             state.rx_queue = packet_queue;
-            state.rx_rings = rings;
-            state.rx_fragment_extension = extension;
+        }
+        drop(state_guard);
+        unsafe {
+            // NetAdapterCx cannot invoke packet callbacks until creation
+            // returns, so these values remain immutable until queue stop.
+            (*queue_context).is_transmit = is_transmit;
+            (*queue_context).rings = *rings;
+            (*queue_context).fragment_extension = extension;
+            (*queue_context).frame_maximum = frame_maximum;
+            (*queue_context).frame_pool = frame_pool;
+            (*queue_context).instance = state_ptr;
         }
     }
     status
 }
 
 extern "C" fn evt_packet_queue_start(queue: netadaptercx_sys::NETPACKETQUEUE) {
-    if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
-        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-            return;
-        };
-        let state = &mut *state_guard;
-        if queue == state.tx_queue {
-            state.tx_queue_started.store(true, Ordering::Release);
-        } else if queue == state.rx_queue {
-            state.rx_queue_started.store(true, Ordering::Release);
-        }
+    let context = unsafe { packet_queue_context(queue) };
+    if context.is_null() {
+        return;
+    }
+    let state = unsafe { (*context).instance };
+    if state.is_null() {
+        return;
+    }
+    if unsafe { (*context).is_transmit } {
+        unsafe { (*state).tx_queue_started.store(true, Ordering::Release) };
+    } else {
+        unsafe { (*state).rx_queue_started.store(true, Ordering::Release) };
     }
 }
 
 extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
-    if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
-        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-            return;
-        };
-        let state_ptr = state_guard.state;
-        let state = &mut *state_guard;
-        let pending_wait = take_wait_for_cancellation_locked(state);
-        let read_work_item = state.read_work_item;
-        if queue == state.tx_queue {
-            state.tx_queue_started.store(false, Ordering::Release);
-        } else if queue == state.rx_queue {
-            state.rx_queue_started.store(false, Ordering::Release);
-            state.rx_notification_armed.store(false, Ordering::Release);
-        }
-        drop(state_guard);
-        if let Some(request) = pending_wait {
-            cancel_claimed_wait(state_ptr, request);
-        }
-        flush_work_item(read_work_item);
+    let context = unsafe { packet_queue_context(queue) };
+    if context.is_null() {
+        return;
     }
+    let state = unsafe { (*context).instance };
+    if state.is_null() {
+        return;
+    }
+    if unsafe { (*context).is_transmit } {
+        unsafe { (*state).tx_queue_started.store(false, Ordering::Release) };
+    } else {
+        unsafe {
+            (*state).rx_queue_started.store(false, Ordering::Release);
+            (*state)
+                .rx_notification_armed
+                .store(false, Ordering::Release);
+        }
+    }
+    cancel_wait_for_teardown(state);
+    flush_work_item(unsafe { (*state).read_work_item });
 }
 
 extern "C" fn evt_packet_queue_advance(queue: netadaptercx_sys::NETPACKETQUEUE) {
-    let Some(state) = (unsafe { instance_from_packet_queue(queue) }) else {
+    let context = unsafe { packet_queue_context(queue) };
+    if context.is_null() {
         return;
-    };
-    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-        return;
-    };
-    let (
-        is_transmit,
-        tx_rings,
-        tx_extension,
-        read_queue,
-        read_work_item,
-        wait_completion_scheduled,
-    ) = {
-        let state_ref = &mut *state_guard;
-        let rx_rings = state_ref.rx_rings;
-        let rx_extension = state_ref.rx_fragment_extension;
-        let wait_completion_scheduled = if queue == state_ref.rx_queue && !rx_rings.is_null() {
-            inject_receive_frames(state_ref, rx_rings, &rx_extension)
-        } else {
-            false
-        };
-        (
-            queue == state_ref.tx_queue && !state_ref.tx_rings.is_null(),
-            state_ref.tx_rings,
-            state_ref.tx_fragment_extension,
-            state_ref.read_queue,
-            state_ref.read_work_item,
-            wait_completion_scheduled,
-        )
-    };
-    drop(state_guard);
-    if wait_completion_scheduled {
-        enqueue_work_item(read_work_item);
     }
-    if is_transmit {
-        capture_transmit_packets(state, read_queue, read_work_item, tx_rings, &tx_extension);
+    let state = unsafe { (*context).instance };
+    if state.is_null() {
+        return;
+    }
+    let rings = unsafe { core::ptr::addr_of!((*context).rings) };
+    let extension = unsafe { &(*context).fragment_extension };
+    if unsafe { (*context).is_transmit } {
+        capture_transmit_packets(
+            state,
+            unsafe { (*state).read_queue },
+            unsafe { (*state).read_work_item },
+            rings,
+            extension,
+            unsafe { (*context).frame_maximum },
+            unsafe { (*context).frame_pool },
+        );
+    } else {
+        inject_receive_frames(state, rings, extension);
     }
 }
 
 fn inject_receive_frames(
-    state: &mut InstanceState,
+    state: *mut InstanceState,
     rings: *const netadaptercx_sys::NET_RING_COLLECTION,
     extension: &netadaptercx_sys::NET_EXTENSION,
-) -> bool {
+) {
     let (packet_ring, fragment_ring) = unsafe {
         let collection = match rings.as_ref() {
             Some(collection) => collection,
-            None => return false,
+            None => return,
         };
         (
             collection.Rings[ring::PACKET_RING_INDEX],
@@ -1305,10 +1342,9 @@ fn inject_receive_frames(
         )
     };
     if packet_ring.is_null() || fragment_ring.is_null() {
-        return false;
+        return;
     }
 
-    let mut wait_completion_scheduled = false;
     loop {
         let (packet_begin, packet_end, fragment_begin, fragment_end) = unsafe {
             (
@@ -1393,11 +1429,13 @@ fn inject_receive_frames(
             (*fragment_ring).BeginIndex = next_fragment;
         }
         if injection_was_full {
-            wait_completion_scheduled |=
-                claim_wait_for_passive_completion_locked(state, ADAPTIVE_INTEREST_WRITABLE);
+            let _ = claim_wait_for_passive_completion(
+                state,
+                ADAPTIVE_INTEREST_WRITABLE,
+                core::ptr::null_mut(),
+            );
         }
     }
-    wait_completion_scheduled
 }
 
 fn capture_transmit_packets(
@@ -1406,6 +1444,8 @@ fn capture_transmit_packets(
     read_work_item: WDFWORKITEM,
     rings: *const netadaptercx_sys::NET_RING_COLLECTION,
     extension: &netadaptercx_sys::NET_EXTENSION,
+    frame_maximum: usize,
+    frame_pool: wdk_sys::WDFLOOKASIDE,
 ) {
     let (packet_ring, fragment_ring) = unsafe {
         let collection = match rings.as_ref() {
@@ -1420,18 +1460,12 @@ fn capture_transmit_packets(
     if packet_ring.is_null() || fragment_ring.is_null() {
         return;
     }
-    let capture_generation = {
-        let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-            return;
-        };
-        if state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
-            return;
-        }
-        state_guard.owner_generation
-    };
+    if unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN {
+        return;
+    }
+    let capture_generation = unsafe { (*state).owner_generation.load(Ordering::Acquire) };
 
     let mut captured_for_legacy_read = false;
-    let mut wait_completion_scheduled = false;
     loop {
         let (packet_begin, packet_end, fragment_end) = unsafe {
             (
@@ -1491,9 +1525,7 @@ fn capture_transmit_packets(
                     break;
                 }
             };
-            if !validate_fragment(fragment, address, &mut total_length, unsafe {
-                (*state).frame_maximum
-            }) {
+            if !validate_fragment(fragment, address, &mut total_length, frame_maximum) {
                 valid = false;
                 break;
             }
@@ -1505,10 +1537,8 @@ fn capture_transmit_packets(
                 }
             };
         }
-        if !valid || !(FRAME_MINIMUM..=unsafe { (*state).frame_maximum }).contains(&total_length) {
-            unsafe {
-                (*packet).set_Ignore(1);
-            }
+        if !valid || !(FRAME_MINIMUM..=frame_maximum).contains(&total_length) {
+            (*packet).set_Ignore(1);
             let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
                 Some(index) => index,
                 None => break,
@@ -1554,17 +1584,17 @@ fn capture_transmit_packets(
             continue;
         }
 
-        let pool = match unsafe { state.as_ref() }.map(|state| state.frame_pool) {
-            Some(pool) if !pool.is_null() => pool,
-            _ => {
-                debug_status(b"Tx capture frame pool", STATUS_DEVICE_NOT_READY);
-                break;
-            }
-        };
-        let mut frame = match Frame::new(pool) {
+        if frame_pool.is_null() {
+            debug_status(b"Tx capture frame pool", STATUS_DEVICE_NOT_READY);
+            break;
+        }
+        let mut frame = match Frame::new(frame_pool) {
             Ok(frame) => frame,
             Err(_) => {
-                debug_status(b"Tx capture frame allocation", STATUS_INSUFFICIENT_RESOURCES);
+                debug_status(
+                    b"Tx capture frame allocation",
+                    STATUS_INSUFFICIENT_RESOURCES,
+                );
                 unsafe {
                     if let Some(packet) = packet_at(packet_ring, packet_begin) {
                         (*packet).set_Ignore(1);
@@ -1605,9 +1635,8 @@ fn capture_transmit_packets(
                     break;
                 }
             };
-            let start = unsafe {
-                (address.VirtualAddress as *const u8).add(fragment.Offset() as usize)
-            };
+            let start =
+                unsafe { (address.VirtualAddress as *const u8).add(fragment.Offset() as usize) };
             let length = fragment.ValidLength() as usize;
             let data = unsafe { core::slice::from_raw_parts(start, length) };
             if frame.copy_from_slice(offset, data).is_err() {
@@ -1625,20 +1654,13 @@ fn capture_transmit_packets(
         }
         if copy_succeeded && offset == total_length {
             frame.set_length(total_length);
-            if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-                if state_guard.lifecycle.load(Ordering::Acquire) == INSTANCE_OPEN
-                    && state_guard.owner_generation == capture_generation
-                {
-                    let adaptive = state_guard.adaptive_enabled.load(Ordering::Acquire);
-                    match enqueue_existing_capture_frame_locked(&mut state_guard, frame) {
-                        Ok(wait_completion_queued) => {
-                            if !adaptive {
-                                captured_for_legacy_read = true;
-                            }
-                            wait_completion_scheduled |= wait_completion_queued;
-                        }
-                        Err(_) => {}
-                    }
+            if unsafe { (*state).lifecycle.load(Ordering::Acquire) } == INSTANCE_OPEN
+                && unsafe { (*state).owner_generation.load(Ordering::Acquire) }
+                    == capture_generation
+            {
+                let adaptive = unsafe { (*state).adaptive_enabled.load(Ordering::Acquire) };
+                if enqueue_existing_capture_frame(state, frame).is_ok() && !adaptive {
+                    captured_for_legacy_read = true;
                 }
             } else {
                 (*packet).set_Ignore(1);
@@ -1660,7 +1682,7 @@ fn capture_transmit_packets(
         }
     }
 
-    if captured_for_legacy_read || wait_completion_scheduled {
+    if captured_for_legacy_read {
         enqueue_work_item(read_work_item);
     }
 }
@@ -1716,16 +1738,12 @@ fn deliver_transmit_packet_to_read(
     total_length: usize,
     owner_generation: u64,
 ) -> bool {
-    let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) })
-    else {
+    let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) }) else {
         return false;
     };
-    let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-        return false;
-    };
-    if state_guard.adaptive_enabled.load(Ordering::Acquire)
-        || state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN
-        || state_guard.owner_generation != owner_generation
+    if unsafe { (*state).adaptive_enabled.load(Ordering::Acquire) }
+        || unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN
+        || unsafe { (*state).owner_generation.load(Ordering::Acquire) } != owner_generation
     {
         return false;
     }
@@ -1736,11 +1754,12 @@ fn deliver_transmit_packet_to_read(
     if status != STATUS_SUCCESS {
         return false;
     }
-    release_request(&state_guard.pending_reads);
-    state_guard
-        .legacy_direct_read_claims
-        .fetch_add(1, Ordering::AcqRel);
-    drop(state_guard);
+    unsafe { release_request(&(*state).pending_reads) };
+    unsafe {
+        (*state)
+            .legacy_direct_read_claims
+            .fetch_add(1, Ordering::AcqRel);
+    }
 
     let mut output = core::ptr::null_mut::<c_void>();
     let mut output_length = 0usize;
@@ -1838,23 +1857,21 @@ extern "C" fn evt_packet_queue_set_notification_enabled(
     queue: netadaptercx_sys::NETPACKETQUEUE,
     enabled: wdk_sys::BOOLEAN,
 ) {
-    if let Some(state) = unsafe { instance_from_packet_queue(queue) } {
-        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-            return;
-        };
-        let state = &mut *state_guard;
-        if queue != state.rx_queue {
-            return;
-        }
-        state
+    let context = unsafe { packet_queue_context(queue) };
+    if context.is_null() || unsafe { (*context).is_transmit } {
+        return;
+    }
+    let state = unsafe { (*context).instance };
+    if state.is_null() {
+        return;
+    }
+    unsafe {
+        (*state)
             .rx_notification_armed
             .store(enabled != 0, Ordering::Release);
-        let notification_queue = if enabled != 0 && has_queued_injection_frame(state) {
-            take_rx_notification(state)
-        } else {
-            core::ptr::null_mut()
-        };
-        drop(state_guard);
+    }
+    if enabled != 0 && has_queued_injection_frame(state) {
+        let notification_queue = take_rx_notification(state);
         if !notification_queue.is_null() {
             notify_more_received_packets(notification_queue);
         }
@@ -1862,21 +1879,16 @@ extern "C" fn evt_packet_queue_set_notification_enabled(
 }
 
 extern "C" fn evt_packet_queue_cancel(queue: netadaptercx_sys::NETPACKETQUEUE) {
-    let Some(state) = (unsafe { instance_from_packet_queue(queue) }) else {
+    let context = unsafe { packet_queue_context(queue) };
+    if context.is_null() {
         return;
-    };
-    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+    }
+    let state = unsafe { (*context).instance };
+    if state.is_null() {
         return;
-    };
-    let state = &mut *state_guard;
-    let (rings, is_receive) = if queue == state.tx_queue {
-        (state.tx_rings, false)
-    } else if queue == state.rx_queue {
-        (state.rx_rings, true)
-    } else {
-        return;
-    };
-
+    }
+    let is_receive = !unsafe { (*context).is_transmit };
+    let rings = unsafe { core::ptr::addr_of!((*context).rings) };
     if rings.is_null() {
         return;
     }
@@ -1908,7 +1920,11 @@ extern "C" fn evt_packet_queue_cancel(queue: netadaptercx_sys::NETPACKETQUEUE) {
     }
 
     if is_receive {
-        state.rx_notification_armed.store(false, Ordering::Release);
+        unsafe {
+            (*state)
+                .rx_notification_armed
+                .store(false, Ordering::Release);
+        }
     }
 }
 
@@ -1996,23 +2012,13 @@ fn update_receive_filter_state(
     packet_filters: netadaptercx_sys::_NET_PACKET_FILTER_FLAGS,
     multicast_addresses: &[[u8; ETHERNET_ADDRESS_LENGTH]],
 ) {
-    let lock = state.frame_lock;
-    if lock.is_null() {
-        debug_status(b"ReceiveFilter state lock", STATUS_DEVICE_NOT_READY);
-        return;
+    state.active_packet_filters = packet_filters;
+    state.active_multicast_address_count = multicast_addresses.len();
+    for (index, address) in multicast_addresses.iter().enumerate() {
+        state.active_multicast_addresses[index] = *address;
     }
-
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        state.active_packet_filters = packet_filters;
-        state.active_multicast_address_count = multicast_addresses.len();
-        for (index, address) in multicast_addresses.iter().enumerate() {
-            state.active_multicast_addresses[index] = *address;
-        }
-        for index in multicast_addresses.len()..MAXIMUM_MULTICAST_ADDRESSES {
-            state.active_multicast_addresses[index] = [0; ETHERNET_ADDRESS_LENGTH];
-        }
-        call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+    for index in multicast_addresses.len()..MAXIMUM_MULTICAST_ADDRESSES {
+        state.active_multicast_addresses[index] = [0; ETHERNET_ADDRESS_LENGTH];
     }
 }
 
@@ -2039,12 +2045,13 @@ unsafe extern "C" fn evt_device_d0_entry(
         if !adaptive {
             resume_manual_queue(read_queue);
         }
-        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        reopen_frame_queues(state);
+        let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
-        let state = &mut *state_guard;
-        reopen_frame_queues(state);
-        state.lifecycle.store(INSTANCE_OPEN, Ordering::Release);
+        state_guard
+            .lifecycle
+            .store(INSTANCE_OPEN, Ordering::Release);
     }
     STATUS_SUCCESS
 }
@@ -2058,35 +2065,36 @@ unsafe extern "C" fn evt_device_d0_exit(
         else {
             return STATUS_DEVICE_NOT_READY;
         };
+        let Some(_write_lifetime_guard) = (unsafe { WriteLifetimeGuard::acquire(state) }) else {
+            return STATUS_DEVICE_NOT_READY;
+        };
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
-        let (read_queue, read_work_item, adaptive, pending_wait) = {
+        let (read_queue, read_work_item, adaptive) = {
             let state = &mut *state_guard;
             state.lifecycle.store(INSTANCE_SUSPENDED, Ordering::Release);
             (
                 state.read_queue,
                 state.read_work_item,
                 state.adaptive_enabled.load(Ordering::Acquire),
-                take_wait_for_cancellation_locked(state),
             )
         };
         drop(state_guard);
-        if let Some(request) = pending_wait {
-            cancel_claimed_wait(state, request);
-        }
+        cancel_wait_for_teardown(state);
         flush_work_item(read_work_item);
         if !adaptive {
             purge_queue(read_queue);
         }
-        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        clear_frame_queues(state);
+        let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
-        let state = &mut *state_guard;
-        clear_frame_queues(state);
-        state.pending_reads.store(0, Ordering::Release);
-        state.pending_writes.store(0, Ordering::Release);
-        state.rx_notification_armed.store(false, Ordering::Release);
+        state_guard.pending_reads.store(0, Ordering::Release);
+        state_guard.pending_writes.store(0, Ordering::Release);
+        state_guard
+            .rx_notification_armed
+            .store(false, Ordering::Release);
     }
     STATUS_SUCCESS
 }
@@ -2226,7 +2234,7 @@ extern "C" fn evt_device_release_hardware(
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
-    let (adapter, read_queue, read_work_item, adaptive, pending_wait) = {
+    let (adapter, read_queue, read_work_item, adaptive) = {
         let state = &mut *state_guard;
         state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
         (
@@ -2234,7 +2242,6 @@ extern "C" fn evt_device_release_hardware(
             state.read_queue,
             state.read_work_item,
             state.adaptive_enabled.load(Ordering::Acquire),
-            take_wait_for_cancellation_locked(state),
         )
     };
     drop(state_guard);
@@ -2252,20 +2259,21 @@ extern "C" fn evt_device_release_hardware(
     let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
+    let Some(_write_lifetime_guard) = (unsafe { WriteLifetimeGuard::acquire(state) }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
 
-    if let Some(request) = pending_wait {
-        cancel_claimed_wait(state, request);
-    }
+    cancel_wait_for_teardown(state);
     flush_work_item(read_work_item);
     if !adaptive {
         purge_queue(read_queue);
     }
     flush_work_item(read_work_item);
+    clear_frame_queues(state);
     let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return STATUS_DEVICE_NOT_READY;
     };
     let state = &mut *state_guard;
-    clear_frame_queues(state);
     // The lookaside list is parented to the device; leave it alive until WDF
     // tears down the device so any in-flight Frame can release its memory.
     clear_receive_filter_state(state);
@@ -2273,10 +2281,6 @@ extern "C" fn evt_device_release_hardware(
     state.pending_writes.store(0, Ordering::Release);
     state.tx_queue = core::ptr::null_mut();
     state.rx_queue = core::ptr::null_mut();
-    state.tx_rings = core::ptr::null();
-    state.rx_rings = core::ptr::null();
-    state.tx_fragment_extension = netadaptercx_sys::NET_EXTENSION::default();
-    state.rx_fragment_extension = netadaptercx_sys::NET_EXTENSION::default();
     state.tx_queue_started.store(false, Ordering::Release);
     state.rx_queue_started.store(false, Ordering::Release);
     state.rx_notification_armed.store(false, Ordering::Release);
@@ -2349,9 +2353,27 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
             wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
         ..WDF_OBJECT_ATTRIBUTES::default()
     };
-    let mut frame_lock: WDFSPINLOCK = core::ptr::null_mut();
+    let mut injection_lock: WDFSPINLOCK = core::ptr::null_mut();
     let status = unsafe {
-        call_unsafe_wdf_function_binding!(WdfSpinLockCreate, &mut lock_attributes, &mut frame_lock,)
+        call_unsafe_wdf_function_binding!(
+            WdfSpinLockCreate,
+            &mut lock_attributes,
+            &mut injection_lock,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return status;
+    }
+    let mut capture_lock: WDFSPINLOCK = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfSpinLockCreate,
+            &mut lock_attributes,
+            &mut capture_lock,
+        )
     };
     if status != STATUS_SUCCESS {
         unsafe {
@@ -2362,6 +2384,20 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
     let mut state_lock: WDFSPINLOCK = core::ptr::null_mut();
     let status = unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockCreate, &mut lock_attributes, &mut state_lock,)
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return status;
+    }
+    let mut write_lifetime_lock: WDFWAITLOCK = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfWaitLockCreate,
+            &mut lock_attributes,
+            &mut write_lifetime_lock,
+        )
     };
     if status != STATUS_SUCCESS {
         unsafe {
@@ -2533,10 +2569,12 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
     }
 
     state.read_queue = read_queue;
-    state.frame_lock = frame_lock;
+    state.injection_lock = injection_lock;
+    state.capture_lock = capture_lock;
     state.frame_pool = frame_pool;
     state.state_lock = state_lock;
     state.legacy_direct_read_lock = legacy_direct_read_lock;
+    state.write_lifetime_lock = write_lifetime_lock;
     state.injection_queue = Some(injection_queue);
     state.capture_queue = Some(capture_queue);
     state.read_work_item = read_work_item;
@@ -2585,56 +2623,50 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         else {
             return;
         };
+        let Some(_write_lifetime_guard) = (unsafe { WriteLifetimeGuard::acquire(state) }) else {
+            return;
+        };
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
-        let (was_suspended, read_queue, read_work_item, adaptive, pending_wait) = {
+        let (was_suspended, read_queue, read_work_item, adaptive) = {
             let state = &mut *state_guard;
             let was_suspended = state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
-            state.owner_generation = state.owner_generation.wrapping_add(1);
+            state.owner_generation.fetch_add(1, Ordering::AcqRel);
             state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
             (
                 was_suspended,
                 state.read_queue,
                 state.read_work_item,
                 state.adaptive_enabled.load(Ordering::Acquire),
-                take_wait_for_cancellation_locked(state),
             )
         };
         drop(state_guard);
-        if let Some(request) = pending_wait {
-            cancel_claimed_wait(state, request);
-        }
+        cancel_wait_for_teardown(state);
         flush_work_item(read_work_item);
         if !adaptive {
             purge_queue(read_queue);
         }
-        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+        clear_frame_queues(state);
+        let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
-        let should_resume = {
-            let state = &mut *state_guard;
-            clear_frame_queues(state);
-            state.pending_reads.store(0, Ordering::Release);
-            state.pending_writes.store(0, Ordering::Release);
-            !state.adapter.is_null() && !was_suspended
-        };
-        drop(state_guard);
-        let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-            return;
-        };
-        let state = &mut *state_guard;
-        if should_resume
-            && state.lifecycle.load(Ordering::Acquire) == INSTANCE_CLOSING
-            && !state.adapter.is_null()
-        {
-            reopen_frame_queues(state);
-            state.lifecycle.store(INSTANCE_OPEN, Ordering::Release);
-        }
-        state.adaptive_enabled.store(false, Ordering::Release);
-        state.control_open.store(false, Ordering::Release);
+        let should_resume = state_guard.lifecycle.load(Ordering::Acquire) == INSTANCE_CLOSING
+            && !state_guard.adapter.is_null()
+            && !was_suspended;
+        state_guard.pending_reads.store(0, Ordering::Release);
+        state_guard.pending_writes.store(0, Ordering::Release);
+        state_guard.adaptive_enabled.store(false, Ordering::Release);
+        state_guard.control_open.store(false, Ordering::Release);
         drop(state_guard);
         if should_resume {
+            reopen_frame_queues(state);
+            let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+                return;
+            };
+            state_guard
+                .lifecycle
+                .store(INSTANCE_OPEN, Ordering::Release);
             // A reopened manual queue belongs to a future legacy owner, never to this adaptive owner.
             resume_manual_queue(read_queue);
         }
@@ -2735,6 +2767,10 @@ fn handle_enable_adaptive_polling(
         return;
     }
 
+    let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) }) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
     let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
@@ -2819,46 +2855,57 @@ fn handle_wait_for_change(
         return;
     }
 
-    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-        complete_request(request, STATUS_DEVICE_NOT_READY);
-        return;
-    };
-    if state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
-        drop(state_guard);
+    if unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN
+        || !unsafe { (*state).rx_queue_started.load(Ordering::Acquire) }
+    {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     }
-    if !state_guard.adaptive_enabled.load(Ordering::Acquire) {
-        drop(state_guard);
+    if !unsafe { (*state).adaptive_enabled.load(Ordering::Acquire) } {
         complete_request(request, STATUS_INVALID_DEVICE_REQUEST);
         return;
     }
-    if !state_guard.rx_queue_started.load(Ordering::Acquire) {
-        drop(state_guard);
-        complete_request(request, STATUS_DEVICE_NOT_READY);
-        return;
+    if unsafe {
+        (*state).wait_state.compare_exchange(
+            WAIT_FREE,
+            WAIT_REGISTERING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
     }
-    if !state_guard.pending_wait_request.is_null()
-        || !state_guard.ready_wait_request.is_null()
-        || !state_guard.wait_registration_request.is_null()
-        || !state_guard.completing_wait_request.is_null()
+    .is_err()
     {
-        drop(state_guard);
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
     }
-
-    let satisfied = readiness_mask_locked(&mut state_guard) & wait.interest;
-    if satisfied != 0 {
-        drop(state_guard);
-        complete_wait_response(request, STATUS_SUCCESS, satisfied);
+    // Recheck after taking REGISTERING so teardown either observes and claims
+    // this registration or this path retires it before marking.
+    if unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN
+        || !unsafe { (*state).adaptive_enabled.load(Ordering::Acquire) }
+        || !unsafe { (*state).rx_queue_started.load(Ordering::Acquire) }
+    {
+        unsafe {
+            (*state).wait_state.store(WAIT_FREE, Ordering::Release);
+        }
+        complete_request(request, STATUS_CANCELLED);
         return;
     }
 
-    state_guard.wait_registration_request = request;
-    state_guard.wait_registration_cancelled = false;
-    drop(state_guard);
-
+    let (_, capture_generation, injection_generation) = readiness_snapshot(state);
+    unsafe {
+        (*state)
+            .wait_registration_request
+            .store(request.cast(), Ordering::Release);
+        (*state)
+            .wait_interest
+            .store(wait.interest, Ordering::Release);
+        (*state)
+            .wait_registration_capture_generation
+            .store(capture_generation, Ordering::Release);
+        (*state)
+            .wait_registration_injection_generation
+            .store(injection_generation, Ordering::Release);
+    }
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRequestMarkCancelableEx,
@@ -2866,58 +2913,98 @@ fn handle_wait_for_change(
             Some(evt_wait_for_change_cancel),
         )
     };
-    let mut complete_cancelled = false;
-    let mut unmark_cancelable = false;
-    let mut work_item = core::ptr::null_mut();
-    if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-        if state_guard.wait_registration_request == request {
-            let cancelled = state_guard.wait_registration_cancelled;
-            state_guard.wait_registration_request = core::ptr::null_mut();
-            state_guard.wait_registration_cancelled = false;
-            if status == STATUS_SUCCESS && !cancelled {
-                state_guard.pending_wait_request = request;
-                state_guard.pending_wait_interest = wait.interest;
-                state_guard.pending_wait_cancelable = true;
-                if readiness_mask_locked(&mut state_guard) & wait.interest != 0
-                    && claim_wait_for_passive_completion_locked(
-                        &mut state_guard,
-                        wait.interest,
-                    )
-                {
-                    work_item = state_guard.read_work_item;
-                }
-            } else {
-                complete_cancelled =
-                    !cancelled || (status != STATUS_SUCCESS && status != STATUS_CANCELLED);
-                unmark_cancelable = status == STATUS_SUCCESS;
-            }
-        } else {
-            complete_cancelled = status != STATUS_SUCCESS && status != STATUS_CANCELLED;
+    if status == STATUS_SUCCESS {
+        // The pending slot is published only after WDF accepts the
+        // cancellation routine. A cancellation that saw REGISTERING leaves
+        // WAIT_CANCELLED for this path to retire without publishing.
+        unsafe {
+            (*state)
+                .wait_pending_request
+                .store(request.cast(), Ordering::Release);
         }
-    } else if status != STATUS_SUCCESS && status != STATUS_CANCELLED {
-        complete_cancelled = true;
-    }
-    if unmark_cancelable {
-        let unmark_status = unsafe {
-            call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request)
-        };
-        complete_cancelled = unmark_status != STATUS_CANCELLED;
-    }
-    if complete_cancelled {
+        match unsafe {
+            (*state).wait_state.compare_exchange(
+                WAIT_REGISTERING,
+                WAIT_PENDING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+        } {
+            Ok(_) => {
+                unsafe {
+                    (*state)
+                        .wait_registration_request
+                        .store(core::ptr::null_mut(), Ordering::Release);
+                }
+                let (ready, observed_capture_generation, observed_injection_generation) =
+                    readiness_snapshot(state);
+                let registration_capture_generation = unsafe {
+                    (*state)
+                        .wait_registration_capture_generation
+                        .load(Ordering::Acquire)
+                };
+                let registration_injection_generation = unsafe {
+                    (*state)
+                        .wait_registration_injection_generation
+                        .load(Ordering::Acquire)
+                };
+                if ready & wait.interest != 0
+                    || observed_capture_generation != registration_capture_generation
+                    || observed_injection_generation != registration_injection_generation
+                {
+                    let _ =
+                        claim_wait_for_passive_completion(state, ready & wait.interest, request);
+                }
+            }
+            Err(WAIT_TEARDOWN) => {
+                unsafe {
+                    (*state)
+                        .wait_pending_request
+                        .store(core::ptr::null_mut(), Ordering::Release);
+                }
+                complete_teardown_registration(state, request);
+            }
+            Err(WAIT_CANCELLED) => unsafe {
+                (*state)
+                    .wait_pending_request
+                    .store(core::ptr::null_mut(), Ordering::Release);
+                (*state)
+                    .wait_registration_request
+                    .store(core::ptr::null_mut(), Ordering::Release);
+                (*state).wait_state.store(WAIT_FREE, Ordering::Release);
+            },
+            Err(_) => {
+                unsafe {
+                    (*state)
+                        .wait_pending_request
+                        .store(core::ptr::null_mut(), Ordering::Release);
+                    (*state)
+                        .wait_registration_request
+                        .store(core::ptr::null_mut(), Ordering::Release);
+                }
+                complete_teardown_registration(state, request);
+            }
+        }
+    } else if status == STATUS_CANCELLED {
+        // MarkCancelableEx does not invoke the cancellation callback when the
+        // request was already cancelled; registration retains completion ownership.
+        finish_wait(state);
         complete_request(request, STATUS_CANCELLED);
-    } else if !work_item.is_null() {
-        enqueue_work_item(work_item);
+    } else {
+        unsafe {
+            (*state)
+                .wait_registration_request
+                .store(core::ptr::null_mut(), Ordering::Release);
+            (*state).wait_state.store(WAIT_FREE, Ordering::Release);
+        }
+        complete_request(request, status);
     }
 }
 
 unsafe extern "C" fn evt_wait_for_change_cancel(request: WDFREQUEST) {
     let queue = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetIoQueue, request) };
     if let Some(state) = unsafe { instance_from_io_queue(queue) } {
-        if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-            let _ = take_wait_request_locked(&mut state_guard, request);
-        }
-        complete_request(request, STATUS_CANCELLED);
-        clear_completing_wait_request(state, request);
+        cancel_wait_from_wdf(state, request);
         return;
     }
     complete_request(request, STATUS_CANCELLED);
@@ -2928,18 +3015,13 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
-    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-        complete_request(request, STATUS_DEVICE_NOT_READY);
-        return;
-    };
-    if state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+    if unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     }
-    if state_guard.adaptive_enabled.load(Ordering::Acquire) {
-        let owner_generation = state_guard.owner_generation;
-        let frame = dequeue_capture_frame(&mut state_guard);
-        drop(state_guard);
+    if unsafe { (*state).adaptive_enabled.load(Ordering::Acquire) } {
+        let owner_generation = unsafe { (*state).owner_generation.load(Ordering::Acquire) };
+        let frame = dequeue_capture_frame(state);
         if let Some(frame) = frame {
             let status = complete_captured_frame_to_read(request, &frame);
             if status != STATUS_SUCCESS {
@@ -2951,15 +3033,14 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
         }
         return;
     }
-    if !try_admit(&state_guard.pending_reads, PENDING_READ_LIMIT) {
+    if !unsafe { try_admit(&(*state).pending_reads, PENDING_READ_LIMIT) } {
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
     }
-    let frame = dequeue_capture_frame(&mut *state_guard);
+    let frame = dequeue_capture_frame(state);
     if let Some(frame) = frame {
-        let owner_generation = state_guard.owner_generation;
-        release_request(&state_guard.pending_reads);
-        drop(state_guard);
+        let owner_generation = unsafe { (*state).owner_generation.load(Ordering::Acquire) };
+        unsafe { release_request(&(*state).pending_reads) };
 
         let status = complete_captured_frame_to_read(request, &frame);
         if status != STATUS_SUCCESS {
@@ -2968,9 +3049,9 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
         }
         return;
     }
-    let target = state_guard.read_queue;
+    let target = unsafe { (*state).read_queue };
     if !forward_request(request, target) {
-        release_request(&state_guard.pending_reads);
+        unsafe { release_request(&(*state).pending_reads) };
     }
 }
 
@@ -2979,12 +3060,11 @@ extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize)
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
-    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+    let Some(_write_lifetime_guard) = (unsafe { WriteLifetimeGuard::acquire(state) }) else {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
-    let state = &mut *state_guard;
-    if state.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+    if unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     }
@@ -2992,11 +3072,12 @@ extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize)
         complete_request(request, STATUS_SUCCESS);
         return;
     }
-    if !(FRAME_MINIMUM..=state.frame_maximum).contains(&length) {
+    let frame_maximum = unsafe { (*state).frame_maximum };
+    if !(FRAME_MINIMUM..=frame_maximum).contains(&length) {
         complete_request(request, STATUS_INVALID_PARAMETER);
         return;
     }
-    if !try_admit(&state.pending_writes, PENDING_WRITE_LIMIT) {
+    if !unsafe { try_admit(&(*state).pending_writes, PENDING_WRITE_LIMIT) } {
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
     }
@@ -3013,12 +3094,12 @@ extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize)
         )
     };
     if status != STATUS_SUCCESS {
-        release_request(&state.pending_writes);
+        unsafe { release_request(&(*state).pending_writes) };
         complete_request(request, status);
         return;
     }
-    if input_length > state.frame_maximum {
-        release_request(&state.pending_writes);
+    if input_length > frame_maximum {
+        unsafe { release_request(&(*state).pending_writes) };
         complete_request(request, STATUS_INVALID_BUFFER_SIZE);
         return;
     }
@@ -3027,32 +3108,31 @@ extern "C" fn evt_io_write(_queue: WDFQUEUE, request: WDFREQUEST, length: usize)
     let notification_queue = match enqueue_injection_frame(state, bytes) {
         Ok(()) => {
             let notification_queue = take_rx_notification(state);
-            release_request(&state.pending_writes);
+            unsafe { release_request(&(*state).pending_writes) };
             complete_request_with_information(request, STATUS_SUCCESS, input_length);
             notification_queue
         }
         Err(QueueError::Full) => {
-            release_request(&state.pending_writes);
+            unsafe { release_request(&(*state).pending_writes) };
             complete_request(request, STATUS_DEVICE_BUSY);
             core::ptr::null_mut()
         }
         Err(QueueError::Closed) => {
-            release_request(&state.pending_writes);
+            unsafe { release_request(&(*state).pending_writes) };
             complete_request(request, STATUS_DEVICE_NOT_READY);
             core::ptr::null_mut()
         }
         Err(QueueError::InvalidFrameLength) => {
-            release_request(&state.pending_writes);
+            unsafe { release_request(&(*state).pending_writes) };
             complete_request(request, STATUS_INVALID_BUFFER_SIZE);
             core::ptr::null_mut()
         }
         Err(QueueError::InsufficientResources) => {
-            release_request(&state.pending_writes);
+            unsafe { release_request(&(*state).pending_writes) };
             complete_request(request, STATUS_INSUFFICIENT_RESOURCES);
             core::ptr::null_mut()
         }
     };
-    drop(state_guard);
     if !notification_queue.is_null() {
         notify_more_received_packets(notification_queue);
     }
@@ -3063,23 +3143,15 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
         complete_request(request, STATUS_CANCELLED);
         return;
     };
-    let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-        complete_request(request, STATUS_CANCELLED);
-        return;
-    };
-    let state_ptr = state_guard.state;
-    let state = &mut *state_guard;
-    let wait_claim = take_wait_request_locked(state, request);
-    if matches!(wait_claim, WaitRequestClaim::None) && queue == state.read_queue {
-        release_request(&state.pending_reads);
-    }
-    drop(state_guard);
-    match wait_claim {
-        WaitRequestClaim::Cancelable => cancel_claimed_wait(state_ptr, request),
-        WaitRequestClaim::Completing | WaitRequestClaim::Registering => {
+    if wait_request_is_active(state, request) {
+        if !cancel_wait_for_teardown(state) && wait_request_requires_stop_ack(state, request) {
             acknowledge_stopped_request(request);
         }
-        WaitRequestClaim::None => complete_request(request, STATUS_CANCELLED),
+    } else if queue == unsafe { (*state).read_queue } {
+        unsafe { release_request(&(*state).pending_reads) };
+        complete_request(request, STATUS_CANCELLED);
+    } else {
+        complete_request(request, STATUS_CANCELLED);
     }
 }
 
@@ -3173,9 +3245,12 @@ fn flush_work_item(work_item: WDFWORKITEM) {
     }
 }
 
-fn take_rx_notification(state: &InstanceState) -> netadaptercx_sys::NETPACKETQUEUE {
-    if state.rx_notification_armed.swap(false, Ordering::AcqRel) {
-        state.rx_queue
+fn take_rx_notification(state: *mut InstanceState) -> netadaptercx_sys::NETPACKETQUEUE {
+    if state.is_null() {
+        return core::ptr::null_mut();
+    }
+    if unsafe { (*state).rx_notification_armed.swap(false, Ordering::AcqRel) } {
+        unsafe { (*state).rx_queue }
     } else {
         core::ptr::null_mut()
     }
@@ -3201,12 +3276,7 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
         return;
     };
     loop {
-        let ready_wait = {
-            let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-                return;
-            };
-            take_ready_wait_locked(&mut state_guard)
-        };
+        let ready_wait = take_ready_wait(state);
         if let Some((request, satisfied)) = ready_wait {
             complete_claimed_wait_at_passive(state, request, satisfied);
             continue;
@@ -3214,14 +3284,10 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
 
         let mut request = core::ptr::null_mut();
         let (frame, owner_generation) = {
-            let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
-                return;
-            };
-            let state = &mut *state_guard;
             let status = unsafe {
                 call_unsafe_wdf_function_binding!(
                     WdfIoQueueRetrieveNextRequest,
-                    state.read_queue,
+                    (*state).read_queue,
                     &mut request,
                 )
             };
@@ -3231,15 +3297,17 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
             let frame = match dequeue_capture_frame(state) {
                 Some(frame) => frame,
                 None => {
-                    let target = state.read_queue;
+                    let target = unsafe { (*state).read_queue };
                     if !forward_request(request, target) {
-                        release_request(&state.pending_reads);
+                        unsafe { release_request(&(*state).pending_reads) };
                     }
                     return;
                 }
             };
-            release_request(&state.pending_reads);
-            (frame, state.owner_generation)
+            unsafe { release_request(&(*state).pending_reads) };
+            (frame, unsafe {
+                (*state).owner_generation.load(Ordering::Acquire)
+            })
         };
         let status = complete_captured_frame_to_read(request, &frame);
         if status != STATUS_SUCCESS {
@@ -3249,14 +3317,14 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
     }
 }
 
-fn enqueue_injection_frame(state: &mut InstanceState, bytes: &[u8]) -> Result<(), QueueError> {
-    let lock = state.frame_lock;
+fn enqueue_injection_frame(state: *mut InstanceState, bytes: &[u8]) -> Result<(), QueueError> {
+    let lock = unsafe { (*state).injection_lock };
     if lock.is_null() {
         return Err(QueueError::Closed);
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let capacity = state
+        let capacity = (*state)
             .injection_queue
             .as_ref()
             .ok_or(QueueError::Closed)
@@ -3265,65 +3333,75 @@ fn enqueue_injection_frame(state: &mut InstanceState, bytes: &[u8]) -> Result<()
         capacity?;
     }
 
-    let frame = Frame::from_bytes(state.frame_pool, bytes)?;
+    let frame = Frame::from_bytes(unsafe { (*state).frame_pool }, bytes)?;
     enqueue_existing_injection_frame(state, frame)
 }
 
 fn enqueue_existing_injection_frame(
-    state: &mut InstanceState,
+    state: *mut InstanceState,
     frame: Frame,
 ) -> Result<(), QueueError> {
-    let lock = state.frame_lock;
+    let lock = unsafe { (*state).injection_lock };
     if lock.is_null() {
         return Err(QueueError::Closed);
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let result = state
+        let result = (*state)
             .injection_queue
             .as_mut()
             .ok_or(QueueError::Closed)
             .and_then(|queue| queue.enqueue(frame));
         call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+        if result.is_ok() {
+            (*state)
+                .injection_generation
+                .fetch_add(1, Ordering::Release);
+        }
         result
     }
 }
 
-fn enqueue_existing_capture_frame_locked(
-    state: &mut InstanceState,
+fn enqueue_existing_capture_frame(
+    state: *mut InstanceState,
     frame: Frame,
-) -> Result<bool, QueueError> {
-    let lock = state.frame_lock;
+) -> Result<(), QueueError> {
+    let lock = unsafe { (*state).capture_lock };
     if lock.is_null() {
         return Err(QueueError::Closed);
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let (result, was_empty) = match state.capture_queue.as_mut() {
+        let (result, was_empty) = match (*state).capture_queue.as_mut() {
             Some(queue) => {
                 let was_empty = queue.is_empty();
                 (queue.enqueue(frame), was_empty)
             }
             None => (Err(QueueError::Closed), false),
         };
-        let wait_completion_scheduled = if result.is_ok() && was_empty {
-            claim_wait_for_passive_completion_locked(state, ADAPTIVE_INTEREST_READABLE)
-        } else {
-            false
-        };
         call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
-        result.map(|()| wait_completion_scheduled)
+        if result.is_ok() {
+            (*state).capture_generation.fetch_add(1, Ordering::Release);
+            if was_empty {
+                let _ = claim_wait_for_passive_completion(
+                    state,
+                    ADAPTIVE_INTEREST_READABLE,
+                    core::ptr::null_mut(),
+                );
+            }
+        }
+        result
     }
 }
 
-fn dequeue_injection_frame(state: &mut InstanceState) -> (Option<Frame>, bool) {
-    let lock = state.frame_lock;
+fn dequeue_injection_frame(state: *mut InstanceState) -> (Option<Frame>, bool) {
+    let lock = unsafe { (*state).injection_lock };
     if lock.is_null() {
         return (None, false);
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let (frame, was_full) = match state.injection_queue.as_mut() {
+        let (frame, was_full) = match (*state).injection_queue.as_mut() {
             Some(queue) => {
                 let was_full =
                     queue.state() == QueueState::Open && queue.len() == FRAME_QUEUE_LIMIT;
@@ -3333,6 +3411,11 @@ fn dequeue_injection_frame(state: &mut InstanceState) -> (Option<Frame>, bool) {
         };
         let was_full_transition = frame.is_some() && was_full;
         call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+        if frame.is_some() {
+            (*state)
+                .injection_generation
+                .fetch_add(1, Ordering::Release);
+        }
         (frame, was_full_transition)
     }
 }
@@ -3342,147 +3425,388 @@ fn requeue_capture_frame_and_schedule_wait(
     frame: Frame,
     owner_generation: u64,
 ) {
-    let work_item = if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-        if state_guard.lifecycle.load(Ordering::Acquire) == INSTANCE_OPEN
-            && state_guard.owner_generation == owner_generation
-            && enqueue_existing_capture_frame_locked(&mut state_guard, frame).unwrap_or(false)
-        {
-            state_guard.read_work_item
-        } else {
-            core::ptr::null_mut()
-        }
-    } else {
-        core::ptr::null_mut()
-    };
-    enqueue_work_item(work_item);
+    if !state.is_null()
+        && unsafe { (*state).lifecycle.load(Ordering::Acquire) } == INSTANCE_OPEN
+        && unsafe { (*state).owner_generation.load(Ordering::Acquire) } == owner_generation
+    {
+        let _ = enqueue_existing_capture_frame(state, frame);
+    }
 }
 
-fn dequeue_capture_frame(state: &mut InstanceState) -> Option<Frame> {
-    let lock = state.frame_lock;
+fn dequeue_capture_frame(state: *mut InstanceState) -> Option<Frame> {
+    let lock = unsafe { (*state).capture_lock };
     if lock.is_null() {
         return None;
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let frame = state.capture_queue.as_mut().and_then(FrameQueue::dequeue);
+        let frame = (*state)
+            .capture_queue
+            .as_mut()
+            .and_then(FrameQueue::dequeue);
         call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+        if frame.is_some() {
+            (*state).capture_generation.fetch_add(1, Ordering::Release);
+        }
         frame
     }
 }
 
-fn readiness_mask_locked(state: &mut InstanceState) -> u32 {
-    let lock = state.frame_lock;
-    if lock.is_null() {
-        return 0;
+fn readiness_snapshot(state: *mut InstanceState) -> (u32, u64, u64) {
+    if state.is_null() {
+        return (0, 0, 0);
     }
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let mut ready = 0;
-        if state
-            .capture_queue
-            .as_ref()
-            .is_some_and(|queue| !queue.is_empty())
-        {
-            ready |= ADAPTIVE_INTEREST_READABLE;
+    let capture_generation = unsafe { (*state).capture_generation.load(Ordering::Acquire) };
+    let injection_generation = unsafe { (*state).injection_generation.load(Ordering::Acquire) };
+    let mut ready = 0;
+    let capture_lock = unsafe { (*state).capture_lock };
+    if !capture_lock.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, capture_lock);
+            if (*state)
+                .capture_queue
+                .as_ref()
+                .is_some_and(|queue| !queue.is_empty())
+            {
+                ready |= ADAPTIVE_INTEREST_READABLE;
+            }
+            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, capture_lock);
         }
-        if state.injection_queue.as_ref().is_some_and(|queue| {
-            queue.state() == QueueState::Open && queue.len() < FRAME_QUEUE_LIMIT
-        }) {
-            ready |= ADAPTIVE_INTEREST_WRITABLE;
-        }
-        call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
-        ready
     }
+    let injection_lock = unsafe { (*state).injection_lock };
+    if !injection_lock.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, injection_lock);
+            if (*state).injection_queue.as_ref().is_some_and(|queue| {
+                queue.state() == QueueState::Open && queue.len() < FRAME_QUEUE_LIMIT
+            }) {
+                ready |= ADAPTIVE_INTEREST_WRITABLE;
+            }
+            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, injection_lock);
+        }
+    }
+    (ready, capture_generation, injection_generation)
 }
 
-fn claim_wait_for_passive_completion_locked(state: &mut InstanceState, condition: u32) -> bool {
-    if !state.adaptive_enabled.load(Ordering::Acquire)
-        || state.pending_wait_request.is_null()
-        || !state.pending_wait_cancelable
-        || !state.ready_wait_request.is_null()
+fn claim_wait_for_passive_completion(
+    state: *mut InstanceState,
+    condition: u32,
+    expected_request: WDFREQUEST,
+) -> bool {
+    if state.is_null()
+        || condition == 0
+        || !unsafe { (*state).adaptive_enabled.load(Ordering::Acquire) }
     {
         return false;
     }
-    let satisfied = state.pending_wait_interest & condition;
-    if satisfied == 0 {
+    loop {
+        if unsafe { (*state).wait_state.load(Ordering::Acquire) } != WAIT_PENDING {
+            return false;
+        }
+        let interest = unsafe { (*state).wait_interest.load(Ordering::Acquire) };
+        let satisfied = interest & condition;
+        if satisfied == 0 {
+            return false;
+        }
+        let request: WDFREQUEST =
+            unsafe { (*state).wait_pending_request.load(Ordering::Acquire).cast() };
+        if request.is_null() || (!expected_request.is_null() && request != expected_request) {
+            return false;
+        }
+        unsafe {
+            (*state)
+                .wait_claimed_request
+                .store(request.cast(), Ordering::Release);
+        }
+        if unsafe {
+            (*state).wait_state.compare_exchange(
+                WAIT_PENDING,
+                WAIT_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+        }
+        .is_err()
+        {
+            unsafe {
+                let _ = (*state).wait_claimed_request.compare_exchange(
+                    request.cast(),
+                    core::ptr::null_mut(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            return false;
+        }
+        let published_request: WDFREQUEST = unsafe {
+            (*state)
+                .wait_pending_request
+                .swap(core::ptr::null_mut(), Ordering::AcqRel)
+                .cast()
+        };
+        if published_request.is_null() || published_request != request {
+            finish_wait(state);
+            return false;
+        }
+        let status =
+            unsafe { call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request) };
+        if status == STATUS_SUCCESS {
+            unsafe {
+                (*state)
+                    .wait_ready_satisfied
+                    .store(satisfied, Ordering::Release);
+                (*state)
+                    .wait_ready_request
+                    .store(request.cast(), Ordering::Release);
+                (*state)
+                    .wait_claimed_request
+                    .store(core::ptr::null_mut(), Ordering::Release);
+                (*state).wait_state.store(WAIT_READY, Ordering::Release);
+            }
+            enqueue_work_item(unsafe { (*state).read_work_item });
+            return true;
+        }
+        if status != STATUS_CANCELLED {
+            debug_status(b"WdfRequestUnmarkCancelable", status);
+        }
         return false;
     }
-    let request = state.pending_wait_request;
-    state.pending_wait_request = core::ptr::null_mut();
-    state.pending_wait_interest = 0;
-    state.pending_wait_cancelable = false;
-    state.ready_wait_request = request;
-    state.ready_wait_satisfied = satisfied;
-    true
 }
 
-fn take_wait_for_cancellation_locked(state: &mut InstanceState) -> Option<WDFREQUEST> {
-    if !state.pending_wait_request.is_null() {
-        let request = state.pending_wait_request;
-        state.pending_wait_request = core::ptr::null_mut();
-        state.pending_wait_interest = 0;
-        state.pending_wait_cancelable = false;
-        state.completing_wait_request = request;
-        return Some(request);
+fn finish_wait(state: *mut InstanceState) {
+    unsafe {
+        (*state)
+            .wait_registration_request
+            .store(core::ptr::null_mut(), Ordering::Release);
+        (*state)
+            .wait_pending_request
+            .store(core::ptr::null_mut(), Ordering::Release);
+        (*state)
+            .wait_claimed_request
+            .store(core::ptr::null_mut(), Ordering::Release);
+        (*state)
+            .wait_ready_request
+            .store(core::ptr::null_mut(), Ordering::Release);
+        (*state).wait_interest.store(0, Ordering::Release);
+        (*state).wait_ready_satisfied.store(0, Ordering::Release);
+        (*state).wait_state.store(WAIT_FREE, Ordering::Release);
     }
-    if !state.wait_registration_request.is_null() {
-        state.wait_registration_cancelled = true;
-    }
-    take_ready_wait_for_cancellation_locked(state)
 }
 
-fn take_ready_wait_locked(state: &mut InstanceState) -> Option<(WDFREQUEST, u32)> {
-    if state.ready_wait_request.is_null() {
-        return None;
+fn complete_teardown_registration(state: *mut InstanceState, request: WDFREQUEST) {
+    unsafe {
+        (*state)
+            .wait_claimed_request
+            .store(request.cast(), Ordering::Release);
     }
-    let request = state.ready_wait_request;
-    let satisfied = state.ready_wait_satisfied;
-    state.ready_wait_request = core::ptr::null_mut();
-    state.ready_wait_satisfied = 0;
-    state.completing_wait_request = request;
-    Some((request, satisfied))
+    let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request) };
+    if status == STATUS_SUCCESS {
+        complete_request(request, STATUS_CANCELLED);
+        finish_wait(state);
+    } else if status != STATUS_CANCELLED {
+        debug_status(b"WdfRequestUnmarkCancelable", status);
+    }
 }
 
-fn take_ready_wait_for_cancellation_locked(state: &mut InstanceState) -> Option<WDFREQUEST> {
-    if state.ready_wait_request.is_null() {
-        return None;
+fn cancel_wait_for_teardown(state: *mut InstanceState) -> bool {
+    if state.is_null() {
+        return false;
     }
-    let request = state.ready_wait_request;
-    state.ready_wait_request = core::ptr::null_mut();
-    state.ready_wait_satisfied = 0;
-    state.completing_wait_request = request;
-    Some(request)
+    loop {
+        match unsafe { (*state).wait_state.load(Ordering::Acquire) } {
+            WAIT_FREE | WAIT_CANCELLED | WAIT_CLAIMED | WAIT_TEARDOWN => return false,
+            WAIT_REGISTERING => {
+                if unsafe {
+                    (*state).wait_state.compare_exchange(
+                        WAIT_REGISTERING,
+                        WAIT_TEARDOWN,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                }
+                .is_ok()
+                {
+                    return false;
+                }
+            }
+            WAIT_PENDING => {
+                let request: WDFREQUEST =
+                    unsafe { (*state).wait_pending_request.load(Ordering::Acquire).cast() };
+                if request.is_null() {
+                    return false;
+                }
+                unsafe {
+                    (*state)
+                        .wait_claimed_request
+                        .store(request.cast(), Ordering::Release);
+                }
+                if unsafe {
+                    (*state).wait_state.compare_exchange(
+                        WAIT_PENDING,
+                        WAIT_CLAIMED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                }
+                .is_ok()
+                {
+                    let published_request: WDFREQUEST = unsafe {
+                        (*state)
+                            .wait_pending_request
+                            .swap(core::ptr::null_mut(), Ordering::AcqRel)
+                            .cast()
+                    };
+                    if published_request.is_null() || published_request != request {
+                        finish_wait(state);
+                        return true;
+                    }
+                    let status = unsafe {
+                        call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request)
+                    };
+                    if status == STATUS_SUCCESS {
+                        complete_request(request, STATUS_CANCELLED);
+                        finish_wait(state);
+                        return true;
+                    } else if status != STATUS_CANCELLED {
+                        debug_status(b"WdfRequestUnmarkCancelable", status);
+                    }
+                    return false;
+                }
+                let _ = unsafe {
+                    (*state).wait_claimed_request.compare_exchange(
+                        request.cast(),
+                        core::ptr::null_mut(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                };
+                return false;
+            }
+            WAIT_READY => {
+                if unsafe {
+                    (*state).wait_state.compare_exchange(
+                        WAIT_READY,
+                        WAIT_CLAIMED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                }
+                .is_ok()
+                {
+                    let request: WDFREQUEST = unsafe {
+                        (*state)
+                            .wait_ready_request
+                            .swap(core::ptr::null_mut(), Ordering::AcqRel)
+                            .cast()
+                    };
+                    if !request.is_null() {
+                        complete_request(request, STATUS_CANCELLED);
+                    }
+                    finish_wait(state);
+                    return true;
+                }
+            }
+            _ => return false,
+        }
+    }
 }
 
-enum WaitRequestClaim {
-    None,
-    Cancelable,
-    Registering,
-    Completing,
+fn cancel_wait_from_wdf(state: *mut InstanceState, request: WDFREQUEST) {
+    loop {
+        let state_value = unsafe { (*state).wait_state.load(Ordering::Acquire) };
+        match state_value {
+            WAIT_REGISTERING | WAIT_TEARDOWN => {
+                if unsafe { (*state).wait_registration_request.load(Ordering::Acquire) }
+                    != request.cast()
+                {
+                    return;
+                }
+                if unsafe {
+                    (*state).wait_state.compare_exchange(
+                        state_value,
+                        WAIT_CANCELLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                }
+                .is_ok()
+                {
+                    complete_request(request, STATUS_CANCELLED);
+                    return;
+                }
+            }
+            WAIT_PENDING => {
+                if unsafe { (*state).wait_pending_request.load(Ordering::Acquire) }
+                    != request.cast()
+                {
+                    return;
+                }
+                if unsafe {
+                    (*state).wait_state.compare_exchange(
+                        WAIT_PENDING,
+                        WAIT_CANCELLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                }
+                .is_ok()
+                {
+                    complete_request(request, STATUS_CANCELLED);
+                    finish_wait(state);
+                    return;
+                }
+            }
+            WAIT_CLAIMED => {
+                if unsafe { (*state).wait_claimed_request.load(Ordering::Acquire) }
+                    != request.cast()
+                {
+                    return;
+                }
+                if unsafe {
+                    (*state).wait_state.compare_exchange(
+                        WAIT_CLAIMED,
+                        WAIT_CANCELLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                }
+                .is_ok()
+                {
+                    complete_request(request, STATUS_CANCELLED);
+                    finish_wait(state);
+                    return;
+                }
+            }
+            _ => return,
+        }
+    }
 }
 
-fn take_wait_request_locked(state: &mut InstanceState, request: WDFREQUEST) -> WaitRequestClaim {
-    if state.pending_wait_request == request {
-        state.pending_wait_request = core::ptr::null_mut();
-        state.pending_wait_interest = 0;
-        state.pending_wait_cancelable = false;
-        state.completing_wait_request = request;
-        return WaitRequestClaim::Cancelable;
+fn wait_request_is_active(state: *mut InstanceState, request: WDFREQUEST) -> bool {
+    if state.is_null() {
+        return false;
     }
-    if state.ready_wait_request == request {
-        state.ready_wait_request = core::ptr::null_mut();
-        state.ready_wait_satisfied = 0;
-        state.completing_wait_request = request;
-        return WaitRequestClaim::Cancelable;
+    let request = request.cast();
+    unsafe {
+        (*state).wait_registration_request.load(Ordering::Acquire) == request
+            || (*state).wait_pending_request.load(Ordering::Acquire) == request
+            || (*state).wait_claimed_request.load(Ordering::Acquire) == request
+            || (*state).wait_ready_request.load(Ordering::Acquire) == request
     }
-    if state.wait_registration_request == request {
-        state.wait_registration_cancelled = true;
-        return WaitRequestClaim::Registering;
+}
+
+fn wait_request_requires_stop_ack(state: *mut InstanceState, request: WDFREQUEST) -> bool {
+    if state.is_null() {
+        return false;
     }
-    if state.completing_wait_request == request {
-        return WaitRequestClaim::Completing;
+    let request = request.cast();
+    match unsafe { (*state).wait_state.load(Ordering::Acquire) } {
+        WAIT_REGISTERING | WAIT_TEARDOWN => unsafe {
+            (*state).wait_registration_request.load(Ordering::Acquire) == request
+        },
+        WAIT_CLAIMED => unsafe { (*state).wait_claimed_request.load(Ordering::Acquire) == request },
+        _ => false,
     }
-    WaitRequestClaim::None
 }
 
 fn complete_wait_response(request: WDFREQUEST, status: NTSTATUS, satisfied: u32) {
@@ -3526,50 +3850,21 @@ fn complete_wait_response(request: WDFREQUEST, status: NTSTATUS, satisfied: u32)
     );
 }
 
-fn complete_claimed_wait_at_passive(state: *mut InstanceState, request: WDFREQUEST, satisfied: u32) {
+fn complete_claimed_wait_at_passive(
+    state: *mut InstanceState,
+    request: WDFREQUEST,
+    satisfied: u32,
+) {
     debug_assert!(at_passive_level());
-    let cancelled = unsafe { InstanceStateGuard::new(state) }
-        .is_none_or(|state_guard| {
-            state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN
-                || !state_guard.rx_queue_started.load(Ordering::Acquire)
-        });
-    let cancel_status =
-        unsafe { call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request) };
-    if cancel_status == STATUS_SUCCESS {
-        if cancelled {
-            complete_request(request, STATUS_CANCELLED);
-        } else {
-            complete_wait_response(request, STATUS_SUCCESS, satisfied);
-        }
-    } else if cancel_status != STATUS_CANCELLED {
-        complete_request(request, cancel_status);
-    }
-    if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-        if state_guard.completing_wait_request == request {
-            state_guard.completing_wait_request = core::ptr::null_mut();
-        }
-    }
-}
-
-fn cancel_claimed_wait(state: *mut InstanceState, request: WDFREQUEST) {
-    let cancel_status =
-        unsafe { call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request) };
-    if cancel_status == STATUS_SUCCESS {
+    let cancelled = state.is_null()
+        || unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN
+        || !unsafe { (*state).rx_queue_started.load(Ordering::Acquire) };
+    if cancelled {
         complete_request(request, STATUS_CANCELLED);
-    } else if cancel_status != STATUS_CANCELLED {
-        complete_request(request, cancel_status);
+    } else {
+        complete_wait_response(request, STATUS_SUCCESS, satisfied);
     }
-    if cancel_status != STATUS_CANCELLED {
-        clear_completing_wait_request(state, request);
-    }
-}
-
-fn clear_completing_wait_request(state: *mut InstanceState, request: WDFREQUEST) {
-    if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-        if state_guard.completing_wait_request == request {
-            state_guard.completing_wait_request = core::ptr::null_mut();
-        }
-    }
+    finish_wait(state);
 }
 
 fn acknowledge_stopped_request(request: WDFREQUEST) {
@@ -3578,14 +3873,47 @@ fn acknowledge_stopped_request(request: WDFREQUEST) {
     }
 }
 
-fn has_queued_injection_frame(state: &mut InstanceState) -> bool {
-    let lock = state.frame_lock;
+fn take_ready_wait(state: *mut InstanceState) -> Option<(WDFREQUEST, u32)> {
+    if state.is_null()
+        || unsafe {
+            (*state).wait_state.compare_exchange(
+                WAIT_READY,
+                WAIT_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+        }
+        .is_err()
+    {
+        return None;
+    }
+    let request: WDFREQUEST = unsafe {
+        (*state)
+            .wait_ready_request
+            .swap(core::ptr::null_mut(), Ordering::AcqRel)
+            .cast()
+    };
+    if request.is_null() {
+        finish_wait(state);
+        return None;
+    }
+    unsafe {
+        (*state)
+            .wait_claimed_request
+            .store(request.cast(), Ordering::Release);
+    }
+    let satisfied = unsafe { (*state).wait_ready_satisfied.load(Ordering::Acquire) };
+    Some((request, satisfied))
+}
+
+fn has_queued_injection_frame(state: *mut InstanceState) -> bool {
+    let lock = unsafe { (*state).injection_lock };
     if lock.is_null() {
         return false;
     }
     unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-        let has_frame = state
+        let has_frame = (*state)
             .injection_queue
             .as_ref()
             .is_some_and(|queue| !queue.is_empty());
@@ -3594,34 +3922,62 @@ fn has_queued_injection_frame(state: &mut InstanceState) -> bool {
     }
 }
 
-fn clear_frame_queues(state: &mut InstanceState) {
-    let lock = state.frame_lock;
-    if !lock.is_null() {
+fn clear_frame_queues(state: *mut InstanceState) {
+    if state.is_null() {
+        return;
+    }
+    let injection_lock = unsafe { (*state).injection_lock };
+    if !injection_lock.is_null() {
         unsafe {
-            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-            if let Some(queue) = state.injection_queue.as_mut() {
+            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, injection_lock);
+            if let Some(queue) = (*state).injection_queue.as_mut() {
                 queue.close();
             }
-            if let Some(queue) = state.capture_queue.as_mut() {
+            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, injection_lock);
+            (*state)
+                .injection_generation
+                .fetch_add(1, Ordering::Release);
+        }
+    }
+    let capture_lock = unsafe { (*state).capture_lock };
+    if !capture_lock.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, capture_lock);
+            if let Some(queue) = (*state).capture_queue.as_mut() {
                 queue.close();
             }
-            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, capture_lock);
+            (*state).capture_generation.fetch_add(1, Ordering::Release);
         }
     }
 }
 
-fn reopen_frame_queues(state: &mut InstanceState) {
-    let lock = state.frame_lock;
-    if !lock.is_null() {
+fn reopen_frame_queues(state: *mut InstanceState) {
+    if state.is_null() {
+        return;
+    }
+    let injection_lock = unsafe { (*state).injection_lock };
+    if !injection_lock.is_null() {
         unsafe {
-            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
-            if let Some(queue) = state.injection_queue.as_mut() {
+            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, injection_lock);
+            if let Some(queue) = (*state).injection_queue.as_mut() {
                 queue.reopen();
             }
-            if let Some(queue) = state.capture_queue.as_mut() {
+            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, injection_lock);
+            (*state)
+                .injection_generation
+                .fetch_add(1, Ordering::Release);
+        }
+    }
+    let capture_lock = unsafe { (*state).capture_lock };
+    if !capture_lock.is_null() {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, capture_lock);
+            if let Some(queue) = (*state).capture_queue.as_mut() {
                 queue.reopen();
             }
-            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, capture_lock);
+            (*state).capture_generation.fetch_add(1, Ordering::Release);
         }
     }
 }

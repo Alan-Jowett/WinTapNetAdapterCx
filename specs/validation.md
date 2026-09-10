@@ -5,7 +5,8 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 2 — Specification Changes
-**Status:** Dynamic-bus validation changes proposed; awaiting approval
+**Status:** Direction-isolated packet-queue advancement validation changes
+proposed; awaiting approval
 **Trace source:** `specs/requirements.md` and `specs/design.md`
 
 ## Acceptance criteria
@@ -53,6 +54,7 @@
 | VAL-039 | REQ-049 | Verify OS-managed nonpaged lookaside frame allocation, bounded queue ownership, allocation-failure ring release, in-flight frame drain, and safe pool teardown across normal, cancellation, power, stop, and removal paths. |
 | VAL-040 | REQ-047 | Enable adaptive-polling mode on two exclusive TAP handles; verify immediate empty READ, inline busy WRITE, level-sensitive queue-change waits, bounded one-wait-per-handle behavior, legacy compatibility, adaptive switch batching, cancellation, PnP/power teardown, and no lost notification or per-frame I/O-ring wait. |
 | VAL-041 | REQ-048 | Verify per-endpoint adaptive negotiation diagnostics, periodic idle wait statistics, and a GUID-correlated two-TAP probe. Reject stale TAP interfaces; prove enable, wait registration, readable capture, wait completion, resumed read, and peer forwarding before recording performance data. |
+| VAL-042 | REQ-050 | Instrument simultaneous TX and RX packet-queue advancement. Verify neither callback waits for a driver lock held by the opposite direction; verify queue-local contention, atomic adaptive wait races, cancellation, and lifecycle quiescence preserve ring ownership and exactly-once completion. |
 
 | Test | Coverage |
 |---|---|
@@ -133,6 +135,9 @@
 | TC-095 | During an outstanding adaptive `WAIT_FOR_CHANGE`, exercise cancellation, owner cleanup, D0 exit/entry, queue stop/start, surprise removal, and release hardware. Verify exactly one terminal wait completion, no request or frame leak, no use of the manual READ queue for adaptive empty READs, and safe legacy-mode purge/resume behavior. |
 | TC-090 | Provision two manager-created TAP children while stale TAP instances are present. Verify each test address, route, PnP hardware ID, and switch endpoint maps to the same created GUID. Force unsupported, incompatible, and accepted adaptive enable results; verify endpoint-correlated diagnostics. For the accepted case, generate ARP/ICMP traffic and verify idle wait submission, readable capture, wait completion, resumed read, peer forwarding, and bidirectional reply before collecting performance counters. |
 | TC-091 | Exercise minimum, normal, maximum, burst, queue-full, allocation-failure, cancellation, D0, stop, owner-close, surprise-removal, and teardown paths with OS nonpaged lookaside-backed full-size frame elements. Verify no normal frame path uses a general-purpose per-frame allocation, queue limits remain the only admission boundary, every element is acquired and released exactly once, prior payload bytes are not observable after reuse, NetAdapterCx entries and user buffers are never retained on acquisition failure, and lookaside deletion occurs only after all frame ownership drains. |
+| TC-096 | Instrument lock acquisition and hold intervals while RX indication copies a sustained injection burst and TX capture copies a sustained transmit burst concurrently. Verify RX does not acquire a TX-held driver lock, TX does not acquire an RX-held driver lock, and no shared driver lock covers ring traversal, frame allocation/copy, ring-index mutation, or ordinary queue enqueue/dequeue. |
+| TC-097 | Race readable and writable queue transitions against `WAIT_FOR_CHANGE` registration, including cancellation before, during, and after `WdfRequestMarkCancelableEx`, plus owner cleanup, queue close, and release hardware while TX and RX advances run concurrently. Verify a request is not transition-visible before successful marking; a `STATUS_CANCELLED` mark return clears registration and is completed by registration because WDF does not invoke the cancellation callback; generation/recheck handling has no lost wakeup; exactly one path claims and terminally completes each marked wait; a claimant that receives `STATUS_CANCELLED` from `WdfRequestUnmarkCancelable` does not complete the request; and neither advance waits for adaptive-wait synchronization. |
+| TC-098 | Start concurrent TX/RX advances, then exercise queue stop, RX cancel, D0 exit, surprise removal, and release hardware at every published-metadata boundary. Verify framework quiescence or callback-lifetime leases prevent stale ring, extension, queue, and lookaside access; ring ownership/index rules remain intact; and frame/request cleanup is exact-once. |
 
 ## Functional tests
 
@@ -289,4 +294,5 @@ TC-056 through TC-061 provide trace points for REQ-020.
 TC-062 through TC-064 provide trace points for REQ-021. TC-065 provides the
 trace point for REQ-024. TC-066 provides the trace point for REQ-025.
 TC-086 through TC-089 provide trace points for REQ-046. TC-092 through TC-095 provide trace points for REQ-047. TC-090 provides the
-trace point for REQ-048, and TC-091 provides the trace point for REQ-049.
+trace point for REQ-048, TC-091 provides the trace point for REQ-049, and
+TC-096 through TC-098 provide the trace points for REQ-050.

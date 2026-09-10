@@ -5,7 +5,8 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 2 — Specification Changes
-**Status:** Dynamic-bus specification changes proposed; awaiting approval
+**Status:** Direction-isolated packet-queue advancement specification changes
+proposed; awaiting approval
 **Evidence scope:** `README.md`, repository layout, and user-provided project purpose
 
 ## Change manifest
@@ -51,6 +52,9 @@
   artifacts, or build configuration during discovery.
 - Replace the fixed root-enumerated adapter model with a separate-service KMDF
   bus and dynamically enumerated, GUID-keyed TAP child adapters.
+- Eliminate TX/RX packet-queue-advance blocking caused by driver
+  synchronization while preserving packet ownership, adaptive waits, and
+  teardown safety.
 
 ## User-intent references
 
@@ -81,6 +85,11 @@
   baseline and selected separate KMDF bus and TAP-child driver services.
 - **UI-024 (KNOWN):** The user requested SPDX headers on every eligible file
   and enforcement that rejects noncompliant commits and pull requests.
+- **UI-025 (KNOWN):** Starting from issue #19, the user requested the best
+  solution to reduce or eliminate contention between the TX and RX paths.
+- **UI-026 (KNOWN):** The selected acceptance criterion is no
+  cross-direction blocking while TX and RX packet-queue advance callbacks
+  run.
 
 ## Baseline requirements
 
@@ -1089,6 +1098,63 @@ behavior. It shall preserve directional isolation, queue bounds, NetAdapterCx
 ring ownership, IRQL/pageability rules, exact-once completion, adaptive/legacy
 semantics, and teardown safety.
 
+### REQ-050 — Direction-isolated packet-queue advancement
+
+**Before:** `evt_packet_queue_advance` acquires a shared adapter state lock
+before determining whether it serves TX or RX. RX holds that lock while
+traversing and populating its packet rings. TX therefore waits at callback
+entry and later reacquires the same lock while capturing frames. The distinct
+injection and capture queues also share a frame lock. [KNOWN: issue #19;
+`crates/wintap-netadaptercx-driver/src/lib.rs` packet-queue advance, capture,
+and frame-queue paths.]
+
+**After:** TX and RX packet-queue advance callbacks shall process their own
+framework rings and ordinary directional frame-queue transitions without
+acquiring synchronization that the opposite direction can hold. Queue
+identity, ring collection, fragment extension, immutable frame limits, and
+lookaside identity shall be published before the framework may invoke the
+queue and remain valid until the framework-defined queue quiescence point.
+
+The injection and capture queues shall use independent synchronization. A
+shared lifecycle/control lock may protect control-handle state, owner
+generation, receive-filter state, and `OPEN`/`CLOSING`/`CLOSED` transitions,
+but shall not span ring traversal, frame allocation or copy, ring-index
+mutation, or ordinary queue enqueue/dequeue operations. Queue-local
+operations shall not acquire that lifecycle/control lock.
+
+Adaptive `WAIT_FOR_CHANGE` registration, cancellation, and completion
+claiming shall use an atomic publication and claim protocol. It shall observe
+queue readiness level-sensitively, publish at most one wait request, and allow
+either a matching queue transition or cancellation/teardown to claim terminal
+ownership exactly once. Neither TX nor RX queue advance may wait on shared
+adaptive-wait synchronization. The request shall not become visible to a
+queue transition until `WdfRequestMarkCancelableEx` succeeds; registration
+state sufficient for its cancellation callback shall remain valid throughout
+the mark/publish race. If `WdfRequestMarkCancelableEx` returns
+`STATUS_CANCELLED`, registration shall perform cancellation cleanup and
+complete the request because WDF does not invoke the cancellation callback.
+A transition or teardown claimant shall complete a marked request only after
+successful `WdfRequestUnmarkCancelable`; an `STATUS_CANCELLED` result from
+that unmark operation assigns terminal completion exclusively to the WDF
+cancellation callback.
+
+Stop, cancel, D0 exit, surprise removal, and release hardware shall prevent
+new datapath entry, reach the verified framework quiescence point, and only
+then invalidate queue-local metadata or release frame storage. If the
+framework contract cannot establish that quiescence, the implementation shall
+use an equivalent nonblocking callback-lifetime lease and wait for leases to
+drain before invalidation.
+
+**Trace:** UI-025, UI-026; issue #19; REQ-003, REQ-006, REQ-016, REQ-021,
+REQ-024, REQ-025, REQ-047, and REQ-049.
+
+**Invariant impact:** TX advance cannot wait for RX advance, nor RX for TX,
+because of driver synchronization. Each ring remains mutated only by its
+owning packet callback except for the specified RX cancellation return.
+Adaptive waits retain exactly-once completion and cannot lose a readiness
+transition. A callback cannot access invalid ring, extension, queue, or
+lookaside state during teardown.
+
 ### Dynamic-bus traceability
 
 | Requirement | Design coverage | Validation coverage |
@@ -1118,6 +1184,7 @@ semantics, and teardown safety.
 | REQ-047 | Adaptive-polling control contract and switch execution | VAL-040; TC-092 through TC-095 |
 | REQ-048 | Adaptive-path diagnostics and endpoint-correlated functional validation | VAL-041; TC-090 |
 | REQ-049 | OS-managed nonpaged lookaside frame storage and lifecycle | VAL-039; TC-091 |
+| REQ-050 | Direction-isolated packet queue advancement | VAL-042; TC-096 through TC-098 |
 
 ## Open questions requiring user decisions
 
@@ -1190,8 +1257,11 @@ semantics, and teardown safety.
     existing control-handle contract remains the default.
 30. **Resolved:** Each exclusive adaptive-polling handle permits one pending
     `WAIT_FOR_CHANGE` IOCTL; a second wait fails explicitly.
+31. **Resolved:** TX and RX packet-queue advancement must not block each
+    other on driver synchronization. Queue-local frame synchronization and a
+    nonblocking adaptive-wait claim protocol replace shared datapath locking.
 
 ## Specification approval gate
 
-REQ-026 through REQ-049 require approval together with their design and
+REQ-026 through REQ-050 require approval together with their design and
 validation coverage before implementation.

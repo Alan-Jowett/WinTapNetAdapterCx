@@ -5,7 +5,8 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 2 — Specification Changes
-**Status:** Dynamic-bus specification changes proposed; awaiting approval
+**Status:** Direction-isolated packet-queue advancement specification changes
+proposed; awaiting approval
 **Trace source:** `specs/requirements.md`
 
 ## Design principles
@@ -284,7 +285,7 @@ When the TX packet callback is executing at `PASSIVE_LEVEL`, it may match a
 compatible pending READ IRP, retrieve the output buffer, copy the complete
 frame directly from the framework TX fragment(s), complete the request, and
 then return the framework-owned entries. The callback must release any
-adapter/state lock before calling WDF routines that may access request
+lifecycle/control or queue-local lock before calling WDF routines that may access request
 buffers or complete requests.
 
 When the callback executes above `PASSIVE_LEVEL`, it must not access a user
@@ -303,15 +304,16 @@ small, the request completes with `STATUS_BUFFER_TOO_SMALL`; the driver
 stages the frame in `capture_queue`, advances the framework ring, and leaves
 the frame available for a later compatible read.
 
-The passive READ callback and completion work item shall use the state lock
-only to transition ownership. The sequence for a queued-frame/READ pair is:
+The passive READ callback and completion work item shall use capture-queue
+synchronization only to transition ownership. The sequence for a
+queued-frame/READ pair is:
 
-1. Under the state lock, dequeue or claim one captured frame and one READ
+1. Under capture-queue synchronization, dequeue or claim one captured frame and one READ
    request, or leave both available if pairing is not possible.
-2. Release the state lock before retrieving the WDF output buffer, copying
+2. Release capture-queue synchronization before retrieving the WDF output buffer, copying
    bytes, requeueing a frame, or completing the request.
-3. If the output buffer is too small or cannot be retrieved, re-acquire the
-   state lock to requeue the still-owned frame, then complete the request
+3. If the output buffer is too small or cannot be retrieved, re-acquire
+   capture-queue synchronization to requeue the still-owned frame, then complete the request
    outside the lock with the documented error.
 
 Packet callbacks, the passive READ callback, and the work item must use the
@@ -325,7 +327,7 @@ nonpaged `capture_queue` before returning the framework-owned packet entries.
 The enqueue transition records whether the queue was empty before insertion.
 An empty-to-nonempty transition evaluates and claims a registered readable
 `WAIT_FOR_CHANGE` request; it does not access a user buffer or complete that
-request while holding the state/frame lock. This preserves the
+request while holding queue-local synchronization. This preserves the
 DISPATCH_LEVEL-safe packet callback contract while making readiness visible to
 user mode without a pending READ IRP.
 
@@ -350,8 +352,8 @@ the framework entry is returned in the same callback.
 
 The element's valid length is set only after a complete frame copy succeeds.
 On dequeue, delivery, rejection, cancellation, or queue drain, ownership
-transitions are serialized by the existing state/frame lock and the element is
-returned exactly once. Reuse must not expose bytes from a previous frame;
+transitions are serialized by the owning queue's local synchronization and the
+element is returned exactly once. Reuse must not expose bytes from a previous frame;
 the implementation shall clear the prior valid payload range before release
 or establish an equivalent non-observability guarantee.
 
@@ -378,10 +380,14 @@ user buffer, or completing the request.
 Write admission shall use a bounded counter and the bounded injection queue;
 valid writes shall not wait in a WDF manual queue.
 
+For REQ-050, "state lock" in the preceding ownership-transition rule is
+superseded by the owning queue-local lock. The lifecycle/control lock remains
+excluded from ordinary queue ownership transitions.
+
 The injection and captured-frame queues each use the configured frame limit
-independently. They may share a lock when all queue operations use the same
-lock order, but they shall remain separate queue objects and their fullness,
-close, reopen, dequeue, and teardown transitions shall not affect one another.
+independently. Each has queue-local synchronization; neither queue operation
+may acquire a lock held by the other packet direction. Their fullness, close,
+reopen, dequeue, and teardown transitions shall not affect one another.
 
 The switch's pending read and write capacity is one validated positive even
 total configured value shared across both endpoints. Each endpoint receives
@@ -449,22 +455,41 @@ the satisfied mask. It is valid only after successful mode enable. The driver
 permits at most one wait request per exclusive handle. A second request fails
 explicitly and cannot cancel, replace, or steal the registered request.
 
-The state lock protects all of the following as one transaction:
+The driver shall use a nonblocking atomic wait-publication state machine
+instead of the state lock for `WAIT_FOR_CHANGE` coordination. Readability is
+true while the capture queue is nonempty. Writability is true while the
+injection queue has capacity. Each queue publishes its readiness state and a
+monotonic transition generation with release semantics after its queue-local
+transition.
 
-1. Read the requested queue conditions.
-2. Complete the operation immediately if an interested condition is already
-   satisfied.
-3. Otherwise mark the request cancellable and publish it as the one pending
-   wait before releasing the lock.
+Wait registration shall read the requested readiness state, publish stable
+`REGISTERING` cancellation metadata, and call `WdfRequestMarkCancelableEx`.
+The request pointer shall not enter the atomically visible `PENDING` slot
+until marking succeeds. If `WdfRequestMarkCancelableEx` returns
+`STATUS_CANCELLED`, WDF does not invoke the cancellation callback;
+registration removes `REGISTERING` metadata, completes the request with
+`STATUS_CANCELLED`, and does not publish it. If cancellation runs while
+registration is in progress after successful marking, the callback records
+its claim in registration metadata and registration retires that metadata
+without publishing. If marking succeeds, registration publishes a record
+containing its interest mask and the observed generations, then re-reads
+readiness. It completes immediately if an interested condition was already
+or becomes satisfied; otherwise it remains published.
 
-Readability is true while the capture queue is nonempty. Writability is true
-while the injection queue has capacity. A frame enqueue that observes an
-empty capture queue and a frame dequeue that observes a full injection queue
-evaluate the matching registered wait under the state lock. They claim the
-request and clear the pending-wait state under the lock, then unmark and
-complete it outside the lock. A cancellation callback uses the same lock to
-either remove the still-published request or observe that a queue transition
-already claimed it; exactly one path completes the request.
+A readable or writable transition may atomically change the published record
+from `PENDING` to `CLAIMED`. Cancellation and teardown use the same
+single-winner atomic claim. A queue-transition or teardown claimant removes
+publication, calls `WdfRequestUnmarkCancelable`, and completes the request
+only when that call succeeds. If it returns `STATUS_CANCELLED`, the WDF
+cancellation callback exclusively owns terminal completion; the claimant must
+not complete the request. The cancellation callback removes or observes the
+claim through the same atomic state and completes the request exactly once.
+All completion occurs outside queue and lifecycle locks. A losing path
+observes the terminal claim and does not complete the request. The
+registration metadata remains valid until the mark/publish race and any
+cancellation callback have reached a terminal outcome. This protocol prevents
+a readiness change between the initial observation and publication from being
+lost without requiring RX and TX queue advances to acquire a common lock.
 
 When adaptive-polling mode is enabled, an empty READ completes with
 `STATUS_NO_MORE_ENTRIES`; it is never placed on the manual read queue. An
@@ -475,7 +500,8 @@ which prevents a lost wakeup between polling and blocking.
 
 Owner close, file cleanup, D0 exit, adapter stop, surprise removal, queue
 closure, and release hardware first prevent a new wait from being published,
-then claim/cancel the published wait through the same state-lock protocol.
+then claim/cancel the published wait through the atomic wait-publication
+protocol.
 They purge legacy manual READ requests only for legacy mode. Adaptive-mode
 teardown neither leaves a wait request published nor resumes a manual queue
 for an adaptive READ.
@@ -488,10 +514,23 @@ ring-capacity and cancellation boundary.
 
 ## Synchronization
 
-- A per-adapter lock shall protect adapter state, ownership state, queue
-  membership, and transitions between `OPEN`, `CLOSING`, and `CLOSED`.
-- Queue operations shall use one consistent lock ordering; the adapter state
-  lock must not be reacquired from a completion path that already owns it.
+- A per-adapter lifecycle/control lock shall protect control-handle state,
+  owner generation, receive-filter state, and transitions between `OPEN`,
+  `CLOSING`, and `CLOSED`. It shall not protect packet-ring traversal or
+  ordinary directional frame-queue operations.
+- Injection and capture queues shall have independent queue-local locks.
+  RX advance may acquire only injection-queue synchronization and TX advance
+  may acquire only capture-queue synchronization. Neither advance callback
+  may acquire the lifecycle/control lock or a shared adaptive-wait lock while
+  processing packet rings.
+- Queue identity, ring collection, fragment extension, immutable frame limit,
+  and frame-pool identity shall be published before the corresponding queue
+  starts. They remain immutable until the framework has stopped and quiesced
+  that queue. Release hardware shall invalidate them only after all callbacks
+  are quiescent; if this cannot be proven from the callback contract, a
+  lock-free callback lease shall prevent invalidation until all leases drain.
+- Adaptive wait publication and claiming shall use the atomic state machine
+  above. It shall not impose a shared lock acquisition on packet advancement.
 - Cancellation shall atomically remove a request from its queue or mark it for
   completion by the owning worker.
 - Adapter and frame objects shall use reference counting or an equivalent
