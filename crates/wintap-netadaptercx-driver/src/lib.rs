@@ -2856,12 +2856,13 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
         return;
     }
     if state_guard.adaptive_enabled.load(Ordering::Acquire) {
+        let owner_generation = state_guard.owner_generation;
         let frame = dequeue_capture_frame(&mut state_guard);
         drop(state_guard);
         if let Some(frame) = frame {
             let status = complete_captured_frame_to_read(request, &frame);
             if status != STATUS_SUCCESS {
-                requeue_capture_frame_and_schedule_wait(state, frame);
+                requeue_capture_frame_and_schedule_wait(state, frame, owner_generation);
                 complete_request(request, status);
             }
         } else {
@@ -2875,12 +2876,13 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
     }
     let frame = dequeue_capture_frame(&mut *state_guard);
     if let Some(frame) = frame {
+        let owner_generation = state_guard.owner_generation;
         release_request(&state_guard.pending_reads);
         drop(state_guard);
 
         let status = complete_captured_frame_to_read(request, &frame);
         if status != STATUS_SUCCESS {
-            requeue_capture_frame_and_schedule_wait(state, frame);
+            requeue_capture_frame_and_schedule_wait(state, frame, owner_generation);
             complete_request(request, status);
         }
         return;
@@ -3128,7 +3130,7 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
         }
 
         let mut request = core::ptr::null_mut();
-        let frame = {
+        let (frame, owner_generation) = {
             let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
                 return;
             };
@@ -3154,11 +3156,11 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
                 }
             };
             release_request(&state.pending_reads);
-            frame
+            (frame, state.owner_generation)
         };
         let status = complete_captured_frame_to_read(request, &frame);
         if status != STATUS_SUCCESS {
-            requeue_capture_frame_and_schedule_wait(state, frame);
+            requeue_capture_frame_and_schedule_wait(state, frame, owner_generation);
             complete_request(request, status);
         }
     }
@@ -3237,9 +3239,16 @@ fn dequeue_injection_frame(state: &mut InstanceState) -> (Option<Frame>, bool) {
     }
 }
 
-fn requeue_capture_frame_and_schedule_wait(state: *mut InstanceState, frame: Frame) {
+fn requeue_capture_frame_and_schedule_wait(
+    state: *mut InstanceState,
+    frame: Frame,
+    owner_generation: u64,
+) {
     let work_item = if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-        if enqueue_existing_capture_frame_locked(&mut state_guard, frame).unwrap_or(false) {
+        if state_guard.lifecycle.load(Ordering::Acquire) == INSTANCE_OPEN
+            && state_guard.owner_generation == owner_generation
+            && enqueue_existing_capture_frame_locked(&mut state_guard, frame).unwrap_or(false)
+        {
             state_guard.read_work_item
         } else {
             core::ptr::null_mut()
