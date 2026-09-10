@@ -1197,6 +1197,7 @@ extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
         };
         let state = &mut *state_guard;
         let pending_wait = take_wait_for_cancellation_locked(state);
+        let read_work_item = state.read_work_item;
         if queue == state.tx_queue {
             state.tx_queue_started.store(false, Ordering::Release);
         } else if queue == state.rx_queue {
@@ -1207,6 +1208,7 @@ extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
         if let Some(request) = pending_wait {
             cancel_claimed_wait(request);
         }
+        flush_work_item(read_work_item);
     }
 }
 
@@ -2010,11 +2012,12 @@ unsafe extern "C" fn evt_device_d0_exit(
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
-        let (read_queue, adaptive, pending_wait) = {
+        let (read_queue, read_work_item, adaptive, pending_wait) = {
             let state = &mut *state_guard;
             state.lifecycle.store(INSTANCE_SUSPENDED, Ordering::Release);
             (
                 state.read_queue,
+                state.read_work_item,
                 state.adaptive_enabled.load(Ordering::Acquire),
                 take_wait_for_cancellation_locked(state),
             )
@@ -2023,6 +2026,7 @@ unsafe extern "C" fn evt_device_d0_exit(
         if let Some(request) = pending_wait {
             cancel_claimed_wait(request);
         }
+        flush_work_item(read_work_item);
         if !adaptive {
             purge_queue(read_queue);
         }
@@ -2200,6 +2204,7 @@ extern "C" fn evt_device_release_hardware(
     if let Some(request) = pending_wait {
         cancel_claimed_wait(request);
     }
+    flush_work_item(read_work_item);
     if !adaptive {
         purge_queue(read_queue);
     }
@@ -2512,7 +2517,7 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
-        let (was_suspended, read_queue, adaptive, pending_wait) = {
+        let (was_suspended, read_queue, read_work_item, adaptive, pending_wait) = {
             let state = &mut *state_guard;
             let was_suspended = state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
             state.owner_generation = state.owner_generation.wrapping_add(1);
@@ -2520,6 +2525,7 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
             (
                 was_suspended,
                 state.read_queue,
+                state.read_work_item,
                 state.adaptive_enabled.load(Ordering::Acquire),
                 take_wait_for_cancellation_locked(state),
             )
@@ -2528,6 +2534,7 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         if let Some(request) = pending_wait {
             cancel_claimed_wait(request);
         }
+        flush_work_item(read_work_item);
         if !adaptive {
             purge_queue(read_queue);
         }
@@ -2994,8 +3001,9 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
     drop(state_guard);
     match wait_claim {
         WaitRequestClaim::Cancelable => cancel_claimed_wait(request),
-        WaitRequestClaim::Completing => {}
-        WaitRequestClaim::Registering => {}
+        WaitRequestClaim::Completing | WaitRequestClaim::Registering => {
+            acknowledge_stopped_request(request);
+        }
         WaitRequestClaim::None => complete_request(request, STATUS_CANCELLED),
     }
 }
@@ -3426,10 +3434,19 @@ fn complete_wait_response(request: WDFREQUEST, status: NTSTATUS, satisfied: u32)
 
 fn complete_claimed_wait_at_passive(state: *mut InstanceState, request: WDFREQUEST, satisfied: u32) {
     debug_assert!(at_passive_level());
+    let cancelled = unsafe { InstanceStateGuard::new(state) }
+        .is_none_or(|state_guard| {
+            state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN
+                || !state_guard.rx_queue_started.load(Ordering::Acquire)
+        });
     let cancel_status =
         unsafe { call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request) };
     if cancel_status == STATUS_SUCCESS {
-        complete_wait_response(request, STATUS_SUCCESS, satisfied);
+        if cancelled {
+            complete_request(request, STATUS_CANCELLED);
+        } else {
+            complete_wait_response(request, STATUS_SUCCESS, satisfied);
+        }
     } else if cancel_status != STATUS_CANCELLED {
         complete_request(request, cancel_status);
     }
@@ -3447,6 +3464,13 @@ fn cancel_claimed_wait(request: WDFREQUEST) {
         complete_request(request, STATUS_CANCELLED);
     } else if cancel_status != STATUS_CANCELLED {
         complete_request(request, cancel_status);
+    }
+
+}
+
+fn acknowledge_stopped_request(request: WDFREQUEST) {
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfRequestStopAcknowledge, request, 0);
     }
 }
 
