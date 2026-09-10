@@ -26,7 +26,8 @@ use wdk_sys::{
     UNICODE_STRING, WDF_DRIVER_CONFIG, WDF_FILEOBJECT_CONFIG, WDF_IO_QUEUE_CONFIG,
     WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
     WDF_WORKITEM_CONFIG, WDFCMRESLIST, WDFDEVICE, WDFDEVICE_INIT, WDFDRIVER, WDFFILEOBJECT,
-    WDFOBJECT, WDFQUEUE, WDFREQUEST, WDFSPINLOCK, WDFWORKITEM, call_unsafe_wdf_function_binding,
+    WDFOBJECT, WDFQUEUE, WDFREQUEST, WDFSPINLOCK, WDFWAITLOCK, WDFWORKITEM,
+    call_unsafe_wdf_function_binding,
 };
 
 unsafe extern "C" {
@@ -154,6 +155,7 @@ struct InstanceState {
     active_multicast_address_count: usize,
     active_multicast_addresses: [[u8; ETHERNET_ADDRESS_LENGTH]; MAXIMUM_MULTICAST_ADDRESSES],
     read_work_item: WDFWORKITEM,
+    legacy_direct_read_lock: WDFWAITLOCK,
     tx_queue: netadaptercx_sys::NETPACKETQUEUE,
     rx_queue: netadaptercx_sys::NETPACKETQUEUE,
     tx_rings: *const netadaptercx_sys::NET_RING_COLLECTION,
@@ -180,6 +182,38 @@ struct InstanceState {
     lifecycle: core::sync::atomic::AtomicU8,
 }
 
+struct LegacyDirectReadGuard {
+    state: *mut InstanceState,
+}
+
+impl LegacyDirectReadGuard {
+    unsafe fn acquire(state: *mut InstanceState) -> Option<Self> {
+        if state.is_null() || unsafe { (*state).legacy_direct_read_lock.is_null() } {
+            return None;
+        }
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfWaitLockAcquire,
+                (*state).legacy_direct_read_lock,
+                core::ptr::null_mut::<i64>(),
+            )
+        };
+        if status == STATUS_SUCCESS {
+            Some(Self { state })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for LegacyDirectReadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfWaitLockRelease, (*self.state).legacy_direct_read_lock);
+        }
+    }
+}
+
 impl InstanceState {
     fn new(guid: GUID, mtu: usize) -> Self {
         Self {
@@ -199,6 +233,7 @@ impl InstanceState {
             active_multicast_address_count: 0,
             active_multicast_addresses: [[0; ETHERNET_ADDRESS_LENGTH]; MAXIMUM_MULTICAST_ADDRESSES],
             read_work_item: core::ptr::null_mut(),
+            legacy_direct_read_lock: core::ptr::null_mut(),
             tx_queue: core::ptr::null_mut(),
             rx_queue: core::ptr::null_mut(),
             tx_rings: core::ptr::null(),
@@ -1195,6 +1230,7 @@ extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
+        let state_ptr = state_guard.state;
         let state = &mut *state_guard;
         let pending_wait = take_wait_for_cancellation_locked(state);
         let read_work_item = state.read_work_item;
@@ -1206,7 +1242,7 @@ extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
         }
         drop(state_guard);
         if let Some(request) = pending_wait {
-            cancel_claimed_wait(request);
+            cancel_claimed_wait(state_ptr, request);
         }
         flush_work_item(read_work_item);
     }
@@ -1499,6 +1535,7 @@ fn capture_transmit_packets(
                 fragment_begin,
                 fragment_count,
                 total_length,
+                capture_generation,
             )
         {
             let next_packet = match unsafe { increment_index(&*packet_ring, packet_begin) } {
@@ -1675,12 +1712,18 @@ fn deliver_transmit_packet_to_read(
     fragment_begin: u32,
     fragment_count: u32,
     total_length: usize,
+    owner_generation: u64,
 ) -> bool {
+    let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) })
+    else {
+        return false;
+    };
     let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
         return false;
     };
     if state_guard.adaptive_enabled.load(Ordering::Acquire)
         || state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN
+        || state_guard.owner_generation != owner_generation
     {
         return false;
     }
@@ -2009,6 +2052,10 @@ unsafe extern "C" fn evt_device_d0_exit(
     _target_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
     if let Some(state) = unsafe { instance_from_pnp_device(device) } {
+        let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) })
+        else {
+            return STATUS_DEVICE_NOT_READY;
+        };
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return STATUS_DEVICE_NOT_READY;
         };
@@ -2024,7 +2071,7 @@ unsafe extern "C" fn evt_device_d0_exit(
         };
         drop(state_guard);
         if let Some(request) = pending_wait {
-            cancel_claimed_wait(request);
+            cancel_claimed_wait(state, request);
         }
         flush_work_item(read_work_item);
         if !adaptive {
@@ -2200,9 +2247,12 @@ extern "C" fn evt_device_release_hardware(
         // after the framework has stopped datapath activity.
         unsafe { stop(netadaptercx_sys::NetDriverGlobals, adapter) };
     }
+    let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) }) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
 
     if let Some(request) = pending_wait {
-        cancel_claimed_wait(request);
+        cancel_claimed_wait(state, request);
     }
     flush_work_item(read_work_item);
     if !adaptive {
@@ -2310,6 +2360,20 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
     let mut state_lock: WDFSPINLOCK = core::ptr::null_mut();
     let status = unsafe {
         call_unsafe_wdf_function_binding!(WdfSpinLockCreate, &mut lock_attributes, &mut state_lock,)
+    };
+    if status != STATUS_SUCCESS {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, device.cast());
+        }
+        return status;
+    }
+    let mut legacy_direct_read_lock: WDFWAITLOCK = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfWaitLockCreate,
+            &mut lock_attributes,
+            &mut legacy_direct_read_lock,
+        )
     };
     if status != STATUS_SUCCESS {
         unsafe {
@@ -2470,6 +2534,7 @@ fn create_tap_device(device: WDFDEVICE, state: &mut InstanceState) -> NTSTATUS {
     state.frame_lock = frame_lock;
     state.frame_pool = frame_pool;
     state.state_lock = state_lock;
+    state.legacy_direct_read_lock = legacy_direct_read_lock;
     state.injection_queue = Some(injection_queue);
     state.capture_queue = Some(capture_queue);
     state.read_work_item = read_work_item;
@@ -2514,6 +2579,10 @@ extern "C" fn evt_file_close(_file_object: WDFFILEOBJECT) {}
 extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
     let device = unsafe { call_unsafe_wdf_function_binding!(WdfFileObjectGetDevice, file_object) };
     if let Some(state) = unsafe { instance_from_device(device) } {
+        let Some(_legacy_direct_read_guard) = (unsafe { LegacyDirectReadGuard::acquire(state) })
+        else {
+            return;
+        };
         let Some(mut state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
@@ -2532,7 +2601,7 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         };
         drop(state_guard);
         if let Some(request) = pending_wait {
-            cancel_claimed_wait(request);
+            cancel_claimed_wait(state, request);
         }
         flush_work_item(read_work_item);
         if !adaptive {
@@ -2845,6 +2914,9 @@ unsafe extern "C" fn evt_wait_for_change_cancel(request: WDFREQUEST) {
         if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
             let _ = take_wait_request_locked(&mut state_guard, request);
         }
+        complete_request(request, STATUS_CANCELLED);
+        clear_completing_wait_request(state, request);
+        return;
     }
     complete_request(request, STATUS_CANCELLED);
 }
@@ -2993,6 +3065,7 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
         complete_request(request, STATUS_CANCELLED);
         return;
     };
+    let state_ptr = state_guard.state;
     let state = &mut *state_guard;
     let wait_claim = take_wait_request_locked(state, request);
     if matches!(wait_claim, WaitRequestClaim::None) && queue == state.read_queue {
@@ -3000,7 +3073,7 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
     }
     drop(state_guard);
     match wait_claim {
-        WaitRequestClaim::Cancelable => cancel_claimed_wait(request),
+        WaitRequestClaim::Cancelable => cancel_claimed_wait(state_ptr, request),
         WaitRequestClaim::Completing | WaitRequestClaim::Registering => {
             acknowledge_stopped_request(request);
         }
@@ -3347,6 +3420,7 @@ fn take_wait_for_cancellation_locked(state: &mut InstanceState) -> Option<WDFREQ
         state.pending_wait_request = core::ptr::null_mut();
         state.pending_wait_interest = 0;
         state.pending_wait_cancelable = false;
+        state.completing_wait_request = request;
         return Some(request);
     }
     if !state.wait_registration_request.is_null() {
@@ -3374,6 +3448,7 @@ fn take_ready_wait_for_cancellation_locked(state: &mut InstanceState) -> Option<
     let request = state.ready_wait_request;
     state.ready_wait_request = core::ptr::null_mut();
     state.ready_wait_satisfied = 0;
+    state.completing_wait_request = request;
     Some(request)
 }
 
@@ -3389,11 +3464,13 @@ fn take_wait_request_locked(state: &mut InstanceState, request: WDFREQUEST) -> W
         state.pending_wait_request = core::ptr::null_mut();
         state.pending_wait_interest = 0;
         state.pending_wait_cancelable = false;
+        state.completing_wait_request = request;
         return WaitRequestClaim::Cancelable;
     }
     if state.ready_wait_request == request {
         state.ready_wait_request = core::ptr::null_mut();
         state.ready_wait_satisfied = 0;
+        state.completing_wait_request = request;
         return WaitRequestClaim::Cancelable;
     }
     if state.wait_registration_request == request {
@@ -3472,7 +3549,7 @@ fn complete_claimed_wait_at_passive(state: *mut InstanceState, request: WDFREQUE
     }
 }
 
-fn cancel_claimed_wait(request: WDFREQUEST) {
+fn cancel_claimed_wait(state: *mut InstanceState, request: WDFREQUEST) {
     let cancel_status =
         unsafe { call_unsafe_wdf_function_binding!(WdfRequestUnmarkCancelable, request) };
     if cancel_status == STATUS_SUCCESS {
@@ -3480,7 +3557,17 @@ fn cancel_claimed_wait(request: WDFREQUEST) {
     } else if cancel_status != STATUS_CANCELLED {
         complete_request(request, cancel_status);
     }
+    if cancel_status != STATUS_CANCELLED {
+        clear_completing_wait_request(state, request);
+    }
+}
 
+fn clear_completing_wait_request(state: *mut InstanceState, request: WDFREQUEST) {
+    if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
+        if state_guard.completing_wait_request == request {
+            state_guard.completing_wait_request = core::ptr::null_mut();
+        }
+    }
 }
 
 fn acknowledge_stopped_request(request: WDFREQUEST) {
