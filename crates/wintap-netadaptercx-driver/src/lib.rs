@@ -1640,6 +1640,8 @@ fn capture_transmit_packets(
                         Err(_) => {}
                     }
                 }
+            } else {
+                (*packet).set_Ignore(1);
             }
         }
 

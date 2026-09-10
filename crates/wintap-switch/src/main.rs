@@ -412,7 +412,7 @@ mod windows_runtime {
 
     impl AdaptiveWait {
         fn new() -> Result<Self, String> {
-            let event = unsafe { CreateEventW(null_mut(), 0, 0, std::ptr::null()) };
+            let event = unsafe { CreateEventW(null_mut(), 1, 0, std::ptr::null()) };
             if event.is_null() {
                 return Err(format!("CreateEventW failed with error {}", unsafe {
                     GetLastError()
@@ -1746,7 +1746,7 @@ mod windows_runtime {
         input: &mut Input,
         output: &mut Output,
     ) -> Result<Dword, Dword> {
-        let event = unsafe { CreateEventW(null_mut(), 0, 0, std::ptr::null()) };
+        let event = unsafe { CreateEventW(null_mut(), 1, 0, std::ptr::null()) };
         if event.is_null() {
             return Err(unsafe { GetLastError() });
         }
