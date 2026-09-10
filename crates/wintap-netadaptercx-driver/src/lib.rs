@@ -176,6 +176,7 @@ struct InstanceState {
     ready_wait_request: WDFREQUEST,
     ready_wait_satisfied: u32,
     completing_wait_request: WDFREQUEST,
+    owner_generation: u64,
     lifecycle: core::sync::atomic::AtomicU8,
 }
 
@@ -220,6 +221,7 @@ impl InstanceState {
             ready_wait_request: core::ptr::null_mut(),
             ready_wait_satisfied: 0,
             completing_wait_request: core::ptr::null_mut(),
+            owner_generation: 0,
             lifecycle: core::sync::atomic::AtomicU8::new(INSTANCE_OPEN),
         }
     }
@@ -1380,6 +1382,15 @@ fn capture_transmit_packets(
     if packet_ring.is_null() || fragment_ring.is_null() {
         return;
     }
+    let capture_generation = {
+        let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
+            return;
+        };
+        if state_guard.lifecycle.load(Ordering::Acquire) != INSTANCE_OPEN {
+            return;
+        }
+        state_guard.owner_generation
+    };
 
     let mut captured_for_legacy_read = false;
     let mut wait_completion_scheduled = false;
@@ -1576,15 +1587,19 @@ fn capture_transmit_packets(
         if copy_succeeded && offset == total_length {
             frame.set_length(total_length);
             if let Some(mut state_guard) = unsafe { InstanceStateGuard::new(state) } {
-                let adaptive = state_guard.adaptive_enabled.load(Ordering::Acquire);
-                match enqueue_existing_capture_frame_locked(&mut state_guard, frame) {
-                    Ok(wait_completion_queued) => {
-                        if !adaptive {
-                            captured_for_legacy_read = true;
+                if state_guard.lifecycle.load(Ordering::Acquire) == INSTANCE_OPEN
+                    && state_guard.owner_generation == capture_generation
+                {
+                    let adaptive = state_guard.adaptive_enabled.load(Ordering::Acquire);
+                    match enqueue_existing_capture_frame_locked(&mut state_guard, frame) {
+                        Ok(wait_completion_queued) => {
+                            if !adaptive {
+                                captured_for_legacy_read = true;
+                            }
+                            wait_completion_scheduled |= wait_completion_queued;
                         }
-                        wait_completion_scheduled |= wait_completion_queued;
+                        Err(_) => {}
                     }
-                    Err(_) => {}
                 }
             }
         }
@@ -2500,6 +2515,7 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         let (was_suspended, read_queue, adaptive, pending_wait) = {
             let state = &mut *state_guard;
             let was_suspended = state.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
+            state.owner_generation = state.owner_generation.wrapping_add(1);
             state.lifecycle.store(INSTANCE_CLOSING, Ordering::Release);
             (
                 was_suspended,
