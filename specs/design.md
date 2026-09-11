@@ -5,7 +5,8 @@
 
 **Workflow:** `/evolve`  
 **Phase:** Phase 2 — Specification Changes
-**Status:** Dynamic-bus specification changes proposed; awaiting approval
+**Status:** Direction-isolated packet-queue advancement specification changes
+proposed; awaiting approval
 **Trace source:** `specs/requirements.md`
 
 ## Design principles
@@ -284,7 +285,7 @@ When the TX packet callback is executing at `PASSIVE_LEVEL`, it may match a
 compatible pending READ IRP, retrieve the output buffer, copy the complete
 frame directly from the framework TX fragment(s), complete the request, and
 then return the framework-owned entries. The callback must release any
-adapter/state lock before calling WDF routines that may access request
+lifecycle/control or queue-local lock before calling WDF routines that may access request
 buffers or complete requests.
 
 When the callback executes above `PASSIVE_LEVEL`, it must not access a user
@@ -303,15 +304,16 @@ small, the request completes with `STATUS_BUFFER_TOO_SMALL`; the driver
 stages the frame in `capture_queue`, advances the framework ring, and leaves
 the frame available for a later compatible read.
 
-The passive READ callback and completion work item shall use the state lock
-only to transition ownership. The sequence for a queued-frame/READ pair is:
+The passive READ callback and completion work item shall use capture-queue
+synchronization only to transition ownership. The sequence for a
+queued-frame/READ pair is:
 
-1. Under the state lock, dequeue or claim one captured frame and one READ
+1. Under capture-queue synchronization, dequeue or claim one captured frame and one READ
    request, or leave both available if pairing is not possible.
-2. Release the state lock before retrieving the WDF output buffer, copying
+2. Release capture-queue synchronization before retrieving the WDF output buffer, copying
    bytes, requeueing a frame, or completing the request.
-3. If the output buffer is too small or cannot be retrieved, re-acquire the
-   state lock to requeue the still-owned frame, then complete the request
+3. If the output buffer is too small or cannot be retrieved, re-acquire
+   capture-queue synchronization to requeue the still-owned frame, then complete the request
    outside the lock with the documented error.
 
 Packet callbacks, the passive READ callback, and the work item must use the
@@ -325,7 +327,7 @@ nonpaged `capture_queue` before returning the framework-owned packet entries.
 The enqueue transition records whether the queue was empty before insertion.
 An empty-to-nonempty transition evaluates and claims a registered readable
 `WAIT_FOR_CHANGE` request; it does not access a user buffer or complete that
-request while holding the state/frame lock. This preserves the
+request while holding queue-local synchronization. This preserves the
 DISPATCH_LEVEL-safe packet callback contract while making readiness visible to
 user mode without a pending READ IRP.
 
@@ -350,8 +352,8 @@ the framework entry is returned in the same callback.
 
 The element's valid length is set only after a complete frame copy succeeds.
 On dequeue, delivery, rejection, cancellation, or queue drain, ownership
-transitions are serialized by the existing state/frame lock and the element is
-returned exactly once. Reuse must not expose bytes from a previous frame;
+transitions are serialized by the owning queue's local synchronization and the
+element is returned exactly once. Reuse must not expose bytes from a previous frame;
 the implementation shall clear the prior valid payload range before release
 or establish an equivalent non-observability guarantee.
 
@@ -370,18 +372,20 @@ The design shall maintain separate bounded queues for:
 - received Ethernet frames awaiting user reads;
 - pending overlapped reads.
 
-The state lock protects queue and ownership transitions, not WDF request
-buffer access or request completion. Any path that claims a frame or request
-under the lock shall release it before invoking WDF buffer APIs, copying to a
-user buffer, or completing the request.
+The owning queue-local lock protects frame-queue and request-ownership
+transitions, not WDF request buffer access or request completion. A path that
+claims a frame or request under the capture or injection lock shall release
+that lock before invoking WDF buffer APIs, copying to a user buffer, or
+completing the request. The lifecycle/control lock is excluded from ordinary
+queue ownership transitions.
 
 Write admission shall use a bounded counter and the bounded injection queue;
 valid writes shall not wait in a WDF manual queue.
 
 The injection and captured-frame queues each use the configured frame limit
-independently. They may share a lock when all queue operations use the same
-lock order, but they shall remain separate queue objects and their fullness,
-close, reopen, dequeue, and teardown transitions shall not affect one another.
+independently. Each has queue-local synchronization; neither queue operation
+may acquire a lock held by the other packet direction. Their fullness, close,
+reopen, dequeue, and teardown transitions shall not affect one another.
 
 The switch's pending read and write capacity is one validated positive even
 total configured value shared across both endpoints. Each endpoint receives
@@ -449,22 +453,109 @@ the satisfied mask. It is valid only after successful mode enable. The driver
 permits at most one wait request per exclusive handle. A second request fails
 explicitly and cannot cancel, replace, or steal the registered request.
 
-The state lock protects all of the following as one transaction:
+The driver shall use a nonblocking atomic wait-publication state machine
+instead of the state lock for `WAIT_FOR_CHANGE` coordination. Readability is
+true while the capture queue is nonempty. Writability is true while the
+injection queue has capacity. Each queue publishes its readiness state and a
+monotonic transition generation with release semantics after its queue-local
+transition.
 
-1. Read the requested queue conditions.
-2. Complete the operation immediately if an interested condition is already
-   satisfied.
-3. Otherwise mark the request cancellable and publish it as the one pending
-   wait before releasing the lock.
+Wait registration shall atomically claim a nonclaimable `REGISTERING` record
+before it publishes the single request slot, then publish the requested
+readiness metadata and call `WdfRequestMarkCancelableEx`. A packet-queue stop
+that precedes request-slot publication is detected by rechecking the started
+state of every direction named by the wait interest mask; a stop after slot
+publication can atomically change `REGISTERING` to teardown ownership. The
+wait shall not become claimable until marking succeeds. If `WdfRequestMarkCancelableEx`
+returns `STATUS_CANCELLED` or any other failure, WDF does not invoke the
+cancellation callback; registration removes `REGISTERING` metadata, completes
+the request with that status, and does not publish it. If cancellation runs
+while registration is in progress after successful marking, the callback
+completes the request, records its claim in the shared wait state, and
+registration retires that state without completing the request again. The
+same rule applies when teardown has already claimed the `REGISTERING` record,
+so a cancelled teardown handoff can never leave the wait state stuck and
+reject later waits as busy. If marking succeeds and registration wins the
+publish transition, it publishes a record containing its interest mask and the
+observed generations, then re-reads readiness. It claims immediately if an
+interested condition was already or becomes satisfied; otherwise it remains
+published.
 
-Readability is true while the capture queue is nonempty. Writability is true
-while the injection queue has capacity. A frame enqueue that observes an
-empty capture queue and a frame dequeue that observes a full injection queue
-evaluate the matching registered wait under the state lock. They claim the
-request and clear the pending-wait state under the lock, then unmark and
-complete it outside the lock. A cancellation callback uses the same lock to
-either remove the still-published request or observe that a queue transition
-already claimed it; exactly one path completes the request.
+The wait record is a single atomic word holding the claim state, the satisfied
+readiness mask, and a monotonic registration sequence. Publishing a
+`REGISTERING` record advances the sequence and clears the mask in one store,
+and retiring a record advances it again. Every state transition is a
+compare-exchange on the whole word, so:
+
+- a claim publishes its readiness bits and its `SCHEDULED` transition
+  indivisibly, and the passive worker reads the mask from the very word whose
+  transition it won;
+- a claim that stalled across a retirement observes a different sequence, so
+  its compare-exchange fails and its readiness bits can neither leak into a
+  later registration nor schedule one;
+- concurrent transitions accumulate into the same record: the first moves it
+  to `SCHEDULED` and enqueues the worker, and a later one only ORs its bits in
+  without enqueueing again.
+
+A readable or writable transition may atomically change the published record
+from `PENDING` to `SCHEDULED` and enqueue the passive worker. That atomic
+claim and the work-item enqueue are the only wait operations permitted in a
+packet-queue advance callback: it shall not acquire a wait lock, call
+`WdfRequestUnmarkCancelable`, or complete a request. Cancellation and teardown
+use the same single-winner atomic claim; teardown may also claim a `SCHEDULED`
+record. A claimant that takes terminal ownership moves the record to
+`UNMARKING`, calls `WdfRequestUnmarkCancelable`, and:
+
+- on `STATUS_SUCCESS`, retires the wait and then completes the request;
+- on `STATUS_CANCELLED`, publishes an `UNMARK_CANCELLED` handoff. If the
+  cancellation callback had already published `CANCEL_ARRIVED`, this claimant
+  retires the wait and completes the request; otherwise the record stays
+  published and the cancellation callback resolves and completes it. Because
+  the cancellation callback never completes a request while a claimant is
+  unmarking, `WdfRequestUnmarkCancelable` is never called on a completed
+  request;
+- on any other status, retires the wait and completes the request with that
+  status, because the cancellation callback will not run and would otherwise
+  leave the record permanently claimed.
+
+Retirement before completion is the general rule: as soon as terminal
+ownership is resolved, the owning path clears the wait state and the published
+request slot before calling `WdfRequestComplete`, so a handle the framework
+recycles after completion can never match the slot. The two paths whose
+ownership is still unresolved — the `STATUS_CANCELLED` unmark handoff and a
+cancellation that observes a `REGISTERING` or teardown-claimed record — leave
+the record published for the path that still owes resolution and must not be
+reordered.
+
+The WDF cancellation callback removes or observes the claim through the same
+atomic state and participates in exactly one completion. All completion occurs
+outside queue and lifecycle locks. A losing path observes the terminal claim
+and does not complete the request. The registration record remains valid until
+the mark/publish race and any cancellation callback have reached a terminal
+outcome. This protocol prevents a readiness change between the initial
+observation and publication from being lost without requiring RX and TX queue
+advances to acquire a common lock.
+
+The control request queue is created with queue-level automatic
+synchronization and passive execution, so the framework serializes its request
+handlers with `EvtIoStop`. `EvtIoStop` therefore never observes a control
+request that the dispatch callback still owns, and it never observes the
+pre-publication or `REGISTERING` windows. For the published wait it performs
+the same single-winner atomic claim as any other teardown path:
+
+- if the claim wins, it holds exclusive ownership, unmarks, and completes the
+  request, which satisfies the stop;
+- if the claim loses to the cancellation callback or the passive completion
+  worker, that owner is free to be manipulating the handle concurrently.
+  `EvtIoStop` takes no action at all — neither `WdfRequestStopAcknowledge` nor
+  completion — because the framework treats the owner's bounded completion as
+  satisfying the stop.
+
+Because a callback holding the queue synchronization lock can be waited on by
+a path that completes a request on the same queue, no such callback may block
+on a driver lock a stop, power, owner-cleanup, or removal path can hold. The
+adaptive-enable handler therefore acquires the direct-read serialization lock
+without blocking and reports `STATUS_DEVICE_BUSY` when it is unavailable.
 
 When adaptive-polling mode is enabled, an empty READ completes with
 `STATUS_NO_MORE_ENTRIES`; it is never placed on the manual read queue. An
@@ -475,7 +566,12 @@ which prevents a lost wakeup between polling and blocking.
 
 Owner close, file cleanup, D0 exit, adapter stop, surprise removal, queue
 closure, and release hardware first prevent a new wait from being published,
-then claim/cancel the published wait through the same state-lock protocol.
+then claim/cancel the published wait through the atomic wait-publication
+protocol. Owner close additionally retires the owner generation, closes
+packet-callback admission, and drains the direction-specific callback leases
+before it clears or reopens the frame queues, so an in-flight packet callback
+can neither indicate nor requeue a retired owner's frame into the next owner's
+queues.
 They purge legacy manual READ requests only for legacy mode. Adaptive-mode
 teardown neither leaves a wait request published nor resumes a manual queue
 for an adaptive READ.
@@ -488,10 +584,58 @@ ring-capacity and cancellation boundary.
 
 ## Synchronization
 
-- A per-adapter lock shall protect adapter state, ownership state, queue
-  membership, and transitions between `OPEN`, `CLOSING`, and `CLOSED`.
-- Queue operations shall use one consistent lock ordering; the adapter state
-  lock must not be reacquired from a completion path that already owns it.
+- A per-adapter lifecycle/control lock shall protect control-handle state,
+  owner generation, receive-filter state, and transitions between `OPEN`,
+  `CLOSING`, and `CLOSED`. It shall not protect packet-ring traversal or
+  ordinary directional frame-queue operations.
+- Injection and capture queues shall have independent queue-local locks.
+  RX advance may acquire only injection-queue synchronization and TX advance
+  may acquire only capture-queue synchronization. Neither advance callback
+  may acquire the lifecycle/control lock or a shared adaptive-wait lock while
+  processing packet rings.
+- Queue identity, ring collection, fragment extension, immutable frame limit,
+  and frame-pool identity shall be published before the corresponding queue
+  starts. They remain immutable until the framework has stopped and quiesced
+  that queue. Release hardware shall invalidate them only after all callbacks
+  are quiescent; if this cannot be proven from the callback contract, a
+  lock-free callback lease shall prevent invalidation until all leases drain.
+- Each datapath direction shall have its own callback-lifetime lease word that
+  packs per-scope admission closers with the outstanding lease count, so
+  admission closure and lease acquisition are one atomic operation and no
+  callback can be admitted after admission closes. Lease acquisition shall
+  never block and is therefore safe at DISPATCH_LEVEL. Owner cleanup, D0 exit,
+  and release hardware shall close admission for both directions, wait at
+  `PASSIVE_LEVEL` for both lease counts to drain while holding no lock that a
+  leased callback can wait on, and only then clear, reopen, or invalidate queue
+  state. During hardware preparation, the hardware closer may be released
+  before NetAdapterCx creates replacement queues only while lifecycle remains
+  non-`OPEN`; any admitted callback returns without touching queue state, and
+  each queue context is fully published before that queue can invoke its
+  callback.
+- Quiescence shall nest. Owner cleanup, power transition, and hardware
+  transition each own a distinct closer bit of the lease word, so a scope
+  readmits only its own closure and callbacks stay denied while any other
+  scope is quiesced. Owner cleanup releases its closer through a scope guard so
+  an early return cannot strand admission closed, and releasing it cannot
+  readmit callbacks while D0 exit or release hardware is still quiesced. The
+  power closer is set by D0 exit and released by D0 entry; the hardware closer
+  is held from device creation until prepare hardware, and thereafter is set by
+  release hardware and released by prepare hardware. Because each scope owns a
+  distinct bit, unbalanced or repeated readmission cannot underflow a count or
+  readmit another scope.
+- A leased callback observes the owner generation and lifecycle state under
+  its lease, so the ownership check and the subsequent enqueue or requeue are
+  atomic with respect to owner cleanup. A frame that fails that check belongs
+  to a retired owner and is released rather than requeued.
+- Passive READ delivery and capture-drain work hold the capture-direction
+  lease from the lifecycle/owner snapshot through dequeue, WDF buffer
+  delivery, and any requeue. Owner cleanup reopens queues first, then changes
+  lifecycle from an owner-specific closing state to `OPEN` with a
+  compare-exchange. Cleanup claims that state only from `OPEN`, so a power or
+  hardware transition that started before or during cleanup retains lifecycle
+  ownership and prevents cleanup from resuming the manual queue.
+- Adaptive wait publication and claiming shall use the atomic state machine
+  above. It shall not impose a shared lock acquisition on packet advancement.
 - Cancellation shall atomically remove a request from its queue or mark it for
   completion by the owning worker.
 - Adapter and frame objects shall use reference counting or an equivalent
@@ -504,6 +648,13 @@ ring-capacity and cancellation boundary.
 - Adapter teardown shall also wait for direct passive-level READ delivery and
   passive capture-drain work before releasing pending requests, capture
   frames, or packet-ring state.
+- Direct passive-level TX delivery shall acquire the direct-read serialization
+  lock without blocking. A packet-queue advance callback that cannot acquire
+  it immediately falls back to bounded nonpaged capture, so no packet callback
+  ever waits on a lock that owner cleanup, D0 exit, or release hardware holds.
+- No callback that runs under the control queue's automatic synchronization
+  lock may block on a driver lock that a path completing a control request can
+  hold, because such a completion needs the same queue lock.
 
 ## IRQL and pageability
 
