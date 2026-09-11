@@ -372,20 +372,15 @@ The design shall maintain separate bounded queues for:
 - received Ethernet frames awaiting user reads;
 - pending overlapped reads.
 
-The state lock protects queue and ownership transitions, not WDF request
-buffer access or request completion. Any path that claims a frame or request
-under the lock shall release it before invoking WDF buffer APIs, copying to a
-user buffer, or completing the request.
+The owning queue-local lock protects frame-queue and request-ownership
+transitions, not WDF request buffer access or request completion. A path that
+claims a frame or request under the capture or injection lock shall release
+that lock before invoking WDF buffer APIs, copying to a user buffer, or
+completing the request. The lifecycle/control lock is excluded from ordinary
+queue ownership transitions.
 
 Write admission shall use a bounded counter and the bounded injection queue;
 valid writes shall not wait in a WDF manual queue.
-
-For REQ-050, "state lock" in the preceding ownership-transition rule is
-superseded by the owning queue-local lock: the capture queue's lock for
-captured-frame and READ pairing, and the injection queue's lock for injection
-transitions. The lifecycle/control lock remains excluded from ordinary queue
-ownership transitions. The release-before-completion rule is unchanged and
-applies to the queue-local lock.
 
 The injection and captured-frame queues each use the configured frame limit
 independently. Each has queue-local synchronization; neither queue operation
@@ -465,12 +460,13 @@ injection queue has capacity. Each queue publishes its readiness state and a
 monotonic transition generation with release semantics after its queue-local
 transition.
 
-Wait registration shall claim a single request slot before it publishes any
-wait state, so cancellation, teardown, and queue-stop handling can identify
-the published wait by its request handle. Registration shall then read the
-requested readiness state, publish stable `REGISTERING` cancellation metadata,
-and call `WdfRequestMarkCancelableEx`. The wait shall
-not become claimable until marking succeeds. If `WdfRequestMarkCancelableEx`
+Wait registration shall atomically claim a nonclaimable `REGISTERING` record
+before it publishes the single request slot, then publish the requested
+readiness metadata and call `WdfRequestMarkCancelableEx`. A packet-queue stop
+that precedes request-slot publication is detected by rechecking the started
+state of every direction named by the wait interest mask; a stop after slot
+publication can atomically change `REGISTERING` to teardown ownership. The
+wait shall not become claimable until marking succeeds. If `WdfRequestMarkCancelableEx`
 returns `STATUS_CANCELLED` or any other failure, WDF does not invoke the
 cancellation callback; registration removes `REGISTERING` metadata, completes
 the request with that status, and does not publish it. If cancellation runs

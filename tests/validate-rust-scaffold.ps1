@@ -44,8 +44,9 @@ Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" 'WAIT_RECORD_SEQUENCE
 Assert-NotText "crates\wintap-netadaptercx-driver\src\lib.rs" 'wait_ready_satisfied' "The satisfied mask must not live in a word separate from the wait state."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" 'wait_request:\s*AtomicPtr<c_void>' "Adaptive waits must publish exactly one request slot."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" 'wait_cancel_handoff:\s*AtomicU8' "Adaptive wait cancellation must use an exact-once handoff word."
-Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" 'WdfRequestMarkCancelableEx' "Adaptive waits must mark requests before publication."
+Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)fn handle_wait_for_change.*?WdfRequestMarkCancelableEx.*?transition_wait_record\(state, WAIT_REGISTERING, WAIT_PENDING\)' "Adaptive waits must be marked cancelable before becoming transition-claimable."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" 'WdfRequestUnmarkCancelable' "Adaptive wait claimants must unmark requests."
+Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)fn handle_wait_for_change.*?begin_wait_record\(state\).*?wait_request\.compare_exchange.*?wait_interest_queues_started\(state, wait\.interest\).*?WdfRequestMarkCancelableEx' "Wait registration must claim REGISTERING before slot publication and recheck requested queue directions before marking."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)if status == STATUS_CANCELLED \{\s*// MarkCancelableEx does not invoke.*?finish_wait\(state\);\s*complete_request\(request, STATUS_CANCELLED\);' "Mark-time cancellation must be completed by registration."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)extern "C" fn evt_file_cleanup.*?DatapathQuiesceGuard::acquire\(state, DATAPATH_CLOSED_OWNER\);.*?clear_frame_queues\(state\);' "Owner cleanup must drain packet-callback leases under its own closer before clearing frame queues."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)extern "C" fn evt_file_cleanup.*?compare_exchange\(\s*INSTANCE_OPEN,\s*INSTANCE_OWNER_CLOSING,.*?reopen_frame_queues\(state\);.*?compare_exchange\(\s*INSTANCE_OWNER_CLOSING,\s*INSTANCE_OPEN,.*?if resumed \{.*?resume_manual_queue\(read_queue\);' "Owner cleanup must claim and revalidate an owner-specific lifecycle state before publishing OPEN and resuming the manual queue."
@@ -66,13 +67,16 @@ $advance = [regex]::Match(
 if (-not $advance.Success -or $advance.Value -match 'InstanceStateGuard|WdfSpinLockAcquire|WdfWaitLockAcquire') {
     throw "Packet queue advance must not acquire the shared lifecycle lock."
 }
-if ([regex]::Matches($advance.Value, 'acquire_(capture|receive)_lease\(state\)').Count -lt 2) {
-    throw "Both packet queue advance directions must take a callback-lifetime lease."
+if ($advance.Value -notmatch 'acquire_capture_lease\(state\)') {
+    throw "TX packet queue advance must take a capture callback-lifetime lease."
+}
+if ($advance.Value -notmatch 'acquire_receive_lease\(state\)') {
+    throw "RX packet queue advance must take a receive callback-lifetime lease."
 }
 
 $claim = [regex]::Match(
     $driverSource,
-    'fn claim_wait_for_passive_completion(?s:.*?)\n/// Retires the wait record'
+    'fn claim_wait_for_passive_completion(?s:.*?)\nfn finish_wait'
 )
 if (-not $claim.Success -or $claim.Value -match 'WdfRequestUnmarkCancelable|WdfRequestComplete|WdfSpinLockAcquire|WdfWaitLockAcquire') {
     throw "Adaptive wait claiming from packet queue advance must only make an atomic claim and schedule passive work."
@@ -80,6 +84,10 @@ if (-not $claim.Success -or $claim.Value -match 'WdfRequestUnmarkCancelable|WdfR
 if ($claim.Value -notmatch 'wait_record_satisfied\(observed\) \| satisfied,\s*\r?\n\s*WAIT_SCHEDULED,') {
     throw "A wait claim must publish its satisfied mask in the same atomic word as the WAIT_SCHEDULED transition."
 }
+Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)extern "C" fn evt_packet_queue_stop.*?tx_queue_started\.store\(false, Ordering::SeqCst\).*?cancel_wait_for_teardown\(state\)' "TX queue stop must order its stopped state before scanning wait registration."
+Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)extern "C" fn evt_packet_queue_stop.*?rx_queue_started\.store\(false, Ordering::SeqCst\).*?cancel_wait_for_teardown\(state\)' "RX queue stop must order its stopped state before scanning wait registration."
+Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)fn wait_interest_queues_started.*?tx_queue_started\.load\(Ordering::SeqCst\).*?rx_queue_started\.load\(Ordering::SeqCst\)' "Wait registration must observe packet-queue stop through sequentially consistent direction checks."
+Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)fn cancel_wait_request_for_teardown.*?WAIT_REGISTERING => \{.*?transition_wait_record\(state, WAIT_REGISTERING, WAIT_TEARDOWN\)' "Teardown must claim REGISTERING even before request-slot publication."
 
 $finish = [regex]::Match($driverSource, 'fn finish_wait\(state: \*mut InstanceState\)(?s:.*?)\n\}')
 if (-not $finish.Success -or $finish.Value -notmatch 'wait_record_sequence\(observed\) \+ 1') {

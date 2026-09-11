@@ -484,21 +484,30 @@ fn transition_wait_record(state: *mut InstanceState, from: u8, to: u8) -> Result
     }
 }
 
-/// Publishes a fresh `WAIT_REGISTERING` record.
+/// Claims and publishes a fresh `WAIT_REGISTERING` record.
 ///
 /// The registration sequence advances and the satisfied mask is cleared in the
 /// same store, so a queue transition that observed the previous record can
 /// neither contribute readiness bits to this one nor schedule it.
-fn begin_wait_record(state: *mut InstanceState) {
+fn begin_wait_record(state: *mut InstanceState) -> bool {
     if state.is_null() {
-        return;
+        return false;
     }
     let record = unsafe { &(*state).wait_state };
-    let observed = record.load(Ordering::SeqCst);
-    record.store(
-        wait_record_word(wait_record_sequence(observed) + 1, 0, WAIT_REGISTERING),
-        Ordering::SeqCst,
-    );
+    loop {
+        let observed = record.load(Ordering::SeqCst);
+        if wait_record_state(observed) != WAIT_FREE {
+            return false;
+        }
+        let registering =
+            wait_record_word(wait_record_sequence(observed) + 1, 0, WAIT_REGISTERING);
+        if record
+            .compare_exchange_weak(observed, registering, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+    }
 }
 
 impl InstanceState {
@@ -1525,10 +1534,10 @@ extern "C" fn evt_packet_queue_stop(queue: netadaptercx_sys::NETPACKETQUEUE) {
         return;
     }
     if unsafe { (*context).is_transmit } {
-        unsafe { (*state).tx_queue_started.store(false, Ordering::Release) };
+        unsafe { (*state).tx_queue_started.store(false, Ordering::SeqCst) };
     } else {
         unsafe {
-            (*state).rx_queue_started.store(false, Ordering::Release);
+            (*state).rx_queue_started.store(false, Ordering::SeqCst);
             (*state)
                 .rx_notification_armed
                 .store(false, Ordering::Release);
@@ -3182,7 +3191,7 @@ fn handle_wait_for_change(
     }
 
     if unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN
-        || !unsafe { (*state).rx_queue_started.load(Ordering::Acquire) }
+        || !wait_interest_queues_started(state, wait.interest)
     {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
@@ -3191,11 +3200,14 @@ fn handle_wait_for_change(
         complete_request(request, STATUS_INVALID_DEVICE_REQUEST);
         return;
     }
-    // Admit exactly one wait per exclusive handle by claiming the single
-    // request slot. The control queue is queue-synchronized, so EvtIoStop
-    // cannot run while this dispatch owns the request; the slot exists so that
-    // cancellation and teardown identify the published wait, and it is released
-    // only after the wait record has been retired.
+    // Claim a nonclaimable registration record before publishing the request
+    // slot. Packet-queue stop may run concurrently with this control dispatch;
+    // if it runs before the slot is visible, the queue-started recheck below
+    // detects it, and if it runs afterwards it can claim REGISTERING.
+    if !begin_wait_record(state) {
+        complete_request(request, STATUS_DEVICE_BUSY);
+        return;
+    }
     if unsafe {
         (*state).wait_request.compare_exchange(
             core::ptr::null_mut(),
@@ -3206,6 +3218,7 @@ fn handle_wait_for_change(
     }
     .is_err()
     {
+        finish_wait(state);
         complete_request(request, STATUS_DEVICE_BUSY);
         return;
     }
@@ -3224,14 +3237,12 @@ fn handle_wait_for_change(
             .wait_cancel_handoff
             .store(WAIT_HANDOFF_NONE, Ordering::Release);
     }
-    // Publishing the record advances its sequence and clears the satisfied
-    // mask, so no readiness bit from a previous wait can survive into this one.
-    begin_wait_record(state);
-    // Recheck after publishing REGISTERING so teardown either observes and
-    // claims this registration or this path retires it before marking.
+    // Recheck after publishing the request slot so packet-queue stop either
+    // observes and claims this registration or this path retires it before
+    // marking. Each requested direction must still be running.
     if unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN
         || !unsafe { (*state).adaptive_enabled.load(Ordering::Acquire) }
-        || !unsafe { (*state).rx_queue_started.load(Ordering::Acquire) }
+        || !wait_interest_queues_started(state, wait.interest)
     {
         finish_wait(state);
         complete_request(request, STATUS_CANCELLED);
@@ -3830,11 +3841,22 @@ fn readiness_snapshot(state: *mut InstanceState) -> (u32, u64, u64) {
     (ready, capture_generation, injection_generation)
 }
 
+fn wait_interest_queues_started(state: *mut InstanceState, interest: u32) -> bool {
+    if state.is_null() {
+        return false;
+    }
+    let readable_started = interest & ADAPTIVE_INTEREST_READABLE == 0
+        || unsafe { (*state).tx_queue_started.load(Ordering::SeqCst) };
+    let writable_started = interest & ADAPTIVE_INTEREST_WRITABLE == 0
+        || unsafe { (*state).rx_queue_started.load(Ordering::SeqCst) };
+    readable_started && writable_started
+}
+
 /// Reads the single published adaptive-wait request slot.
 ///
-/// The slot is claimed by registration before any wait state becomes visible
-/// and is released only after the wait reaches a terminal outcome, so a
-/// nonnull match identifies the request that the wait protocol owns.
+/// The slot is published only after registration claims the nonclaimable
+/// `WAIT_REGISTERING` state and is released before that state returns to
+/// `WAIT_FREE`, so a nonnull match identifies the request the protocol owns.
 fn wait_request_slot(state: *mut InstanceState) -> WDFREQUEST {
     if state.is_null() {
         return core::ptr::null_mut();
@@ -3910,8 +3932,8 @@ fn claim_wait_for_passive_completion(
     }
 }
 
-/// Retires the wait record and releases the registration slot last so the next
-/// registration can only be admitted after every field is reset.
+/// Retires the registration slot and wait record so the next registration can
+/// only be admitted after the old request is no longer published.
 fn finish_wait(state: *mut InstanceState) {
     if state.is_null() {
         return;
@@ -3927,6 +3949,9 @@ fn finish_wait(state: *mut InstanceState) {
         (*state)
             .wait_cancel_handoff
             .store(WAIT_HANDOFF_NONE, Ordering::Release);
+        (*state)
+            .wait_request
+            .store(core::ptr::null_mut(), Ordering::SeqCst);
         let record = &(*state).wait_state;
         let observed = record.load(Ordering::SeqCst);
         // Advancing the sequence while clearing the state and satisfied mask
@@ -3935,9 +3960,6 @@ fn finish_wait(state: *mut InstanceState) {
             wait_record_word(wait_record_sequence(observed) + 1, 0, WAIT_FREE),
             Ordering::SeqCst,
         );
-        (*state)
-            .wait_request
-            .store(core::ptr::null_mut(), Ordering::SeqCst);
     }
 }
 
@@ -4008,12 +4030,12 @@ fn cancel_wait_request_for_teardown(
     }
     loop {
         let observed = wait_record_state(load_wait_record(state));
-        let published = wait_request_slot(state);
-        if published.is_null() || (!expected_request.is_null() && published != expected_request) {
-            return false;
-        }
         match observed {
             WAIT_REGISTERING => {
+                let published = wait_request_slot(state);
+                if !expected_request.is_null() && published != expected_request {
+                    return false;
+                }
                 if transition_wait_record(state, WAIT_REGISTERING, WAIT_TEARDOWN).is_ok() {
                     // Registration has not finished marking the request, so it
                     // retains the unmark handshake and terminal completion.
@@ -4021,6 +4043,12 @@ fn cancel_wait_request_for_teardown(
                 }
             }
             WAIT_PENDING | WAIT_SCHEDULED => {
+                let published = wait_request_slot(state);
+                if published.is_null()
+                    || (!expected_request.is_null() && published != expected_request)
+                {
+                    return false;
+                }
                 if transition_wait_record(state, observed, WAIT_UNMARKING).is_ok() {
                     // Re-read the slot only after winning the transition. The
                     // pre-check above is advisory; the wait record could have
@@ -4146,8 +4174,9 @@ fn complete_scheduled_wait_at_passive(
         complete_request(request, STATUS_CANCELLED);
         return;
     }
+    let interest = unsafe { (*state).wait_interest.load(Ordering::Acquire) };
     let cancelled = unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN
-        || !unsafe { (*state).rx_queue_started.load(Ordering::Acquire) };
+        || !wait_interest_queues_started(state, interest);
     if cancelled {
         unmark_and_complete_wait(state, request, STATUS_CANCELLED, 0);
     } else {

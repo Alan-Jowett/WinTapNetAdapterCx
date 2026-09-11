@@ -1201,9 +1201,13 @@ or complete, a request that another path can manipulate concurrently. It shall
 complete only a request for which its atomic claim took exclusive terminal
 ownership; when the claim is lost to the cancellation or passive-completion
 path, it shall take no action and rely on that owner's bounded completion to
-release the power transition. Because the queue is serialized, a queue stop
-cannot observe the window before a wait registration publishes its wait state
-or the `REGISTERING` window.
+release the power transition. Because the control queue is serialized,
+`EvtIoStop` cannot observe the window before a wait registration publishes
+its wait state or the `REGISTERING` window. Packet-queue stop may run
+concurrently; registration shall publish a nonclaimable `REGISTERING` record
+before its request slot and recheck every queue direction named by the
+interest mask after slot publication, so a stop before or during registration
+prevents a wait from becoming pending.
 
 Stop, cancel, D0 exit, owner cleanup, surprise removal, and release hardware
 shall prevent new datapath entry, reach the verified framework quiescence
@@ -1332,8 +1336,8 @@ owner's queues.
     completion, and TX ring entries are not held indefinitely waiting for a
     read.
 25. **Resolved:** Passive READ delivery claims frame/request ownership under
-    the state lock but performs WDF buffer access, copying, requeue, and
-    request completion only after releasing that lock.
+    the owning capture-queue lock but performs WDF buffer access, copying,
+    requeue, and request completion only after releasing that lock.
 26. **Resolved:** Driver-owned frames use OS-provided nonpaged lookaside
     storage with one full-size frame payload per element; the OS manages
     lookaside caching/capacity and existing directional queues remain the
