@@ -48,8 +48,11 @@ Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" 'WdfRequestMarkCancel
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" 'WdfRequestUnmarkCancelable' "Adaptive wait claimants must unmark requests."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)if status == STATUS_CANCELLED \{\s*// MarkCancelableEx does not invoke.*?finish_wait\(state\);\s*complete_request\(request, STATUS_CANCELLED\);' "Mark-time cancellation must be completed by registration."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)extern "C" fn evt_file_cleanup.*?DatapathQuiesceGuard::acquire\(state, DATAPATH_CLOSED_OWNER\);.*?clear_frame_queues\(state\);' "Owner cleanup must drain packet-callback leases under its own closer before clearing frame queues."
+Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)extern "C" fn evt_file_cleanup.*?compare_exchange\(\s*INSTANCE_OPEN,\s*INSTANCE_OWNER_CLOSING,.*?reopen_frame_queues\(state\);.*?compare_exchange\(\s*INSTANCE_OWNER_CLOSING,\s*INSTANCE_OPEN,.*?if resumed \{.*?resume_manual_queue\(read_queue\);' "Owner cleanup must claim and revalidate an owner-specific lifecycle state before publishing OPEN and resuming the manual queue."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)fn evt_device_d0_exit.*?quiesce_datapath_callbacks\(state, DATAPATH_CLOSED_POWER\)' "D0 exit must quiesce packet callbacks under the power closer."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)fn evt_device_release_hardware.*?quiesce_datapath_callbacks\(state, DATAPATH_CLOSED_HARDWARE\)' "Release hardware must quiesce packet callbacks under the hardware closer."
+Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)extern "C" fn evt_io_read.*?acquire_capture_lease\(state\).*?owner_generation\.load\(Ordering::Acquire\).*?dequeue_capture_frame\(state\)' "Passive READ delivery must hold the capture lease across its owner snapshot and dequeue."
+Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)extern "C" fn evt_read_completion_work_item.*?acquire_capture_lease\(state\).*?owner_generation\.load\(Ordering::Acquire\).*?WdfIoQueueRetrieveNextRequest.*?dequeue_capture_frame\(state\)' "Passive capture-drain work must hold the capture lease across its owner snapshot, dequeue, and delivery."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)fn requeue_capture_frame_and_schedule_wait.*?acquire_capture_lease\(state\)' "Capture requeue must revalidate ownership under a callback-lifetime lease."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)fn deliver_transmit_packet_to_read.*?LegacyDirectReadGuard::try_acquire\(state\)' "Direct TX delivery must not block a packet callback on the legacy read lock."
 Assert-Text "crates\wintap-netadaptercx-driver\src\lib.rs" '(?s)let mut control_queue_attributes = WDF_OBJECT_ATTRIBUTES \{.*?WdfExecutionLevelPassive,.*?WdfSynchronizationScopeQueue,' "The control queue must serialize its request handlers with EvtIoStop at PASSIVE_LEVEL."
@@ -86,6 +89,9 @@ if (-not $finish.Success -or $finish.Value -notmatch 'wait_record_sequence\(obse
 $stop = [regex]::Match($driverSource, 'extern "C" fn evt_io_stop(?s:.*?)\nfn forward_request')
 if (-not $stop.Success -or $stop.Value -notmatch 'cancel_wait_request_for_teardown\(state, request\)') {
     throw "EvtIoStop must claim only the wait request it was given."
+}
+if ($stop.Value -match 'WdfRequestStopAcknowledge|acknowledge_stopped_request') {
+    throw "EvtIoStop must not acknowledge a control request that a terminal owner can still be completing."
 }
 $stopWaitBranch = [regex]::Match(
     $stop.Value,

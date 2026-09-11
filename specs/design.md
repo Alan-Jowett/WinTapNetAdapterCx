@@ -611,8 +611,11 @@ ring-capacity and cancellation boundary.
   and release hardware shall close admission for both directions, wait at
   `PASSIVE_LEVEL` for both lease counts to drain while holding no lock that a
   leased callback can wait on, and only then clear, reopen, or invalidate queue
-  state. Admission is reopened only after the next owner's queues are
-  published.
+  state. During hardware preparation, the hardware closer may be released
+  before NetAdapterCx creates replacement queues only while lifecycle remains
+  non-`OPEN`; any admitted callback returns without touching queue state, and
+  each queue context is fully published before that queue can invoke its
+  callback.
 - Quiescence shall nest. Owner cleanup, power transition, and hardware
   transition each own a distinct closer bit of the lease word, so a scope
   readmits only its own closure and callbacks stay denied while any other
@@ -628,6 +631,13 @@ ring-capacity and cancellation boundary.
   its lease, so the ownership check and the subsequent enqueue or requeue are
   atomic with respect to owner cleanup. A frame that fails that check belongs
   to a retired owner and is released rather than requeued.
+- Passive READ delivery and capture-drain work hold the capture-direction
+  lease from the lifecycle/owner snapshot through dequeue, WDF buffer
+  delivery, and any requeue. Owner cleanup reopens queues first, then changes
+  lifecycle from an owner-specific closing state to `OPEN` with a
+  compare-exchange. Cleanup claims that state only from `OPEN`, so a power or
+  hardware transition that started before or during cleanup retains lifecycle
+  ownership and prevents cleanup from resuming the manual queue.
 - Adaptive wait publication and claiming shall use the atomic state machine
   above. It shall not impose a shared lock acquisition on packet advancement.
 - Cancellation shall atomically remove a request from its queue or mark it for

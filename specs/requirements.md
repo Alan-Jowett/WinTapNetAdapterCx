@@ -1224,7 +1224,14 @@ hardware remains quiesced. A scope's readmission shall not underflow or
 readmit a scope that never closed admission, and a scope that returns early
 shall still release only its own closure. A frame captured or dequeued under a
 lease belongs to the owner observed under that lease and shall never be
-enqueued or requeued into a later owner's queue.
+delivered, enqueued, or requeued after that owner is retired or into a later
+owner's queue. Passive READ delivery and capture-drain work shall hold the
+capture-direction lease from the owner/lifecycle snapshot through dequeue,
+buffer delivery, and any requeue. Owner cleanup shall reopen the lifecycle
+only by atomically claiming and later confirming an owner-specific closing
+state after reopening the queues; an existing or concurrent power or hardware
+transition shall prevent owner cleanup from publishing `OPEN` or resuming the
+manual queue.
 
 **Trace:** UI-025, UI-026; issue #19; REQ-003, REQ-006, REQ-016, REQ-021,
 REQ-024, REQ-025, REQ-047, and REQ-049.

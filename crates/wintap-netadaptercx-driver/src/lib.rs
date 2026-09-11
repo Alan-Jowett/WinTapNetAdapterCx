@@ -117,6 +117,7 @@ const INSTANCE_OPEN: u8 = 0;
 const INSTANCE_SUSPENDED: u8 = 1;
 const INSTANCE_CLOSING: u8 = 2;
 const INSTANCE_CLOSED: u8 = 3;
+const INSTANCE_OWNER_CLOSING: u8 = 4;
 /// No wait is registered; the request slot is free.
 const WAIT_FREE: u8 = 0;
 /// The dispatch path owns the request and has not marked it cancelable yet.
@@ -2911,16 +2912,20 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
     if let Some(state) = unsafe { instance_from_device(device) } {
         // Retire the owner before quiescing so a leased packet callback either
         // observes the retired owner or has already finished.
-        let was_suspended = {
+        let owns_lifecycle = {
             let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
                 return;
             };
-            let was_suspended = state_guard.lifecycle.load(Ordering::Acquire) == INSTANCE_SUSPENDED;
             state_guard.owner_generation.fetch_add(1, Ordering::AcqRel);
             state_guard
                 .lifecycle
-                .store(INSTANCE_CLOSING, Ordering::Release);
-            was_suspended
+                .compare_exchange(
+                    INSTANCE_OPEN,
+                    INSTANCE_OWNER_CLOSING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
         };
         // Close packet-callback admission and drain outstanding leases while
         // holding no lock that a leased callback can wait on. The owner closer
@@ -2953,9 +2958,9 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
         let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
             return;
         };
-        let should_resume = state_guard.lifecycle.load(Ordering::Acquire) == INSTANCE_CLOSING
-            && !state_guard.adapter.is_null()
-            && !was_suspended;
+        let should_resume = owns_lifecycle
+            && state_guard.lifecycle.load(Ordering::Acquire) == INSTANCE_OWNER_CLOSING
+            && !state_guard.adapter.is_null();
         state_guard.pending_reads.store(0, Ordering::Release);
         state_guard.pending_writes.store(0, Ordering::Release);
         state_guard.adaptive_enabled.store(false, Ordering::Release);
@@ -2966,15 +2971,23 @@ extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
             let Some(state_guard) = (unsafe { InstanceStateGuard::new(state) }) else {
                 return;
             };
-            state_guard
+            let resumed = state_guard
                 .lifecycle
-                .store(INSTANCE_OPEN, Ordering::Release);
+                .compare_exchange(
+                    INSTANCE_OWNER_CLOSING,
+                    INSTANCE_OPEN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
             drop(state_guard);
-            // Packet callbacks may only be readmitted after the next owner's
-            // queues are open again.
-            drop(owner_quiesce);
-            // A reopened manual queue belongs to a future legacy owner, never to this adaptive owner.
-            resume_manual_queue(read_queue);
+            if resumed {
+                // Packet callbacks may only be readmitted after the next owner's
+                // queues are open again.
+                drop(owner_quiesce);
+                // A reopened manual queue belongs to a future legacy owner, never to this adaptive owner.
+                resume_manual_queue(read_queue);
+            }
         }
         // When this owner did not reopen the queues, the power or hardware
         // closer held by D0 exit or release hardware keeps admission closed
@@ -3302,12 +3315,16 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     };
+    let Some(_capture_lease) = acquire_capture_lease(state) else {
+        complete_request(request, STATUS_DEVICE_NOT_READY);
+        return;
+    };
     if unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN {
         complete_request(request, STATUS_DEVICE_NOT_READY);
         return;
     }
+    let owner_generation = unsafe { (*state).owner_generation.load(Ordering::Acquire) };
     if unsafe { (*state).adaptive_enabled.load(Ordering::Acquire) } {
-        let owner_generation = unsafe { (*state).owner_generation.load(Ordering::Acquire) };
         let frame = dequeue_capture_frame(state);
         if let Some(frame) = frame {
             let status = complete_captured_frame_to_read(request, &frame);
@@ -3326,7 +3343,6 @@ extern "C" fn evt_io_read(_queue: WDFQUEUE, request: WDFREQUEST, _length: usize)
     }
     let frame = dequeue_capture_frame(state);
     if let Some(frame) = frame {
-        let owner_generation = unsafe { (*state).owner_generation.load(Ordering::Acquire) };
         unsafe { release_request(&(*state).pending_reads) };
 
         let status = complete_captured_frame_to_read(request, &frame);
@@ -3447,14 +3463,14 @@ extern "C" fn evt_io_stop(queue: WDFQUEUE, request: WDFREQUEST, _action_flags: U
         }
         // Cancellation or the passive completion worker already owns terminal
         // completion and can be manipulating this handle right now. Touching it
-        // here — including WdfRequestStopAcknowledge — would race that owner.
+        // here, including acknowledging the stop, would race that owner.
         // The owner completes promptly, which releases the D0 transition.
         return;
     }
-    // Unreachable while the queue lock serializes dispatch with this callback.
-    // Requeue defensively so the framework redelivers the request after the
-    // device returns to D0 rather than waiting on an owner that does not exist.
-    acknowledge_stopped_request(request);
+    // The queue lock excludes an in-flight control dispatch. A terminal wait
+    // owner can already have retired its publication immediately before
+    // completing, so this callback must not touch an unrecognized request.
+    // That owner completes promptly and satisfies the stop.
 }
 
 fn forward_request(request: WDFREQUEST, target_queue: WDFQUEUE) -> bool {
@@ -3584,8 +3600,15 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
             continue;
         }
 
+        let Some(_capture_lease) = acquire_capture_lease(state) else {
+            return;
+        };
+        if unsafe { (*state).lifecycle.load(Ordering::Acquire) } != INSTANCE_OPEN {
+            return;
+        }
+        let owner_generation = unsafe { (*state).owner_generation.load(Ordering::Acquire) };
         let mut request = core::ptr::null_mut();
-        let (frame, owner_generation) = {
+        let frame = {
             let status = unsafe {
                 call_unsafe_wdf_function_binding!(
                     WdfIoQueueRetrieveNextRequest,
@@ -3607,9 +3630,7 @@ extern "C" fn evt_read_completion_work_item(work_item: WDFWORKITEM) {
                 }
             };
             unsafe { release_request(&(*state).pending_reads) };
-            (frame, unsafe {
-                (*state).owner_generation.load(Ordering::Acquire)
-            })
+            frame
         };
         let status = complete_captured_frame_to_read(request, &frame);
         if status != STATUS_SUCCESS {
@@ -4131,16 +4152,6 @@ fn complete_scheduled_wait_at_passive(
         unmark_and_complete_wait(state, request, STATUS_CANCELLED, 0);
     } else {
         unmark_and_complete_wait(state, request, STATUS_SUCCESS, satisfied);
-    }
-}
-
-/// Postpones a stopped request that no driver path owns.
-///
-/// The request is requeued so the framework redelivers it once the device
-/// returns to D0; the driver keeps no reference to the handle afterwards.
-fn acknowledge_stopped_request(request: WDFREQUEST) {
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestStopAcknowledge, request, 1);
     }
 }
 
